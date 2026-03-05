@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyttd"
+version = "0.1.0"
+description = "Python Time-Travel Debugger"
+requires-python = ">=3.12"
+license = "MIT"
+dependencies = [
+    "peewee>=3.17",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "rich",
+]
+
+[project.scripts]
+pyttd = "pyttd.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["pyttd*"]
