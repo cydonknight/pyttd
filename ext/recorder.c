@@ -475,11 +475,21 @@ static int pyttd_trace_func(PyObject *obj, PyFrameObject *frame, int what, PyObj
     }
 
     case PyTrace_EXCEPTION: {
+        /* Save active exception state — serialize_locals() has PyErr_Clear() paths
+         * that can accidentally wipe the active exception on Python 3.12, breaking
+         * exception_unwind detection in the eval hook's PyErr_Occurred() check */
+        PyObject *save_type, *save_value, *save_tb;
+        PyErr_Fetch(&save_type, &save_value, &save_tb);
+
         PyCodeObject *code = PyFrame_GetCode(frame);
         int line_no = PyFrame_GetLineNumber(frame);
         const char *filename = PyUnicode_AsUTF8(code->co_filename);
         const char *funcname = PyUnicode_AsUTF8(code->co_qualname);
-        if (!filename || !funcname) { PyErr_Clear(); Py_DECREF(code); return 0; }
+        if (!filename || !funcname) {
+            if (PyErr_Occurred()) PyErr_Clear();
+            Py_DECREF(code);
+            goto exc_restore;
+        }
 
         PyObject *exc_key = PyUnicode_FromString("__exception__");
         PyObject *exc_value = NULL;
@@ -503,6 +513,11 @@ static int pyttd_trace_func(PyObject *obj, PyFrameObject *frame, int what, PyObj
         ringbuf_push(&event);
         atomic_fetch_add_explicit(&g_frame_count, 1, memory_order_relaxed);
         Py_DECREF(code);
+
+exc_restore:
+        /* Discard any errors from recording, restore original exception */
+        if (PyErr_Occurred()) PyErr_Clear();
+        PyErr_Restore(save_type, save_value, save_tb);
         return 0;
     }
 

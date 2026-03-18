@@ -71,8 +71,13 @@ jobs:
           LDFLAGS: "-fsanitize=address"
         run: pip install -e ".[dev]"
 
+      - name: Find ASAN library
+        id: asan
+        run: echo "lib=$(gcc -print-file-name=libasan.so)" >> "$GITHUB_OUTPUT"
+
       - name: Run tests under ASAN
         env:
+          LD_PRELOAD: ${{ steps.asan.outputs.lib }}
           ASAN_OPTIONS: "detect_leaks=0"
         run: pytest tests/ -v -x
 
