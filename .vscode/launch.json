@@ -1,0 +1,11 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "pyttd",
+            "request": "launch",
+            "name": "Time-Travel Debug Current File",
+            "program": "${file}"
+        }
+    ]
+}

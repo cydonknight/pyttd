@@ -2,7 +2,10 @@
 #define PYTTD_IOHOOK_H
 #include <Python.h>
 
-PyObject *pyttd_install_io_hooks(PyObject *self, PyObject *Py_UNUSED(args));
-PyObject *pyttd_remove_io_hooks(PyObject *self, PyObject *Py_UNUSED(args));
+/* Internal C functions — NOT registered in PyttdMethods */
+int install_io_hooks_internal(PyObject *io_flush_callback, PyObject *io_replay_loader);
+void remove_io_hooks_internal(void);
+void iohook_enter_replay_mode(uint64_t checkpoint_seq);
+void iohook_reset_child_state(void);
 
 #endif

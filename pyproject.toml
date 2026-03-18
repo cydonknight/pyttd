@@ -4,10 +4,26 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyttd"
-version = "0.1.0"
-description = "Python Time-Travel Debugger"
+version = "0.3.0"
+description = "Python Time-Travel Debugger — record, replay, and step backward through program execution"
 requires-python = ">=3.12"
 license = "MIT"
+readme = "README.md"
+authors = [
+    {name = "pyttd contributors"},
+]
+keywords = ["debugger", "time-travel", "debugging", "replay", "tracing"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: C",
+    "Topic :: Software Development :: Debuggers",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+]
 dependencies = [
     "peewee>=3.17",
 ]
@@ -15,11 +31,27 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
+    "pytest-benchmark>=4.0",
     "rich",
 ]
+
+[project.urls]
+Homepage = "https://github.com/pyttd/pyttd"
+Repository = "https://github.com/pyttd/pyttd"
+"Bug Tracker" = "https://github.com/pyttd/pyttd/issues"
+Documentation = "https://github.com/pyttd/pyttd/tree/main/docs"
 
 [project.scripts]
 pyttd = "pyttd.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["pyttd*"]
+
+[tool.cibuildwheel]
+build = "cp312-* cp313-*"
+skip = "*-musllinux*"
+test-command = "pytest {project}/tests/ -x -q"
+test-requires = "pytest"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

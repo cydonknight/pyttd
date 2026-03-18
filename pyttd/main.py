@@ -10,11 +10,11 @@ def ttdbg(func):
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         import inspect
-        source_file = inspect.getfile(func)
+        source_file = os.path.realpath(inspect.getfile(func))
         script_name = os.path.splitext(os.path.basename(source_file))[0]
         db_path = os.path.join(os.path.dirname(source_file) or '.', script_name + DB_NAME_SUFFIX)
         delete_db_files(db_path)
-        config = PyttdConfig()
+        config = PyttdConfig(checkpoint_interval=0)
         recorder = Recorder(config)
         recorder.start(db_path, script_path=source_file)
         try:

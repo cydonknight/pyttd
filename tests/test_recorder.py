@@ -1,45 +1,7 @@
 import json
-import os
-import textwrap
-import pytest
-from pyttd.config import PyttdConfig
-from pyttd.recorder import Recorder
+import pyttd_native
 from pyttd.models.frames import ExecutionFrames
 from pyttd.models.runs import Runs
-from pyttd.models.storage import delete_db_files, close_db
-from pyttd.models.base import db
-
-
-@pytest.fixture
-def record_func(tmp_path):
-    """Record a script and return (db_path, run_id, stats)."""
-    def _record(script_content):
-        script_file = tmp_path / "test_script.py"
-        script_file.write_text(textwrap.dedent(script_content))
-        db_path = str(tmp_path / "test.pyttd.db")
-        delete_db_files(db_path)
-
-        config = PyttdConfig()
-        recorder = Recorder(config)
-        recorder.start(db_path, script_path=str(script_file))
-
-        import runpy
-        import sys
-        old_argv = sys.argv[:]
-        sys.argv = [str(script_file)]
-        try:
-            runpy.run_path(str(script_file), run_name='__main__')
-        except BaseException:
-            pass
-        finally:
-            sys.argv = old_argv
-        stats = recorder.stop()
-        run_id = recorder.run_id
-        # Don't cleanup — tests need to query the DB
-        return db_path, run_id, stats
-    yield _record
-    close_db()
-    db.init(None)
 
 
 def test_basic_recording(record_func):
@@ -177,3 +139,37 @@ def test_total_frames_in_run(record_func):
     run = Runs.get(Runs.run_id == run_id)
     assert run.total_frames == stats['frame_count']
     assert run.total_frames > 0
+
+
+def test_repr_reentrancy(record_func):
+    """Verify that user-defined __repr__ doesn't corrupt locals or cause crashes."""
+    db_path, run_id, stats = record_func("""\
+        class Foo:
+            def __repr__(self):
+                return "Foo()"
+        def bar():
+            f = Foo()
+            return f
+        bar()
+    """)
+    frames = list(ExecutionFrames.select()
+        .where(ExecutionFrames.run_id == run_id)
+        .order_by(ExecutionFrames.sequence_no))
+    assert len(frames) > 0
+    for f in frames:
+        if f.locals_snapshot:
+            data = json.loads(f.locals_snapshot)
+            assert isinstance(data, dict)
+
+
+def test_elapsed_time_accurate(record_func):
+    """Verify elapsed_time reflects recording duration, not query time."""
+    import time
+    db_path, run_id, stats = record_func("""\
+        x = 1
+    """)
+    time.sleep(0.1)
+    stats2 = pyttd_native.get_recording_stats()
+    # Both stat calls should report approximately the same elapsed_time
+    # since recording is stopped — not growing with wall clock
+    assert abs(stats['elapsed_time'] - stats2['elapsed_time']) < 0.01

@@ -3,9 +3,15 @@ from dataclasses import dataclass, field
 @dataclass
 class PyttdConfig:
     checkpoint_interval: int = 1000
-    max_checkpoints: int = 32
     ring_buffer_size: int = 65536
     flush_interval_ms: int = 10
-    max_repr_length: int = 256
     ignore_patterns: list[str] = field(default_factory=list)
     db_path: str | None = None
+
+    def __post_init__(self):
+        if self.checkpoint_interval < 0:
+            raise ValueError("checkpoint_interval must be >= 0")
+        if self.ring_buffer_size != 0 and self.ring_buffer_size < 64:
+            raise ValueError("ring_buffer_size must be 0 (default) or >= 64")
+        if self.flush_interval_ms <= 0:
+            raise ValueError("flush_interval_ms must be > 0")

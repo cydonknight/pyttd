@@ -12,7 +12,8 @@
 
 static PyMethodDef PyttdMethods[] = {
     {"start_recording", (PyCFunction)pyttd_start_recording, METH_VARARGS | METH_KEYWORDS,
-     "Start recording with frame eval hook. Args: flush_callback, buffer_size, flush_interval_ms"},
+     "Start recording with frame eval hook. Args: flush_callback, buffer_size, flush_interval_ms, "
+     "checkpoint_callback, checkpoint_interval, io_flush_callback, io_replay_loader"},
     {"stop_recording", (PyCFunction)pyttd_stop_recording, METH_NOARGS,
      "Stop recording and flush ring buffer"},
     {"get_recording_stats", (PyCFunction)pyttd_get_recording_stats, METH_NOARGS,
@@ -21,16 +22,16 @@ static PyMethodDef PyttdMethods[] = {
      "Set filename/function patterns to ignore during recording"},
     {"request_stop", (PyCFunction)pyttd_request_stop, METH_NOARGS,
      "Set atomic stop flag checked by frame eval hook (for interrupt)"},
+    {"set_recording_thread", (PyCFunction)pyttd_set_recording_thread, METH_NOARGS,
+     "Set current thread as the recording thread (for server mode)"},
     {"create_checkpoint", (PyCFunction)pyttd_create_checkpoint, METH_NOARGS,
      "Fork a checkpoint (Unix only)"},
     {"restore_checkpoint", (PyCFunction)pyttd_restore_checkpoint, METH_VARARGS,
      "Find nearest checkpoint <= target_seq, resume child, fast-forward, return state dict"},
     {"kill_all_checkpoints", (PyCFunction)pyttd_kill_all_checkpoints, METH_NOARGS,
      "Send DIE to all checkpoint children"},
-    {"install_io_hooks", (PyCFunction)pyttd_install_io_hooks, METH_NOARGS,
-     "Replace non-deterministic functions with recording hooks"},
-    {"remove_io_hooks", (PyCFunction)pyttd_remove_io_hooks, METH_NOARGS,
-     "Restore original functions"},
+    {"get_checkpoint_count", (PyCFunction)pyttd_get_checkpoint_count, METH_NOARGS,
+     "Return number of live checkpoint children"},
     {NULL, NULL, 0, NULL}
 };
 

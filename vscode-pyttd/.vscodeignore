@@ -1,4 +1,14 @@
-node_modules/
+# Source files (bundled by esbuild)
 src/
+node_modules/
+
+# Config files
 tsconfig.json
+esbuild.mjs
 .vscode/
+
+# Development artifacts
+**/*.map
+.gitignore
+.mocharc.yml
+package-lock.json

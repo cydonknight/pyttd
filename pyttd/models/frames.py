@@ -14,6 +14,7 @@ class ExecutionFrames(_BaseModel):
     frame_event = CharField()
     call_depth = IntegerField()
     locals_snapshot = TextField(null=True)
+    thread_id = BigIntegerField(default=0)
 
     class Meta:
         indexes = (
@@ -22,4 +23,5 @@ class ExecutionFrames(_BaseModel):
             (('run_id', 'function_name'), False),
             (('run_id', 'frame_event', 'sequence_no'), False),
             (('run_id', 'call_depth', 'sequence_no'), False),
+            (('run_id', 'thread_id', 'sequence_no'), False),
         )

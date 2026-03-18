@@ -4,7 +4,13 @@ from pyttd.models import storage
 
 def get_last_run(db_path: str) -> Runs:
     storage.connect_to_db(db_path)
-    return Runs.select().order_by(Runs.timestamp_start.desc()).get()
+    try:
+        run = Runs.select().order_by(Runs.timestamp_start.desc()).first()
+    except Exception:
+        raise ValueError("No runs found in database (table may not exist)")
+    if run is None:
+        raise ValueError("No runs found in database")
+    return run
 
 def get_frames(run_id, limit=50, offset=0) -> list[ExecutionFrames]:
     return list(ExecutionFrames.select()
@@ -12,8 +18,8 @@ def get_frames(run_id, limit=50, offset=0) -> list[ExecutionFrames]:
         .order_by(ExecutionFrames.sequence_no)
         .offset(offset).limit(limit))
 
-def get_frame_at_seq(run_id, seq) -> ExecutionFrames:
-    return ExecutionFrames.get(
+def get_frame_at_seq(run_id, seq) -> ExecutionFrames | None:
+    return ExecutionFrames.get_or_none(
         (ExecutionFrames.run_id == run_id) &
         (ExecutionFrames.sequence_no == seq))
 

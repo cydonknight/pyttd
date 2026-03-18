@@ -2,88 +2,151 @@
   "name": "pyttd",
   "displayName": "pyttd - Python Time-Travel Debugger",
   "description": "Time-travel debugger for Python with record, replay, and visual timeline",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "publisher": "pyttd",
-  "engines": { "vscode": "^1.85.0" },
-  "categories": ["Debuggers"],
-  "activationEvents": ["onDebugResolve:pyttd"],
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Debuggers"
+  ],
+  "activationEvents": [
+    "onDebugResolve:pyttd"
+  ],
   "main": "./out/extension.js",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pyttd/pyttd"
+  },
+  "license": "MIT",
+  "author": "pyttd contributors",
+  "galleryBanner": {
+    "color": "#1e1e1e",
+    "theme": "dark"
+  },
+  "badges": [
+    {
+      "url": "https://github.com/pyttd/pyttd/actions/workflows/ci.yml/badge.svg",
+      "href": "https://github.com/pyttd/pyttd/actions/workflows/ci.yml",
+      "description": "CI"
+    }
+  ],
+  "markdown": "github",
+  "qna": "https://github.com/pyttd/pyttd/discussions",
+  "keywords": [
+    "python",
+    "debugger",
+    "time-travel",
+    "replay",
+    "record"
+  ],
   "contributes": {
-    "debuggers": [{
-      "type": "pyttd",
-      "label": "Python Time-Travel Debug",
-      "languages": ["python"],
-      "configurationAttributes": {
-        "launch": {
-          "required": [],
-          "properties": {
-            "program": {
-              "type": "string",
-              "description": "Path to Python script to debug"
-            },
-            "module": {
-              "type": "string",
-              "description": "Python module to debug (dotted name)"
-            },
-            "pythonPath": {
-              "type": "string",
-              "description": "Path to Python interpreter"
-            },
-            "cwd": {
-              "type": "string",
-              "description": "Working directory"
-            },
-            "args": {
-              "type": "array",
-              "items": { "type": "string" },
-              "description": "Command line arguments"
-            },
-            "traceDb": {
-              "type": "string",
-              "description": "Path to trace database file"
-            },
-            "checkpointInterval": {
-              "type": "number",
-              "description": "Frames between checkpoints (default: 1000)"
-            }
-          }
-        }
-      },
-      "configurationSnippets": [{
-        "label": "pyttd: Launch",
-        "description": "Time-travel debug a Python script",
-        "body": {
-          "type": "pyttd",
-          "request": "launch",
-          "name": "Time-Travel Debug",
-          "program": "^\"${file}\""
-        }
-      }],
-      "exceptionBreakpointFilters": [
+    "views": {
+      "debug": [
         {
-          "filter": "uncaught",
-          "label": "Uncaught Exceptions",
-          "default": true
+          "type": "webview",
+          "id": "pyttd.timeline",
+          "name": "Timeline",
+          "when": "debugType == 'pyttd'"
         },
         {
-          "filter": "raised",
-          "label": "All Exceptions",
-          "default": false
+          "id": "pyttd.callHistory",
+          "name": "Call History",
+          "when": "debugType == 'pyttd'"
         }
       ]
-    }]
+    },
+    "debuggers": [
+      {
+        "type": "pyttd",
+        "label": "Python Time-Travel Debug",
+        "languages": [
+          "python"
+        ],
+        "configurationAttributes": {
+          "launch": {
+            "required": [],
+            "properties": {
+              "program": {
+                "type": "string",
+                "description": "Path to Python script to debug"
+              },
+              "module": {
+                "type": "string",
+                "description": "Python module to debug (dotted name)"
+              },
+              "pythonPath": {
+                "type": "string",
+                "description": "Path to Python interpreter"
+              },
+              "cwd": {
+                "type": "string",
+                "description": "Working directory"
+              },
+              "args": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Command line arguments"
+              },
+              "traceDb": {
+                "type": "string",
+                "description": "Path to trace database file"
+              },
+              "checkpointInterval": {
+                "type": "number",
+                "description": "Frames between checkpoints (default: 1000)"
+              }
+            }
+          }
+        },
+        "configurationSnippets": [
+          {
+            "label": "pyttd: Launch",
+            "description": "Time-travel debug a Python script",
+            "body": {
+              "type": "pyttd",
+              "request": "launch",
+              "name": "Time-Travel Debug",
+              "program": "^\"${file}\""
+            }
+          }
+        ],
+        "exceptionBreakpointFilters": [
+          {
+            "filter": "uncaught",
+            "label": "Uncaught Exceptions",
+            "default": true
+          },
+          {
+            "filter": "raised",
+            "label": "All Exceptions",
+            "default": false
+          }
+        ]
+      }
+    ]
   },
   "scripts": {
-    "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./"
-  },
-  "dependencies": {
-    "@vscode/debugadapter": "^1.65.0",
-    "@vscode/debugprotocol": "^1.65.0"
+    "compile": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "compile:tsc": "tsc -p ./",
+    "test": "tsc -p ./ && mocha",
+    "package": "node esbuild.mjs --production && vsce package --no-dependencies",
+    "vscode:prepublish": "node esbuild.mjs --production"
   },
   "devDependencies": {
+    "@types/mocha": "^10.0.10",
     "@types/node": "^20.0.0",
+    "@types/sinon": "^21.0.0",
     "@types/vscode": "^1.85.0",
+    "@vscode/debugadapter": "^1.65.0",
+    "@vscode/debugprotocol": "^1.65.0",
+    "@vscode/vsce": "^3.0.0",
+    "esbuild": "^0.24.0",
+    "mocha": "^11.7.5",
+    "sinon": "^21.0.2",
     "typescript": "^5.3.0"
   }
 }

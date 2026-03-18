@@ -7,6 +7,7 @@ typedef struct {
     uint64_t sequence_no;
     int line_no;
     int call_depth;
+    unsigned long thread_id;    /* PyThread_get_thread_ident() */
     const char *filename;
     const char *function_name;
     const char *event_type;     /* "call", "line", "return", "exception", "exception_unwind" */
