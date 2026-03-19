@@ -1,5 +1,10 @@
 from dataclasses import dataclass, field
 
+_DEFAULT_SECRET_PATTERNS = [
+    'password', 'secret', 'token', 'api_key', 'apikey',
+    'auth', 'credential', 'private_key',
+]
+
 @dataclass
 class PyttdConfig:
     checkpoint_interval: int = 1000
@@ -7,6 +12,9 @@ class PyttdConfig:
     flush_interval_ms: int = 10
     ignore_patterns: list[str] = field(default_factory=list)
     db_path: str | None = None
+    redact_secrets: bool = True
+    secret_patterns: list[str] = field(default_factory=lambda: list(_DEFAULT_SECRET_PATTERNS))
+    include_functions: list[str] = field(default_factory=list)
 
     def __post_init__(self):
         if self.checkpoint_interval < 0:

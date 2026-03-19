@@ -16,6 +16,7 @@ class Session:
         self.last_line_seq = None
         self.replay_controller = ReplayController()
         self._stack_cache = {}  # (seq, thread_id) -> stack_snapshot (DAP order)
+        self._var_ref_cache = {}  # ref_id -> (seq, name) for expandable variables
         self.current_thread_id = None
         self.known_threads = {}  # {thread_id: "Thread Name"}
 
@@ -152,16 +153,11 @@ class Session:
         for bp in self.breakpoints:
             if 'file' not in bp or 'line' not in bp:
                 continue
-            hit = (ExecutionFrames.select(ExecutionFrames.sequence_no)
-                   .where((ExecutionFrames.run_id == self.run_id) &
-                          (ExecutionFrames.filename == bp['file']) &
-                          (ExecutionFrames.line_no == bp['line']) &
-                          (ExecutionFrames.frame_event == 'line') &
-                          (ExecutionFrames.sequence_no > self.current_frame_seq))
-                   .order_by(ExecutionFrames.sequence_no)
-                   .limit(1).first())
-            if hit:
-                candidates.append((hit.sequence_no, "breakpoint"))
+            condition = bp.get('condition', '')
+            hit = self._find_conditional_hit_forward(bp['file'], bp['line'],
+                                                      condition, self.current_frame_seq)
+            if hit is not None:
+                candidates.append((hit, "breakpoint"))
 
         if "raised" in self.exception_filters:
             hit = (ExecutionFrames.select(ExecutionFrames.sequence_no)
@@ -213,16 +209,11 @@ class Session:
         for bp in self.breakpoints:
             if 'file' not in bp or 'line' not in bp:
                 continue
-            hit = (ExecutionFrames.select(ExecutionFrames.sequence_no)
-                   .where((ExecutionFrames.run_id == self.run_id) &
-                          (ExecutionFrames.filename == bp['file']) &
-                          (ExecutionFrames.line_no == bp['line']) &
-                          (ExecutionFrames.frame_event == 'line') &
-                          (ExecutionFrames.sequence_no < self.current_frame_seq))
-                   .order_by(ExecutionFrames.sequence_no.desc())
-                   .limit(1).first())
-            if hit:
-                candidates.append((hit.sequence_no, "breakpoint"))
+            condition = bp.get('condition', '')
+            hit = self._find_conditional_hit_reverse(bp['file'], bp['line'],
+                                                      condition, self.current_frame_seq)
+            if hit is not None:
+                candidates.append((hit, "breakpoint"))
 
         if "raised" in self.exception_filters:
             hit = (ExecutionFrames.select(ExecutionFrames.sequence_no)
@@ -387,13 +378,51 @@ class Session:
             return []
         variables = []
         for name, value in locals_data.items():
+            ref = 0
+            if isinstance(value, dict) and '__type__' in value:
+                ref = self._encode_var_ref(seq, name)
             variables.append({
                 "name": name,
-                "value": str(value),
+                "value": _format_value(value),
                 "type": _infer_type(value),
-                "variablesReference": 0,
+                "variablesReference": ref,
             })
         return variables
+
+    def get_variable_children(self, reference: int) -> list[dict]:
+        decoded = self._decode_var_ref(reference)
+        if decoded is None:
+            return []
+        seq, name = decoded
+        frame = ExecutionFrames.get_or_none(
+            (ExecutionFrames.run_id == self.run_id) &
+            (ExecutionFrames.sequence_no == seq))
+        if frame is None or not frame.locals_snapshot:
+            return []
+        try:
+            locals_data = json.loads(frame.locals_snapshot)
+        except (json.JSONDecodeError, TypeError):
+            return []
+        value = locals_data.get(name)
+        if not isinstance(value, dict) or '__children__' not in value:
+            return []
+        result = []
+        for child in value['__children__']:
+            result.append({
+                "name": str(child.get('key', '')),
+                "value": str(child.get('value', '')),
+                "type": child.get('type', 'str'),
+                "variablesReference": 0,
+            })
+        return result
+
+    def _encode_var_ref(self, seq: int, name: str) -> int:
+        ref = len(self._var_ref_cache) + 1000
+        self._var_ref_cache[ref] = (seq, name)
+        return ref
+
+    def _decode_var_ref(self, ref: int):
+        return self._var_ref_cache.get(ref)
 
     def evaluate_at(self, seq: int, expression: str, context: str) -> dict:
         if context == "repl":
@@ -518,7 +547,131 @@ class Session:
             })
         return results
 
+    # --- Phase 10B: Variable History ---
+
+    def get_variable_history(self, variable_name: str, start_seq: int, end_seq: int,
+                             max_points: int = 500) -> list[dict]:
+        frames = ExecutionFrames.select(
+            ExecutionFrames.sequence_no,
+            ExecutionFrames.line_no,
+            ExecutionFrames.filename,
+            ExecutionFrames.function_name,
+            ExecutionFrames.locals_snapshot,
+        ).where(
+            (ExecutionFrames.run_id == self.run_id) &
+            (ExecutionFrames.frame_event == 'line') &
+            (ExecutionFrames.sequence_no >= start_seq) &
+            (ExecutionFrames.sequence_no <= end_seq) &
+            (ExecutionFrames.locals_snapshot.contains(f'"{variable_name}"'))
+        ).order_by(ExecutionFrames.sequence_no).iterator()
+
+        result = []
+        last_value = object()
+        for frame in frames:
+            if not frame.locals_snapshot:
+                continue
+            try:
+                locals_data = json.loads(frame.locals_snapshot)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if variable_name not in locals_data:
+                continue
+            value = _format_value(locals_data[variable_name])
+            if value == last_value:
+                continue
+            last_value = value
+            result.append({
+                'seq': frame.sequence_no,
+                'value': value,
+                'line': frame.line_no,
+                'filename': frame.filename,
+                'functionName': frame.function_name,
+            })
+            if len(result) >= max_points:
+                break
+        return result
+
     # --- Internal helpers ---
+
+    def _evaluate_condition(self, condition: str, seq: int) -> bool:
+        if not condition or not condition.strip():
+            return True
+        frame = ExecutionFrames.get_or_none(
+            (ExecutionFrames.run_id == self.run_id) &
+            (ExecutionFrames.sequence_no == seq))
+        if frame is None or not frame.locals_snapshot:
+            return True
+        try:
+            locals_data = json.loads(frame.locals_snapshot)
+        except (json.JSONDecodeError, TypeError):
+            return True
+        eval_locals = {}
+        for name, value in locals_data.items():
+            eval_locals[name] = _parse_repr_value(value)
+        try:
+            return bool(eval(condition, {"__builtins__": {}}, eval_locals))
+        except Exception:
+            return True
+
+    def _find_conditional_hit_forward(self, filename: str, line: int,
+                                       condition: str, after_seq: int) -> int | None:
+        if not condition or not condition.strip():
+            hit = (ExecutionFrames.select(ExecutionFrames.sequence_no)
+                   .where((ExecutionFrames.run_id == self.run_id) &
+                          (ExecutionFrames.filename == filename) &
+                          (ExecutionFrames.line_no == line) &
+                          (ExecutionFrames.frame_event == 'line') &
+                          (ExecutionFrames.sequence_no > after_seq))
+                   .order_by(ExecutionFrames.sequence_no)
+                   .limit(1).first())
+            return hit.sequence_no if hit else None
+
+        cursor = after_seq
+        for _ in range(10000):
+            hit = (ExecutionFrames.select(ExecutionFrames.sequence_no)
+                   .where((ExecutionFrames.run_id == self.run_id) &
+                          (ExecutionFrames.filename == filename) &
+                          (ExecutionFrames.line_no == line) &
+                          (ExecutionFrames.frame_event == 'line') &
+                          (ExecutionFrames.sequence_no > cursor))
+                   .order_by(ExecutionFrames.sequence_no)
+                   .limit(1).first())
+            if hit is None:
+                return None
+            if self._evaluate_condition(condition, hit.sequence_no):
+                return hit.sequence_no
+            cursor = hit.sequence_no
+        return None
+
+    def _find_conditional_hit_reverse(self, filename: str, line: int,
+                                       condition: str, before_seq: int) -> int | None:
+        if not condition or not condition.strip():
+            hit = (ExecutionFrames.select(ExecutionFrames.sequence_no)
+                   .where((ExecutionFrames.run_id == self.run_id) &
+                          (ExecutionFrames.filename == filename) &
+                          (ExecutionFrames.line_no == line) &
+                          (ExecutionFrames.frame_event == 'line') &
+                          (ExecutionFrames.sequence_no < before_seq))
+                   .order_by(ExecutionFrames.sequence_no.desc())
+                   .limit(1).first())
+            return hit.sequence_no if hit else None
+
+        cursor = before_seq
+        for _ in range(10000):
+            hit = (ExecutionFrames.select(ExecutionFrames.sequence_no)
+                   .where((ExecutionFrames.run_id == self.run_id) &
+                          (ExecutionFrames.filename == filename) &
+                          (ExecutionFrames.line_no == line) &
+                          (ExecutionFrames.frame_event == 'line') &
+                          (ExecutionFrames.sequence_no < cursor))
+                   .order_by(ExecutionFrames.sequence_no.desc())
+                   .limit(1).first())
+            if hit is None:
+                return None
+            if self._evaluate_condition(condition, hit.sequence_no):
+                return hit.sequence_no
+            cursor = hit.sequence_no
+        return None
 
     def _snap_to_line(self, seq: int) -> int:
         """Snap an exception/call/return event to the nearest line event.
@@ -663,7 +816,32 @@ class Session:
         }
 
 
+def _parse_repr_value(value):
+    """Safely convert a repr string back to a Python literal.
+    Uses ast.literal_eval (safe — only parses literals, no code execution).
+    Falls back to the raw string on failure."""
+    import ast
+    if isinstance(value, dict) and '__type__' in value:
+        return _format_value(value)
+    s = str(value)
+    try:
+        return ast.literal_eval(s)
+    except (ValueError, SyntaxError):
+        return s
+
+
+def _format_value(value) -> str:
+    if isinstance(value, dict) and '__type__' in value:
+        t = value['__type__']
+        length = value.get('__len__', '?')
+        rep = value.get('__repr__', f'{t}(...)')
+        return rep
+    return str(value)
+
+
 def _infer_type(value) -> str:
+    if isinstance(value, dict) and '__type__' in value:
+        return value['__type__']
     s = str(value)
     if s in ('True', 'False'):
         return 'bool'

@@ -32,6 +32,10 @@ static PyMethodDef PyttdMethods[] = {
      "Send DIE to all checkpoint children"},
     {"get_checkpoint_count", (PyCFunction)pyttd_get_checkpoint_count, METH_NOARGS,
      "Return number of live checkpoint children"},
+    {"set_secret_patterns", (PyCFunction)pyttd_set_secret_patterns, METH_VARARGS,
+     "Set variable name patterns for secret redaction during recording"},
+    {"set_include_patterns", (PyCFunction)pyttd_set_include_patterns, METH_VARARGS,
+     "Set function name patterns for selective recording (empty = record all)"},
     {NULL, NULL, 0, NULL}
 };
 

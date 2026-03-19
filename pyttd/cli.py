@@ -16,7 +16,13 @@ def main():
     record_parser.add_argument('script', help='Script path or module name (with --module)')
     record_parser.add_argument('--module', action='store_true', help='Treat script as module name')
     record_parser.add_argument('--checkpoint-interval', type=int, default=1000)
-    record_parser.add_argument('--args', nargs='*', default=[])
+    record_parser.add_argument('--args', nargs='+', default=[])
+    record_parser.add_argument('--no-redact', action='store_true',
+                               help='Disable secrets redaction in recorded variables')
+    record_parser.add_argument('--secret-patterns', nargs='+', default=None,
+                               help='Additional secret patterns for variable redaction')
+    record_parser.add_argument('--include', nargs='+', default=None,
+                               help='Only record functions matching these patterns')
 
     query_parser = subparsers.add_parser('query', help='Query trace data')
     query_parser.add_argument('--last-run', action='store_true')
@@ -36,6 +42,16 @@ def main():
     serve_parser.add_argument('--module', action='store_true')
     serve_parser.add_argument('--cwd', default='.')
     serve_parser.add_argument('--checkpoint-interval', type=int, default=1000)
+    serve_parser.add_argument('--include', nargs='+', default=None,
+                              help='Only record functions matching these patterns')
+
+    export_parser = subparsers.add_parser('export', help='Export trace data')
+    export_parser.add_argument('--format', choices=['perfetto'], default='perfetto',
+                               help='Export format (default: perfetto)')
+    export_parser.add_argument('--db', type=str, required=True,
+                               help='Path to .pyttd.db file')
+    export_parser.add_argument('-o', '--output', type=str, required=True,
+                               help='Output file path')
 
     args = parser.parse_args()
 
@@ -57,6 +73,8 @@ def main():
         _cmd_replay(args)
     elif args.command == 'serve':
         _cmd_serve(args)
+    elif args.command == 'export':
+        _cmd_export(args)
 
 def _cmd_record(args):
     from pyttd.config import PyttdConfig
@@ -80,7 +98,15 @@ def _cmd_record(args):
     cwd = script_dir
 
     # CLI mode: use caller's checkpoint-interval (children killed after recording)
-    config = PyttdConfig(checkpoint_interval=args.checkpoint_interval)
+    config_kwargs = dict(checkpoint_interval=args.checkpoint_interval)
+    if args.no_redact:
+        config_kwargs['redact_secrets'] = False
+    if args.secret_patterns is not None:
+        from pyttd.config import _DEFAULT_SECRET_PATTERNS
+        config_kwargs['secret_patterns'] = list(_DEFAULT_SECRET_PATTERNS) + args.secret_patterns
+    if args.include is not None:
+        config_kwargs['include_functions'] = args.include
+    config = PyttdConfig(**config_kwargs)
     recorder = Recorder(config)
     runner = Runner()
 
@@ -115,11 +141,13 @@ def _cmd_serve(args):
         if not args.module and not os.path.isfile(args.script):
             print(f"Error: script not found: {args.script}", file=sys.stderr)
             sys.exit(1)
+        include_functions = args.include if args.include is not None else []
         server = PyttdServer(
             script=args.script,
             is_module=args.module,
             cwd=args.cwd,
             checkpoint_interval=args.checkpoint_interval,
+            include_functions=include_functions,
         )
     else:
         # --db mode: replay existing recording
@@ -196,3 +224,11 @@ def _cmd_replay(args):
         print(f"Frame {args.goto_frame}: {result}")
     finally:
         storage.close_db()
+
+def _cmd_export(args):
+    from pyttd.export import export_perfetto
+    if not os.path.isfile(args.db):
+        print(f"Error: database not found: {args.db}", file=sys.stderr)
+        sys.exit(1)
+    export_perfetto(args.db, args.output)
+    print(f"Exported to {args.output}")

@@ -88,6 +88,13 @@ typedef struct {
 static SubstringFilter g_dir_filter = {.count = 0};
 static ExactMatchSet g_exact_filter = {.count = 0};
 
+/* ---- Secrets Filter (Phase 8B) ---- */
+static SubstringFilter g_secret_filter = {.count = 0};
+
+/* ---- Include Filter (Phase 9B) ---- */
+static SubstringFilter g_include_filter = {.count = 0};
+static int g_include_mode = 0;  /* 1 if include patterns active */
+
 /* ---- Flush Thread ---- */
 #ifdef _WIN32
 static HANDLE g_flush_thread = NULL;
@@ -183,6 +190,67 @@ static int should_ignore(const char *filename, const char *funcname) {
     return 0;
 }
 
+/* ---- Secrets Filter (Phase 8B) ---- */
+
+/* Case-insensitive substring search (portable — no strcasestr on Windows) */
+static int ci_strstr(const char *haystack, const char *needle) {
+    if (!haystack || !needle || !*needle) return 0;
+    size_t nlen = strlen(needle);
+    for (const char *h = haystack; *h; h++) {
+        int match = 1;
+        for (size_t i = 0; i < nlen; i++) {
+            char hc = h[i];
+            char nc = needle[i];
+            if (!hc) { match = 0; break; }
+            if (hc >= 'A' && hc <= 'Z') hc += 32;
+            if (nc >= 'A' && nc <= 'Z') nc += 32;
+            if (hc != nc) { match = 0; break; }
+        }
+        if (match) return 1;
+    }
+    return 0;
+}
+
+static int should_redact(const char *name) {
+    for (int i = 0; i < g_secret_filter.count; i++) {
+        if (ci_strstr(name, g_secret_filter.patterns[i])) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void clear_secret_filter(void) {
+    for (int i = 0; i < g_secret_filter.count; i++) {
+        free(g_secret_filter.patterns[i]);
+        g_secret_filter.patterns[i] = NULL;
+    }
+    g_secret_filter.count = 0;
+}
+
+/* ---- Include Filter (Phase 9B) ---- */
+
+static int should_include(const char *funcname) {
+    if (!g_include_mode) return 1;
+    /* <module> always included — top-level code must record */
+    if (strcmp(funcname, "<module>") == 0) return 1;
+    for (int i = 0; i < g_include_filter.count; i++) {
+        if (strstr(funcname, g_include_filter.patterns[i]) != NULL) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void clear_include_filter(void) {
+    for (int i = 0; i < g_include_filter.count; i++) {
+        free(g_include_filter.patterns[i]);
+        g_include_filter.patterns[i] = NULL;
+    }
+    g_include_filter.count = 0;
+    g_include_mode = 0;
+}
+
 /* ---- JSON Escaping ---- */
 
 int recorder_json_escape_string(const char *src, char *dst, size_t dst_size) {
@@ -191,35 +259,36 @@ int recorder_json_escape_string(const char *src, char *dst, size_t dst_size) {
         memcpy(dst, "null", 5);
         return 4;
     }
+    if (dst_size < 2) return -1;  /* need at least 1 char + NUL */
     size_t pos = 0;
     for (const char *p = src; *p; p++) {
         unsigned char c = (unsigned char)*p;
         if (c == '"') {
-            if (pos + 2 > dst_size - 1) return -1;
+            if (pos + 2 >= dst_size) return -1;
             dst[pos++] = '\\'; dst[pos++] = '"';
         } else if (c == '\\') {
-            if (pos + 2 > dst_size - 1) return -1;
+            if (pos + 2 >= dst_size) return -1;
             dst[pos++] = '\\'; dst[pos++] = '\\';
         } else if (c == '\n') {
-            if (pos + 2 > dst_size - 1) return -1;
+            if (pos + 2 >= dst_size) return -1;
             dst[pos++] = '\\'; dst[pos++] = 'n';
         } else if (c == '\r') {
-            if (pos + 2 > dst_size - 1) return -1;
+            if (pos + 2 >= dst_size) return -1;
             dst[pos++] = '\\'; dst[pos++] = 'r';
         } else if (c == '\t') {
-            if (pos + 2 > dst_size - 1) return -1;
+            if (pos + 2 >= dst_size) return -1;
             dst[pos++] = '\\'; dst[pos++] = 't';
         } else if (c == '\b') {
-            if (pos + 2 > dst_size - 1) return -1;
+            if (pos + 2 >= dst_size) return -1;
             dst[pos++] = '\\'; dst[pos++] = 'b';
         } else if (c == '\f') {
-            if (pos + 2 > dst_size - 1) return -1;
+            if (pos + 2 >= dst_size) return -1;
             dst[pos++] = '\\'; dst[pos++] = 'f';
         } else if (c < 0x20) {
-            if (pos + 6 > dst_size - 1) return -1;
+            if (pos + 6 >= dst_size) return -1;
             pos += snprintf(dst + pos, dst_size - pos, "\\u%04x", c);
         } else {
-            if (pos + 1 > dst_size - 1) return -1;
+            if (pos + 1 >= dst_size) return -1;
             dst[pos++] = (char)c;
         }
     }
@@ -234,9 +303,323 @@ static int json_escape_string(const char *src, char *dst, size_t dst_size) {
 
 /* ---- Locals Serialization ---- */
 
+#define MAX_CHILDREN 50
+
+/* Phase 10A: Detect if a value should be serialized as an expandable structure.
+ * Only expand basic container types and user objects (not modules, types, functions, etc.) */
+static int is_expandable(PyObject *value) {
+    if (PyDict_Check(value) || PyList_Check(value) ||
+        PyTuple_Check(value) || PySet_Check(value)) {
+        return 1;
+    }
+    /* Skip modules, types, functions, methods, code objects */
+    if (PyModule_Check(value) || PyType_Check(value) ||
+        PyFunction_Check(value) || PyMethod_Check(value)) {
+        return 0;
+    }
+    /* User objects with __dict__ (but not builtins) */
+    if (PyObject_HasAttrString(value, "__dict__")) {
+        PyObject *tp = (PyObject *)Py_TYPE(value);
+        /* Skip types defined in C (builtins, extensions) — only expand Python classes */
+        if (((PyTypeObject *)tp)->tp_flags & Py_TPFLAGS_HEAPTYPE) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Write expandable structured JSON into buf at *pos.
+ * Format: {"__type__":"dict","__len__":N,"__repr__":"...","__children__":[...]}
+ * Returns 1 on success, 0 on buffer full (caller should fall back to flat repr). */
+static int serialize_expandable_value(PyObject *value, char *buf, size_t buf_size,
+                                       size_t *pos) {
+    const char *type_name;
+    Py_ssize_t length = 0;
+
+    if (PyDict_Check(value)) {
+        type_name = "dict";
+        length = PyDict_Size(value);
+    } else if (PyList_Check(value)) {
+        type_name = "list";
+        length = PyList_GET_SIZE(value);
+    } else if (PyTuple_Check(value)) {
+        type_name = "tuple";
+        length = PyTuple_GET_SIZE(value);
+    } else if (PySet_Check(value)) {
+        type_name = "set";
+        length = PySet_GET_SIZE(value);
+    } else {
+        type_name = "object";
+    }
+
+    /* Get repr */
+    g_inside_repr = 1;
+    PyObject *repr = PyObject_Repr(value);
+    g_inside_repr = 0;
+    if (!repr) { PyErr_Clear(); return 0; }
+    const char *repr_str = PyUnicode_AsUTF8(repr);
+    if (!repr_str) { Py_DECREF(repr); PyErr_Clear(); return 0; }
+
+    char repr_truncated[MAX_REPR_LENGTH + 4];
+    size_t repr_len = strlen(repr_str);
+    if (repr_len > MAX_REPR_LENGTH) {
+        memcpy(repr_truncated, repr_str, MAX_REPR_LENGTH);
+        memcpy(repr_truncated + MAX_REPR_LENGTH, "...", 4);
+        repr_str = repr_truncated;
+    }
+
+    /* Write: {"__type__":"<type>","__len__":<N>,"__repr__":"<repr>","__children__":[ */
+    size_t needed = 80 + repr_len;
+    if (*pos + needed >= buf_size) { Py_DECREF(repr); return 0; }
+
+    int n = snprintf(buf + *pos, buf_size - *pos,
+                     "{\"__type__\": \"%s\", \"__len__\": %zd, \"__repr__\": \"",
+                     type_name, length);
+    if (n < 0 || (size_t)n >= buf_size - *pos) { Py_DECREF(repr); return 0; }
+    *pos += n;
+
+    if (*pos + 30 >= buf_size) { Py_DECREF(repr); return 0; }
+    int esc_len = json_escape_string(repr_str, buf + *pos, buf_size - *pos - 30);
+    Py_DECREF(repr);
+    if (esc_len < 0) return 0;
+    *pos += esc_len;
+
+    if (*pos + 21 >= buf_size) return 0;
+    memcpy(buf + *pos, "\", \"__children__\": [", 20);
+    *pos += 20;
+
+    /* Serialize children (max MAX_CHILDREN, 1 level deep — children are flat repr) */
+    int child_count = 0;
+    int child_first = 1;
+
+    if (PyDict_Check(value)) {
+        PyObject *key, *val;
+        Py_ssize_t dict_pos = 0;
+        while (PyDict_Next(value, &dict_pos, &key, &val) && child_count < MAX_CHILDREN) {
+            g_inside_repr = 1;
+            PyObject *krepr = PyObject_Repr(key);
+            PyObject *vrepr = PyObject_Repr(val);
+            g_inside_repr = 0;
+            if (!krepr || !vrepr) {
+                Py_XDECREF(krepr); Py_XDECREF(vrepr);
+                PyErr_Clear();
+                continue;
+            }
+            const char *ks = PyUnicode_AsUTF8(krepr);
+            const char *vs = PyUnicode_AsUTF8(vrepr);
+            if (!ks || !vs) {
+                Py_DECREF(krepr); Py_DECREF(vrepr);
+                PyErr_Clear();
+                continue;
+            }
+            if (!child_first) {
+                if (*pos + 2 >= buf_size) { Py_DECREF(krepr); Py_DECREF(vrepr); break; }
+                buf[(*pos)++] = ',';
+                buf[(*pos)++] = ' ';
+            }
+            child_first = 0;
+            /* {"key":"k","value":"v","type":"t"} */
+            const char *vtype = val->ob_type->tp_name;
+            if (*pos + 50 >= buf_size) { Py_DECREF(krepr); Py_DECREF(vrepr); break; }
+            memcpy(buf + *pos, "{\"key\": \"", 9); *pos += 9;
+            esc_len = json_escape_string(ks, buf + *pos, buf_size - *pos - 40);
+            if (esc_len < 0) { Py_DECREF(krepr); Py_DECREF(vrepr); break; }
+            *pos += esc_len;
+            if (*pos + 44 >= buf_size) { Py_DECREF(krepr); Py_DECREF(vrepr); break; }
+            memcpy(buf + *pos, "\", \"value\": \"", 13); *pos += 13;
+            if (*pos + 30 >= buf_size) { Py_DECREF(krepr); Py_DECREF(vrepr); break; }
+            esc_len = json_escape_string(vs, buf + *pos, buf_size - *pos - 30);
+            Py_DECREF(krepr); Py_DECREF(vrepr);
+            if (esc_len < 0) break;
+            *pos += esc_len;
+            n = snprintf(buf + *pos, buf_size - *pos, "\", \"type\": \"%s\"}", vtype);
+            if (n < 0 || (size_t)n >= buf_size - *pos) break;
+            *pos += n;
+            child_count++;
+        }
+    } else if (PyList_Check(value) || PyTuple_Check(value)) {
+        Py_ssize_t len = PyList_Check(value) ? PyList_GET_SIZE(value) : PyTuple_GET_SIZE(value);
+        Py_ssize_t limit = len < MAX_CHILDREN ? len : MAX_CHILDREN;
+        for (Py_ssize_t i = 0; i < limit; i++) {
+            PyObject *item = PyList_Check(value) ? PyList_GET_ITEM(value, i) : PyTuple_GET_ITEM(value, i);
+            g_inside_repr = 1;
+            PyObject *irepr = PyObject_Repr(item);
+            g_inside_repr = 0;
+            if (!irepr) { PyErr_Clear(); continue; }
+            const char *is = PyUnicode_AsUTF8(irepr);
+            if (!is) { Py_DECREF(irepr); PyErr_Clear(); continue; }
+            if (!child_first) {
+                if (*pos + 2 >= buf_size) { Py_DECREF(irepr); break; }
+                buf[(*pos)++] = ',';
+                buf[(*pos)++] = ' ';
+            }
+            child_first = 0;
+            const char *itype = item->ob_type->tp_name;
+            n = snprintf(buf + *pos, buf_size - *pos, "{\"key\": \"%zd\", \"value\": \"", i);
+            if (n < 0 || (size_t)n >= buf_size - *pos) { Py_DECREF(irepr); break; }
+            *pos += n;
+            if (*pos + 30 >= buf_size) { Py_DECREF(irepr); break; }
+            esc_len = json_escape_string(is, buf + *pos, buf_size - *pos - 30);
+            Py_DECREF(irepr);
+            if (esc_len < 0) break;
+            *pos += esc_len;
+            n = snprintf(buf + *pos, buf_size - *pos, "\", \"type\": \"%s\"}", itype);
+            if (n < 0 || (size_t)n >= buf_size - *pos) break;
+            *pos += n;
+            child_count++;
+        }
+    } else if (PySet_Check(value)) {
+        PyObject *iter = PyObject_GetIter(value);
+        if (iter) {
+            PyObject *item;
+            int idx = 0;
+            while ((item = PyIter_Next(iter)) && child_count < MAX_CHILDREN) {
+                g_inside_repr = 1;
+                PyObject *irepr = PyObject_Repr(item);
+                g_inside_repr = 0;
+                if (!irepr) { Py_DECREF(item); PyErr_Clear(); continue; }
+                const char *is = PyUnicode_AsUTF8(irepr);
+                if (!is) { Py_DECREF(irepr); Py_DECREF(item); PyErr_Clear(); continue; }
+                if (!child_first) {
+                    if (*pos + 2 >= buf_size) { Py_DECREF(irepr); Py_DECREF(item); break; }
+                    buf[(*pos)++] = ',';
+                    buf[(*pos)++] = ' ';
+                }
+                child_first = 0;
+                const char *itype = item->ob_type->tp_name;
+                n = snprintf(buf + *pos, buf_size - *pos, "{\"key\": \"%d\", \"value\": \"", idx);
+                if (n < 0 || (size_t)n >= buf_size - *pos) { Py_DECREF(irepr); Py_DECREF(item); break; }
+                *pos += n;
+                if (*pos + 30 >= buf_size) { Py_DECREF(irepr); Py_DECREF(item); break; }
+                esc_len = json_escape_string(is, buf + *pos, buf_size - *pos - 30);
+                Py_DECREF(irepr);
+                Py_DECREF(item);
+                if (esc_len < 0) break;
+                *pos += esc_len;
+                n = snprintf(buf + *pos, buf_size - *pos, "\", \"type\": \"%s\"}", itype);
+                if (n < 0 || (size_t)n >= buf_size - *pos) break;
+                *pos += n;
+                child_count++;
+                idx++;
+            }
+            Py_DECREF(iter);
+            if (PyErr_Occurred()) PyErr_Clear();
+        } else {
+            PyErr_Clear();
+        }
+    } else {
+        /* Object with __dict__ */
+        PyObject *obj_dict = PyObject_GetAttrString(value, "__dict__");
+        if (obj_dict && PyDict_Check(obj_dict)) {
+            PyObject *key, *val;
+            Py_ssize_t dict_pos = 0;
+            while (PyDict_Next(obj_dict, &dict_pos, &key, &val) && child_count < MAX_CHILDREN) {
+                const char *ks = PyUnicode_AsUTF8(key);
+                if (!ks) { PyErr_Clear(); continue; }
+                g_inside_repr = 1;
+                PyObject *vrepr = PyObject_Repr(val);
+                g_inside_repr = 0;
+                if (!vrepr) { PyErr_Clear(); continue; }
+                const char *vs = PyUnicode_AsUTF8(vrepr);
+                if (!vs) { Py_DECREF(vrepr); PyErr_Clear(); continue; }
+                if (!child_first) {
+                    if (*pos + 2 >= buf_size) { Py_DECREF(vrepr); break; }
+                    buf[(*pos)++] = ',';
+                    buf[(*pos)++] = ' ';
+                }
+                child_first = 0;
+                const char *vtype = val->ob_type->tp_name;
+                if (*pos + 50 >= buf_size) { Py_DECREF(vrepr); break; }
+                memcpy(buf + *pos, "{\"key\": \"", 9); *pos += 9;
+                esc_len = json_escape_string(ks, buf + *pos, buf_size - *pos - 40);
+                if (esc_len < 0) { Py_DECREF(vrepr); break; }
+                *pos += esc_len;
+                if (*pos + 44 >= buf_size) { Py_DECREF(vrepr); break; }
+                memcpy(buf + *pos, "\", \"value\": \"", 13); *pos += 13;
+                if (*pos + 30 >= buf_size) { Py_DECREF(vrepr); break; }
+                esc_len = json_escape_string(vs, buf + *pos, buf_size - *pos - 30);
+                Py_DECREF(vrepr);
+                if (esc_len < 0) break;
+                *pos += esc_len;
+                n = snprintf(buf + *pos, buf_size - *pos, "\", \"type\": \"%s\"}", vtype);
+                if (n < 0 || (size_t)n >= buf_size - *pos) break;
+                *pos += n;
+                child_count++;
+            }
+        }
+        Py_XDECREF(obj_dict);
+        if (PyErr_Occurred()) PyErr_Clear();
+    }
+
+    /* Close: ]} */
+    if (*pos + 2 >= buf_size) return 0;
+    buf[(*pos)++] = ']';
+    buf[(*pos)++] = '}';
+    return 1;
+}
+
 static int serialize_one_local(const char *key_str, PyObject *value,
                                char *buf, size_t buf_size,
                                size_t *pos, int *first, size_t *last_complete_pos) {
+    /* Phase 8B: Secrets redaction — skip repr entirely for sensitive variables */
+    if (should_redact(key_str)) {
+        const char *redacted = "<redacted>";
+        if (!*first) {
+            if (*pos + 2 >= buf_size) return 0;
+            buf[(*pos)++] = ',';
+            buf[(*pos)++] = ' ';
+        }
+        *first = 0;
+        /* Write "key": "<redacted>" */
+        if (*pos + 12 >= buf_size) return 0;
+        buf[(*pos)++] = '"';
+        int esc_len = json_escape_string(key_str, buf + *pos, buf_size - *pos - 10);
+        if (esc_len < 0) return 0;
+        *pos += esc_len;
+        if (*pos + 5 >= buf_size) return 0;
+        buf[(*pos)++] = '"';
+        buf[(*pos)++] = ':';
+        buf[(*pos)++] = ' ';
+        buf[(*pos)++] = '"';
+        size_t rlen = strlen(redacted);
+        if (*pos + rlen + 2 >= buf_size) return 0;
+        memcpy(buf + *pos, redacted, rlen);
+        *pos += rlen;
+        buf[(*pos)++] = '"';
+        *last_complete_pos = *pos;
+        return 1;
+    }
+
+    /* Phase 10A: Try expandable serialization for container types */
+    if (is_expandable(value)) {
+        size_t save_pos = *pos;
+        int save_first = *first;
+        if (!*first) {
+            if (*pos + 2 >= buf_size) return 0;
+            buf[(*pos)++] = ',';
+            buf[(*pos)++] = ' ';
+        }
+        *first = 0;
+        /* Write "key": {structured...} */
+        if (*pos + 12 >= buf_size) { *pos = save_pos; *first = save_first; goto flat_repr; }
+        buf[(*pos)++] = '"';
+        int esc_len = json_escape_string(key_str, buf + *pos, buf_size - *pos - 10);
+        if (esc_len < 0) { *pos = save_pos; *first = save_first; goto flat_repr; }
+        *pos += esc_len;
+        if (*pos + 4 >= buf_size) { *pos = save_pos; *first = save_first; goto flat_repr; }
+        buf[(*pos)++] = '"';
+        buf[(*pos)++] = ':';
+        buf[(*pos)++] = ' ';
+        if (serialize_expandable_value(value, buf, buf_size, pos)) {
+            *last_complete_pos = *pos;
+            return 1;
+        }
+        /* Fall back to flat repr on buffer overflow */
+        *pos = save_pos;
+        *first = save_first;
+    }
+
+flat_repr:;
     g_inside_repr = 1;
     PyObject *repr = PyObject_Repr(value);
     g_inside_repr = 0;
@@ -263,18 +646,18 @@ static int serialize_one_local(const char *key_str, PyObject *value,
     /* Write "key": "escaped_repr" */
     if (*pos + 12 >= buf_size) { Py_DECREF(repr); return 0; }
     buf[(*pos)++] = '"';
-    int esc_len = json_escape_string(key_str, buf + *pos, buf_size - *pos - 10);
-    if (esc_len < 0) { Py_DECREF(repr); return 0; }
-    *pos += esc_len;
+    int esc_len2 = json_escape_string(key_str, buf + *pos, buf_size - *pos - 10);
+    if (esc_len2 < 0) { Py_DECREF(repr); return 0; }
+    *pos += esc_len2;
     if (*pos + 5 >= buf_size) { Py_DECREF(repr); return 0; }
     buf[(*pos)++] = '"';
     buf[(*pos)++] = ':';
     buf[(*pos)++] = ' ';
     buf[(*pos)++] = '"';
     if (*pos + 4 >= buf_size) { Py_DECREF(repr); return 0; }
-    esc_len = json_escape_string(repr_str, buf + *pos, buf_size - *pos - 3);
-    if (esc_len < 0) { Py_DECREF(repr); return 0; }
-    *pos += esc_len;
+    int esc_len3 = json_escape_string(repr_str, buf + *pos, buf_size - *pos - 3);
+    if (esc_len3 < 0) { Py_DECREF(repr); return 0; }
+    *pos += esc_len3;
     if (*pos + 2 >= buf_size) { Py_DECREF(repr); return 0; }
     buf[(*pos)++] = '"';
     *last_complete_pos = *pos;
@@ -654,6 +1037,23 @@ static PyObject *pyttd_eval_hook(PyThreadState *tstate,
         PyObject *result = g_original_eval(tstate, iframe, throwflag);
 
         /* Restore previous trace (only if we removed it) */
+        if (saved_trace) {
+            PyEval_SetTrace(saved_trace, saved_traceobj);
+        }
+        Py_XDECREF(saved_traceobj);
+        Py_DECREF(code);
+        return result;
+    }
+
+    /* Phase 9B: Include filter — skip non-matching functions (same pattern as ignore) */
+    if (!should_include(funcname)) {
+        Py_tracefunc saved_trace = tstate->c_tracefunc;
+        PyObject *saved_traceobj = tstate->c_traceobj;
+        Py_XINCREF(saved_traceobj);
+        if (saved_trace) {
+            PyEval_SetTrace(NULL, NULL);
+        }
+        PyObject *result = g_original_eval(tstate, iframe, throwflag);
         if (saved_trace) {
             PyEval_SetTrace(saved_trace, saved_traceobj);
         }
@@ -1357,6 +1757,47 @@ PyObject *pyttd_set_ignore_patterns(PyObject *self, PyObject *args) {
         }
     }
 
+    Py_RETURN_NONE;
+}
+
+/* Phase 8B: Set secret patterns for variable redaction */
+PyObject *pyttd_set_secret_patterns(PyObject *self, PyObject *args) {
+    (void)self;
+    PyObject *patterns_list;
+    if (!PyArg_ParseTuple(args, "O!", &PyList_Type, &patterns_list)) {
+        return NULL;
+    }
+    clear_secret_filter();
+    Py_ssize_t n = PyList_GET_SIZE(patterns_list);
+    for (Py_ssize_t i = 0; i < n && g_secret_filter.count < MAX_IGNORE_PATTERNS; i++) {
+        PyObject *item = PyList_GET_ITEM(patterns_list, i);
+        const char *pattern = PyUnicode_AsUTF8(item);
+        if (!pattern) { PyErr_Clear(); continue; }
+        char *dup = strdup(pattern);
+        if (dup) g_secret_filter.patterns[g_secret_filter.count++] = dup;
+    }
+    Py_RETURN_NONE;
+}
+
+/* Phase 9B: Set include patterns for selective recording */
+PyObject *pyttd_set_include_patterns(PyObject *self, PyObject *args) {
+    (void)self;
+    PyObject *patterns_list;
+    if (!PyArg_ParseTuple(args, "O!", &PyList_Type, &patterns_list)) {
+        return NULL;
+    }
+    clear_include_filter();
+    Py_ssize_t n = PyList_GET_SIZE(patterns_list);
+    if (n > 0) {
+        g_include_mode = 1;
+        for (Py_ssize_t i = 0; i < n && g_include_filter.count < MAX_IGNORE_PATTERNS; i++) {
+            PyObject *item = PyList_GET_ITEM(patterns_list, i);
+            const char *pattern = PyUnicode_AsUTF8(item);
+            if (!pattern) { PyErr_Clear(); continue; }
+            char *dup = strdup(pattern);
+            if (dup) g_include_filter.patterns[g_include_filter.count++] = dup;
+        }
+    }
     Py_RETURN_NONE;
 }
 

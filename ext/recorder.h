@@ -12,6 +12,8 @@ PyObject *pyttd_get_recording_stats(PyObject *self, PyObject *Py_UNUSED(args));
 PyObject *pyttd_set_ignore_patterns(PyObject *self, PyObject *args);
 PyObject *pyttd_request_stop(PyObject *self, PyObject *Py_UNUSED(args));
 PyObject *pyttd_set_recording_thread(PyObject *self, PyObject *Py_UNUSED(args));
+PyObject *pyttd_set_secret_patterns(PyObject *self, PyObject *args);
+PyObject *pyttd_set_include_patterns(PyObject *self, PyObject *args);
 
 /* Phase 2 getters/setters — used by checkpoint.c and replay.c */
 void recorder_set_fast_forward(int enabled, uint64_t target_seq);
@@ -42,7 +44,7 @@ extern pthread_cond_t g_flush_cond;
 #endif
 
 /* Locals serialization — exposed for checkpoint target state */
-#define MAX_LOCALS_JSON_SIZE   (64 * 1024)
+#define MAX_LOCALS_JSON_SIZE   (256 * 1024)
 extern char g_locals_buf[MAX_LOCALS_JSON_SIZE];
 const char *recorder_serialize_locals(PyObject *frame_obj, char *buf, size_t buf_size,
                                        PyObject *extra_key, PyObject *extra_val);

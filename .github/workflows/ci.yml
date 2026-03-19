@@ -140,7 +140,7 @@ jobs:
           path: dist/*.tar.gz
 
   benchmark:
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -157,10 +157,12 @@ jobs:
         run: pytest benchmarks/bench_components.py benchmarks/bench_flush.py --benchmark-json=benchmark-results.json -v -s
 
       - name: Run overhead benchmarks
-        run: python benchmarks/bench_overhead.py --iterations 3
+        run: python benchmarks/bench_overhead.py -n 3 --json overhead.json
 
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
         with:
           name: benchmark-results
-          path: benchmark-results.json
+          path: |
+            benchmark-results.json
+            overhead.json

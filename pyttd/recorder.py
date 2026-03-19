@@ -26,6 +26,13 @@ class Recorder:
         all_ignore = list(INTERNAL_IGNORE) + list(self.config.ignore_patterns)
         pyttd_native.set_ignore_patterns(all_ignore)
 
+        if self.config.redact_secrets and self.config.secret_patterns:
+            pyttd_native.set_secret_patterns(self.config.secret_patterns)
+        else:
+            pyttd_native.set_secret_patterns([])
+
+        pyttd_native.set_include_patterns(self.config.include_functions)
+
         kwargs = dict(
             flush_callback=self._on_flush,
             buffer_size=self.config.ring_buffer_size,

@@ -48,6 +48,63 @@ def outer():
 outer()
 """
 
+WORKLOAD_TIGHT_LOOP = """\
+total = 0
+for i in range(10000):
+    total += i * i + 1
+"""
+
+WORKLOAD_DEEP_RECURSION = """\
+def recurse(n):
+    if n <= 0:
+        return 0
+    return recurse(n - 1) + 1
+
+recurse(500)
+"""
+
+WORKLOAD_MANY_LOCALS = """\
+def many_vars(n):
+    a, b, c, d, e = 1, 2, 3, 4, 5
+    f, g, h, i, j = 6, 7, 8, 9, 10
+    k, l, m, o, p = 11, 12, 13, 14, 15
+    q, r, s, t, u = 16, 17, 18, 19, 20
+    total = a + b + c + d + e + f + g + h + i + j
+    total += k + l + m + o + p + q + r + s + t + u
+    return total + n
+
+for x in range(200):
+    many_vars(x)
+"""
+
+WORKLOAD_MULTITHREAD = """\
+import threading
+
+def worker(tid, iterations):
+    total = 0
+    for i in range(iterations):
+        total += i * tid
+    return total
+
+threads = []
+for t in range(4):
+    th = threading.Thread(target=worker, args=(t, 500))
+    threads.append(th)
+    th.start()
+for th in threads:
+    th.join()
+"""
+
+# Performance targets (slowdown multiplier)
+TARGETS = {
+    'I/O-bound': 2,
+    'Compute-bound': 10,
+    'Tight loop': 15,
+    'Deep recursion': 10,
+    'Many locals': 15,
+    'Multi-thread': 20,
+}
+
 
 def _python():
     return sys.executable
@@ -140,11 +197,19 @@ def format_results(results):
 
 def write_benchmarks_md(results, output_path):
     """Write full BENCHMARKS.md with results."""
-    io_status = 'PASS' if results[0]['slowdown'] < 2 else 'FAIL'
-    cpu_status = 'PASS' if results[1]['slowdown'] < 10 else 'FAIL'
     peak_rss = max(r['peak_rss_mb'] for r in results)
     rss_status = 'PASS' if peak_rss < 200 else 'FAIL'
     overhead_table = format_results(results)
+
+    target_rows = []
+    for r in results:
+        target = r.get('target', 20)
+        status = r.get('status', 'PASS' if r['slowdown'] < target else 'FAIL')
+        target_rows.append(
+            f"| Recording overhead ({r['name']}) | < {target}x slowdown | "
+            f"{status} ({r['slowdown']:.1f}x) |"
+        )
+    target_table = '\n'.join(target_rows)
 
     content = f"""# pyttd Benchmarks
 
@@ -155,8 +220,7 @@ on {sys.platform} ({os.uname().machine}).
 
 | Metric | Target | Status |
 |--------|--------|--------|
-| Recording overhead (I/O-bound) | < 2x slowdown | {io_status} ({results[0]['slowdown']:.1f}x) |
-| Recording overhead (compute-bound) | < 10x slowdown | {cpu_status} ({results[1]['slowdown']:.1f}x) |
+{target_table}
 | Peak RSS | < 200 MB | {rss_status} ({peak_rss:.0f} MB) |
 | Warm navigation | < 10ms/step | (run pytest benchmarks) |
 | DB size per frame | < 500 bytes | (run pytest benchmarks) |
@@ -199,18 +263,33 @@ def main():
                         help='number of iterations per workload (default: 5)')
     parser.add_argument('--output', type=str, default=None,
                         help='write results to BENCHMARKS.md at this path')
+    parser.add_argument('--json', type=str, default=None,
+                        help='write results as JSON to this path (for CI)')
     args = parser.parse_args()
 
     print(f"Running overhead benchmarks ({args.iterations} iterations each)...\n")
 
+    workloads = [
+        ('I/O-bound', WORKLOAD_IO),
+        ('Compute-bound', WORKLOAD_COMPUTE),
+        ('Tight loop', WORKLOAD_TIGHT_LOOP),
+        ('Deep recursion', WORKLOAD_DEEP_RECURSION),
+        ('Many locals', WORKLOAD_MANY_LOCALS),
+        ('Multi-thread', WORKLOAD_MULTITHREAD),
+    ]
+
     results = []
-    for name, script in [('I/O-bound', WORKLOAD_IO),
-                          ('Compute-bound', WORKLOAD_COMPUTE)]:
+    for name, script in workloads:
         print(f"  {name}...")
         r = bench_workload(name, script, args.iterations)
+        target = TARGETS.get(name, 20)
+        status = 'PASS' if r['slowdown'] < target else 'FAIL'
+        r['target'] = target
+        r['status'] = status
         print(f"    baseline={r['baseline_mean']:.3f}s  "
               f"recorded={r['recorded_mean']:.3f}s  "
               f"slowdown={r['slowdown']:.1f}x  "
+              f"target=<{target}x [{status}]  "
               f"RSS={r['peak_rss_mb']:.1f}MB  "
               f"DB={r['db_size_kb']:.0f}KB")
         results.append(r)
@@ -219,6 +298,12 @@ def main():
 
     if args.output:
         write_benchmarks_md(results, args.output)
+
+    if args.json:
+        import json
+        with open(args.json, 'w') as f:
+            json.dump(results, f, indent=2)
+        print(f"Wrote {args.json}")
 
 
 if __name__ == '__main__':

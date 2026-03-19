@@ -173,6 +173,65 @@ class TestBenchDBSize:
               f"{bytes_per_frame:.1f} bytes/frame")
 
 
+class TestBenchMultiThread:
+    """Multi-thread recording throughput."""
+
+    WORKLOAD_MT = """\
+import threading
+
+def worker(tid, n):
+    total = 0
+    for i in range(n):
+        total += i * tid
+    return total
+
+threads = []
+for t in range(4):
+    th = threading.Thread(target=worker, args=(t, 500))
+    threads.append(th)
+    th.start()
+for th in threads:
+    th.join()
+"""
+
+    def test_bench_multithread_recording(self, bench_record, benchmark):
+        """Multi-thread recording throughput (informational)."""
+        db_path, run_id, _ = bench_record(self.WORKLOAD_MT)
+        session = _setup_session(db_path, run_id)
+
+        def do_steps():
+            for _ in range(20):
+                session.step_into()
+
+        benchmark.pedantic(do_steps, rounds=5, warmup_rounds=1)
+
+
+class TestBenchReverse:
+    """Reverse navigation latency."""
+
+    def test_bench_reverse_continue(self, bench_record, benchmark):
+        """reverse_continue with breakpoints: target < 50ms per hit."""
+        db_path, run_id, _ = bench_record(WORKLOAD_MIXED)
+        session = _setup_session(db_path, run_id)
+        # Move to end
+        line_seqs = _get_line_seqs(run_id)
+        session.goto_frame(line_seqs[-1])
+        # Set breakpoint on a line that appears multiple times
+        from pyttd.models.frames import ExecutionFrames
+        sample = (ExecutionFrames.select()
+                  .where((ExecutionFrames.run_id == run_id) &
+                         (ExecutionFrames.frame_event == 'line'))
+                  .order_by(ExecutionFrames.sequence_no)
+                  .offset(10).limit(1).first())
+        if sample:
+            session.set_breakpoints([{'file': sample.filename, 'line': sample.line_no}])
+
+        def do_reverse():
+            session.reverse_continue()
+
+        benchmark.pedantic(do_reverse, rounds=10, warmup_rounds=1)
+
+
 class TestBenchStack:
     """Stack reconstruction and variable access."""
 

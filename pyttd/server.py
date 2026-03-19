@@ -20,11 +20,15 @@ logger = logging.getLogger(__name__)
 
 class PyttdServer:
     def __init__(self, script: str | None, is_module: bool = False, cwd: str = '.',
-                 checkpoint_interval: int = 1000, replay_db: str | None = None):
+                 checkpoint_interval: int = 1000, replay_db: str | None = None,
+                 include_functions: list[str] | None = None):
         self.script = script
         self.is_module = is_module
         self.cwd = os.path.abspath(cwd)
-        self.config = PyttdConfig(checkpoint_interval=checkpoint_interval)
+        self.config = PyttdConfig(
+            checkpoint_interval=checkpoint_interval,
+            include_functions=include_functions or [],
+        )
         self.recorder = Recorder(self.config)
         self.runner = Runner()
         self.session = Session()
@@ -320,6 +324,8 @@ class PyttdServer:
             "get_traced_files": self._handle_get_traced_files,
             "get_execution_stats": self._handle_get_execution_stats,
             "get_call_children": self._handle_get_call_children,
+            "get_variable_children": self._handle_get_variable_children,
+            "get_variable_history": self._handle_get_variable_history,
             "disconnect": self._handle_disconnect,
         }.get(method)
 
@@ -359,6 +365,8 @@ class PyttdServer:
             if not os.path.isabs(db_path):
                 db_path = os.path.join(self.cwd, db_path)
             self._db_path = db_path
+        if "includePatterns" in params:
+            self.config.include_functions = params["includePatterns"]
         return {}
 
     def _handle_configuration_done(self, params: dict) -> dict:
@@ -491,6 +499,21 @@ class PyttdServer:
         parent_call_seq = params.get("parentCallSeq")
         parent_return_seq = params.get("parentReturnSeq")
         return {"children": self.session.get_call_children(parent_call_seq, parent_return_seq)}
+
+    def _handle_get_variable_children(self, params: dict) -> dict:
+        if self.session.state != "replay":
+            return {"error": "not_in_replay"}
+        ref = params.get("variablesReference", 0)
+        return {"variables": self.session.get_variable_children(ref)}
+
+    def _handle_get_variable_history(self, params: dict) -> dict:
+        if self.session.state != "replay":
+            return {"error": "not_in_replay"}
+        name = params.get("variableName", "")
+        start_seq = params.get("startSeq", 0)
+        end_seq = params.get("endSeq", self.session.last_line_seq or 0)
+        max_points = params.get("maxPoints", 500)
+        return {"history": self.session.get_variable_history(name, start_seq, end_seq, max_points)}
 
     def _handle_disconnect(self, params: dict) -> dict:
         if self._recording:
