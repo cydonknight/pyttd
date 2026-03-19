@@ -478,6 +478,19 @@ class Session:
                 range_filter)
             .order_by(ExecutionFrames.sequence_no))
 
+        # Python 3.12 fires PyTrace_RETURN with Py_None (not NULL) during
+        # exception propagation, causing a spurious 'return' event before
+        # the eval hook's 'exception_unwind'. Filter these out.
+        filtered = []
+        for j, ev in enumerate(events):
+            if (ev.frame_event == 'return' and
+                    j + 1 < len(events) and
+                    events[j + 1].frame_event == 'exception_unwind' and
+                    events[j + 1].function_name == ev.function_name):
+                continue
+            filtered.append(ev)
+        events = filtered
+
         results = []
         i = 0
         while i < len(events):

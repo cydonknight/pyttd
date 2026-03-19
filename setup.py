@@ -8,6 +8,7 @@ if sys.version_info < (3, 12):
 extra_compile_args = []
 if platform.system() == "Windows":
     extra_compile_args.append("/std:c11")
+    extra_compile_args.append("/experimental:c11atomics")
 
 pyttd_native = Extension(
     "pyttd_native",
