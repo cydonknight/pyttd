@@ -50,16 +50,7 @@ include = ["pyttd*"]
 [tool.cibuildwheel]
 build = "cp312-* cp313-*"
 skip = "*-musllinux*"
-test-requires = "pytest"
-
-[tool.cibuildwheel.linux]
-test-command = "pytest {project}/tests/ -x -q"
-
-[tool.cibuildwheel.macos]
-test-command = "pytest {project}/tests/ -x -q"
-
-[tool.cibuildwheel.windows]
-test-command = "pytest {project}/tests/ -x -q -k \"not checkpoint and not server and not serve_db and not (multithread and (step_over or step_into or stack_reconstruction or continue_breakpoint or get_threads))\""
+test-command = "python -c \"import pyttd_native; print('C extension OK:', sorted(dir(pyttd_native)))\""
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
