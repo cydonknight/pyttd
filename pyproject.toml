@@ -3,7 +3,7 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pyttd"
+name = "py-tt-debug"
 version = "0.3.0"
 description = "Python Time-Travel Debugger — record, replay, and step backward through program execution"
 requires-python = ">=3.12"
