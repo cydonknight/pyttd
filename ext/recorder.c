@@ -977,9 +977,32 @@ static DWORD WINAPI flush_thread_func(LPVOID arg) {
     (void)arg;
     while (!atomic_load_explicit(&g_flush_stop, memory_order_relaxed)) {
         Sleep(g_flush_interval_ms);
+        if (atomic_load_explicit(&g_flush_stop, memory_order_relaxed)) break;
         flush_batch();
     }
+    /* Final flush */
     flush_batch();
+
+    /* Close flush thread's DB connection (same as Unix path) */
+    if (atomic_load_explicit(&g_interpreter_alive, memory_order_relaxed)) {
+        PyGILState_STATE gstate = PyGILState_Ensure();
+        PyObject *base_mod = PyImport_ImportModule("pyttd.models.base");
+        if (base_mod) {
+            PyObject *db_obj = PyObject_GetAttrString(base_mod, "db");
+            if (db_obj) {
+                PyObject *close_result = PyObject_CallMethod(db_obj, "close", NULL);
+                Py_XDECREF(close_result);
+                if (PyErr_Occurred()) PyErr_Clear();
+                Py_DECREF(db_obj);
+            } else {
+                PyErr_Clear();
+            }
+            Py_DECREF(base_mod);
+        } else {
+            PyErr_Clear();
+        }
+        PyGILState_Release(gstate);
+    }
     return 0;
 }
 #else
@@ -1232,7 +1255,9 @@ PyObject *pyttd_stop_recording(PyObject *self, PyObject *Py_UNUSED(args)) {
     atomic_store_explicit(&g_flush_stop, 1, memory_order_relaxed);
 #ifdef _WIN32
     if (g_flush_thread) {
-        WaitForSingleObject(g_flush_thread, 5000);
+        Py_BEGIN_ALLOW_THREADS
+        WaitForSingleObject(g_flush_thread, INFINITE);
+        Py_END_ALLOW_THREADS
         CloseHandle(g_flush_thread);
         g_flush_thread = NULL;
     }
