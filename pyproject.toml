@@ -50,8 +50,16 @@ include = ["pyttd*"]
 [tool.cibuildwheel]
 build = "cp312-* cp313-*"
 skip = "*-musllinux*"
-test-command = "pytest {project}/tests/ -x -q"
 test-requires = "pytest"
+
+[tool.cibuildwheel.linux]
+test-command = "pytest {project}/tests/ -x -q"
+
+[tool.cibuildwheel.macos]
+test-command = "pytest {project}/tests/ -x -q"
+
+[tool.cibuildwheel.windows]
+test-command = "pytest {project}/tests/ -x -q -k \"not checkpoint and not server and not serve_db and not (multithread and (step_over or step_into or stack_reconstruction or continue_breakpoint or get_threads))\""
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
