@@ -1,4 +1,5 @@
 from datetime import datetime
+import logging
 import os
 import pyttd_native
 from pyttd.config import PyttdConfig
@@ -9,20 +10,39 @@ from pyttd.models.checkpoints import Checkpoint
 from pyttd.models.io_events import IOEvent
 from pyttd.tracing.constants import IGNORE_PATTERNS as INTERNAL_IGNORE
 
+logger = logging.getLogger(__name__)
+
+
 class Recorder:
     def __init__(self, config: PyttdConfig):
         self.config = config
         self._recording = False
         self._run = None
         self._realpath_cache = {}
+        self._db_path = None
+        self._flush_count = 0
+        self._size_warned = False
 
     def start(self, db_path: str, script_path: str | None = None):
         """Initialize DB, create Runs record, set ignore patterns, install frame eval hook."""
+        self._db_path = db_path
         storage.connect_to_db(db_path)
         storage.initialize_schema([Runs, ExecutionFrames, Checkpoint, IOEvent])
-        # Clear stale checkpoint state from any previous crashed session
-        Checkpoint.update(is_alive=False, child_pid=None).execute()
+        # Clear stale checkpoint state from crashed sessions (pid-liveness check)
+        for cp in Checkpoint.select().where(Checkpoint.is_alive == True):
+            if cp.child_pid:
+                try:
+                    os.kill(cp.child_pid, 0)
+                except (OSError, ProcessLookupError):
+                    cp.is_alive = False
+                    cp.child_pid = None
+                    cp.save()
         self._run = Runs.create(script_path=script_path)
+        # Auto-evict old runs if keep_runs is configured
+        if self.config.keep_runs > 0:
+            evicted = storage._evict_old_runs_internal(self.config.keep_runs)
+            if evicted:
+                logger.info("Evicted %d old run(s)", len(evicted))
         all_ignore = list(INTERNAL_IGNORE) + list(self.config.ignore_patterns)
         pyttd_native.set_ignore_patterns(all_ignore)
 
@@ -114,8 +134,22 @@ class Recorder:
         try:
             storage.batch_insert(ExecutionFrames, events)
         except Exception:
-            import logging
-            logging.getLogger(__name__).exception("batch_insert failed")
+            logger.exception("batch_insert failed")
+
+        # Size monitoring (throttled to every 100 flush cycles)
+        if self.config.max_db_size_mb > 0 and self._db_path:
+            self._flush_count += 1
+            if self._flush_count % 100 == 0 and not self._size_warned:
+                try:
+                    size_mb = os.path.getsize(self._db_path) / (1024 * 1024)
+                    if size_mb >= self.config.max_db_size_mb:
+                        logger.warning(
+                            "Database size %.1f MB exceeds limit %d MB: %s",
+                            size_mb, self.config.max_db_size_mb, self._db_path
+                        )
+                        self._size_warned = True
+                except OSError:
+                    pass
 
     def _on_io_event(self, event: dict):
         """Called synchronously by C I/O hooks (with GIL held) to insert a single IOEvent."""

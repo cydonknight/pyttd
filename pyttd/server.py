@@ -12,8 +12,7 @@ from pyttd.recorder import Recorder
 from pyttd.runner import Runner
 from pyttd.session import Session
 from pyttd.protocol import JsonRpcConnection
-from pyttd.models.constants import DB_NAME_SUFFIX
-from pyttd.models.storage import delete_db_files
+from pyttd.models.storage import compute_db_path
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +24,11 @@ class PyttdServer:
                  max_frames: int = 0, env_vars: dict | None = None,
                  include_files: list[str] | None = None,
                  exclude_functions: list[str] | None = None,
-                 exclude_files: list[str] | None = None):
+                 exclude_files: list[str] | None = None,
+                 db_path: str | None = None,
+                 max_db_size_mb: int = 0,
+                 keep_runs: int = 0,
+                 target_run_id: str | None = None):
         self.script = script
         self.is_module = is_module
         self.cwd = os.path.abspath(cwd)
@@ -36,6 +39,8 @@ class PyttdServer:
             include_files=include_files or [],
             exclude_functions=exclude_functions or [],
             exclude_files=exclude_files or [],
+            max_db_size_mb=max_db_size_mb,
+            keep_runs=keep_runs,
         )
         self._launch_env = env_vars or {}
         self.recorder = Recorder(self.config)
@@ -53,17 +58,16 @@ class PyttdServer:
         self._frame_count = 0
         self._frame_count_lock = threading.Lock()
         self._replay_db = replay_db
+        self._target_run_id = target_run_id
 
         # Compute DB path
         if replay_db:
             self._db_path = os.path.abspath(replay_db)
-        elif is_module:
-            script_name = script.replace('.', '_')
-            self._db_path = os.path.join(self.cwd, script_name + DB_NAME_SUFFIX)
         else:
-            script_abs = os.path.realpath(script)
-            script_name = os.path.splitext(os.path.basename(script_abs))[0]
-            self._db_path = os.path.join(os.path.dirname(script_abs) or '.', script_name + DB_NAME_SUFFIX)
+            self._db_path = compute_db_path(
+                script, is_module=is_module, cwd=self.cwd,
+                explicit_path=db_path,
+            )
 
         self._script_args = []
         self._saved_stdout = None
@@ -266,6 +270,10 @@ class PyttdServer:
                     progress_data["droppedFrames"] = stats.get('dropped_frames', 0)
                     progress_data["poolOverflows"] = stats.get('pool_overflows', 0)
                 except Exception:
+                    pass
+                try:
+                    progress_data["dbSizeMB"] = round(os.path.getsize(self._db_path) / (1024 * 1024), 1)
+                except OSError:
                     pass
                 self._rpc.send_notification("progress", progress_data)
 
@@ -566,9 +574,22 @@ class PyttdServer:
 
         storage.connect_to_db(self._db_path)
 
-        last_run = (Runs.select()
-                    .order_by(Runs.timestamp_start.desc())
-                    .limit(1).first())
+        if self._target_run_id:
+            from pyttd.query import get_run_by_id
+            try:
+                last_run = get_run_by_id(self._db_path, self._target_run_id)
+            except ValueError as e:
+                if self._rpc and not self._rpc.is_closed:
+                    self._rpc.send_notification("output", {
+                        "category": "stderr",
+                        "output": f"{e}\n",
+                    })
+                self._shutdown = True
+                return
+        else:
+            last_run = (Runs.select()
+                        .order_by(Runs.timestamp_start.desc())
+                        .limit(1).first())
         if not last_run:
             if self._rpc and not self._rpc.is_closed:
                 self._rpc.send_notification("output", {
@@ -601,8 +622,6 @@ class PyttdServer:
         script_abs = self.script
         if not self.is_module:
             script_abs = os.path.realpath(self.script)
-
-        delete_db_files(self._db_path)
 
         # Wrap flush callback to track frame count
         original_on_flush = self.recorder._on_flush

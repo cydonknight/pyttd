@@ -17,6 +17,8 @@ class PyttdConfig:
     include_functions: list[str] = field(default_factory=list)
     max_frames: int = 0        # 0 = unlimited
     max_memory_mb: int = 0     # 0 = unlimited
+    max_db_size_mb: int = 0    # 0 = unlimited; warn when DB exceeds this
+    keep_runs: int = 0         # 0 = keep all; N = keep only last N runs
     include_files: list[str] = field(default_factory=list)
     exclude_functions: list[str] = field(default_factory=list)
     exclude_files: list[str] = field(default_factory=list)
@@ -32,3 +34,7 @@ class PyttdConfig:
             raise ValueError("max_frames must be >= 0")
         if self.max_memory_mb < 0:
             raise ValueError("max_memory_mb must be >= 0")
+        if self.max_db_size_mb < 0:
+            raise ValueError("max_db_size_mb must be >= 0")
+        if self.keep_runs < 0:
+            raise ValueError("keep_runs must be >= 0")

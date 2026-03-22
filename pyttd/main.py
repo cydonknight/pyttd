@@ -2,8 +2,8 @@ import functools
 import os
 from pyttd.config import PyttdConfig
 from pyttd.recorder import Recorder
-from pyttd.models.constants import DB_NAME_SUFFIX
-from pyttd.models.storage import delete_db_files
+from pyttd.models.storage import compute_db_path
+
 
 def ttdbg(func):
     """Decorator that records function execution with the C extension."""
@@ -11,9 +11,7 @@ def ttdbg(func):
     def wrapper(*args, **kwargs):
         import inspect
         source_file = os.path.realpath(inspect.getfile(func))
-        script_name = os.path.splitext(os.path.basename(source_file))[0]
-        db_path = os.path.join(os.path.dirname(source_file) or '.', script_name + DB_NAME_SUFFIX)
-        delete_db_files(db_path)
+        db_path = compute_db_path(source_file)
         config = PyttdConfig(checkpoint_interval=0)
         recorder = Recorder(config)
         recorder.start(db_path, script_path=source_file)
@@ -44,10 +42,8 @@ def start_recording(db_path: str | None = None, **kwargs):
         import inspect
         caller_frame = inspect.stack()[1]
         source_file = os.path.realpath(caller_frame.filename)
-        script_name = os.path.splitext(os.path.basename(source_file))[0]
-        db_path = os.path.join(os.path.dirname(source_file) or '.', script_name + DB_NAME_SUFFIX)
+        db_path = compute_db_path(source_file)
 
-    delete_db_files(db_path)
     config = PyttdConfig(**kwargs)
     _active_recorder = Recorder(config)
     _active_recorder.start(db_path)

@@ -2044,3 +2044,12 @@ PyObject *pyttd_set_recording_thread(PyObject *self, PyObject *Py_UNUSED(args)) 
     g_main_thread_id = PyThread_get_thread_ident();
     Py_RETURN_NONE;
 }
+
+PyObject *pyttd_trace_current_frame(PyObject *self, PyObject *Py_UNUSED(args)) {
+    (void)self;
+    /* No-op: PyEval_SetTrace on Python 3.12+ has persistent monitoring
+     * side effects that corrupt subsequent recordings. The public API
+     * captures function calls via the eval hook but NOT line events in
+     * the caller's already-entered frame. */
+    Py_RETURN_NONE;
+}

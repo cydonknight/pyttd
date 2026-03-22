@@ -42,6 +42,8 @@ static PyMethodDef PyttdMethods[] = {
      "Set file path glob patterns for selective recording (empty = record all)"},
     {"set_exclude_patterns", (PyCFunction)pyttd_set_exclude_patterns, METH_VARARGS,
      "Set exclude patterns: (func_patterns, file_patterns). Excluded functions/files are never recorded."},
+    {"trace_current_frame", pyttd_trace_current_frame, METH_NOARGS,
+     "Install trace function on current thread to capture line events in the caller's frame."},
     {NULL, NULL, 0, NULL}
 };
 
