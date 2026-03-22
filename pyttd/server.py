@@ -355,6 +355,8 @@ class PyttdServer:
             "get_variable_children": self._handle_get_variable_children,
             "get_variable_history": self._handle_get_variable_history,
             "get_checkpoint_memory": self._handle_get_checkpoint_memory,
+            "set_function_breakpoints": self._handle_set_function_breakpoints,
+            "set_data_breakpoints": self._handle_set_data_breakpoints,
             "disconnect": self._handle_disconnect,
         }.get(method)
 
@@ -464,7 +466,12 @@ class PyttdServer:
     def _handle_continue(self, params: dict) -> dict:
         if self.session.state != "replay":
             return {"error": "not_in_replay"}
-        return self.session.continue_forward()
+        result = self.session.continue_forward()
+        # Send accumulated log point messages
+        for msg in getattr(self.session, '_log_messages', []):
+            if self._rpc and not self._rpc.is_closed:
+                self._rpc.send_notification("logpoint", {"message": msg})
+        return result
 
     def _handle_next(self, params: dict) -> dict:
         if self.session.state != "replay":
@@ -564,6 +571,19 @@ class PyttdServer:
         mem_info = pyttd_native.get_checkpoint_memory()
         mem_info["limitMB"] = self.config.checkpoint_memory_limit_mb
         return mem_info
+
+    def _handle_set_function_breakpoints(self, params: dict) -> dict:
+        breakpoints = params.get("breakpoints", [])
+        self.session.set_function_breakpoints(breakpoints)
+        if self.session.state == "replay":
+            verification = self.session.verify_function_breakpoints(breakpoints)
+            return {"verified": verification}
+        return {}
+
+    def _handle_set_data_breakpoints(self, params: dict) -> dict:
+        breakpoints = params.get("breakpoints", [])
+        self.session.set_data_breakpoints(breakpoints)
+        return {"verified": [{"verified": True} for _ in breakpoints]}
 
     def _handle_disconnect(self, params: dict) -> dict:
         if self._recording:

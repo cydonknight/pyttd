@@ -5,6 +5,7 @@ import { TimelineScrubberProvider } from './providers/timelineScrubberProvider';
 import { PyttdCodeLensProvider } from './providers/codeLensProvider';
 import { PyttdInlineValuesProvider } from './providers/inlineValuesProvider';
 import { PyttdCallHistoryProvider } from './providers/callHistoryProvider';
+import { PyttdStatusBarProvider } from './providers/statusBarProvider';
 
 export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(
@@ -40,6 +41,18 @@ export function activate(context: vscode.ExtensionContext) {
     const timelineProvider = new TimelineScrubberProvider(context.extensionUri);
     context.subscriptions.push(
         vscode.window.registerWebviewViewProvider('pyttd.timeline', timelineProvider)
+    );
+
+    // Status bar provider
+    const statusBar = new PyttdStatusBarProvider();
+    context.subscriptions.push(statusBar);
+
+    // Register command to focus timeline view
+    context.subscriptions.push(
+        vscode.commands.registerCommand('pyttd.focusTimeline', () => {
+            // Focus the timeline webview in the debug sidebar
+            vscode.commands.executeCommand('pyttd.timeline.focus');
+        }),
     );
 
     // Phase 6: CodeLens, Inline Values, Call History
@@ -150,6 +163,7 @@ export function activate(context: vscode.ExtensionContext) {
                 codeLensProvider.refresh();
                 memoryStatusBar.text = '$(pulse) TTD: Recording...';
                 memoryStatusBar.show();
+                statusBar.startRecording();
             }
         }),
         vscode.debug.onDidTerminateDebugSession((session) => {
@@ -159,6 +173,7 @@ export function activate(context: vscode.ExtensionContext) {
                 callHistoryRefreshed = false;
                 memoryStatusBar.hide();
                 lastCheckpointMemoryInfo = null;
+                statusBar.reset();
             }
         }),
     );
@@ -196,6 +211,15 @@ export function activate(context: vscode.ExtensionContext) {
             if (e.event === 'pyttd/timelineData' && !callHistoryRefreshed) {
                 callHistoryRefreshed = true;
                 callHistoryProvider.refresh();
+                statusBar.enterReplay(e.body.startSeq || 0, e.body.totalFrames || 0);
+            }
+            // Update status bar position on navigation
+            if (e.event === 'pyttd/positionChanged') {
+                statusBar.updatePosition(e.body.seq);
+            }
+            // Update status bar during recording
+            if (e.event === 'pyttd/recordingProgress') {
+                statusBar.updateRecording(e.body);
             }
         }),
     );
