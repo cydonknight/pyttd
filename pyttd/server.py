@@ -471,6 +471,14 @@ class PyttdServer:
         for msg in getattr(self.session, '_log_messages', []):
             if self._rpc and not self._rpc.is_closed:
                 self._rpc.send_notification("logpoint", {"message": msg})
+        # Surface condition eval errors as notifications
+        for err in self.session.get_condition_errors():
+            if self._rpc and not self._rpc.is_closed:
+                self._rpc.send_notification("conditionError", {
+                    "seq": err["seq"],
+                    "condition": err["condition"],
+                    "error": err["error"],
+                })
         return result
 
     def _handle_next(self, params: dict) -> dict:
@@ -496,14 +504,22 @@ class PyttdServer:
     def _handle_reverse_continue(self, params: dict) -> dict:
         if self.session.state != "replay":
             return {"error": "not_in_replay"}
-        return self.session.reverse_continue()
+        result = self.session.reverse_continue()
+        for err in self.session.get_condition_errors():
+            if self._rpc and not self._rpc.is_closed:
+                self._rpc.send_notification("conditionError", {
+                    "seq": err["seq"],
+                    "condition": err["condition"],
+                    "error": err["error"],
+                })
+        return result
 
     def _handle_goto_frame(self, params: dict) -> dict:
         if self.session.state != "replay":
             return {"error": "not_in_replay"}
-        target_seq = params.get("target_seq")
+        target_seq = params.get("targetSeq") or params.get("target_seq")
         if target_seq is None:
-            return {"error": "missing_target_seq"}
+            return {"error": "missing_targetSeq"}
         return self.session.goto_frame(target_seq)
 
     def _handle_goto_targets(self, params: dict) -> dict:
@@ -516,9 +532,9 @@ class PyttdServer:
     def _handle_restart_frame(self, params: dict) -> dict:
         if self.session.state != "replay":
             return {"error": "not_in_replay"}
-        frame_seq = params.get("frame_seq")
+        frame_seq = params.get("frameSeq") or params.get("frame_seq")
         if frame_seq is None:
-            return {"error": "missing_frame_seq"}
+            return {"error": "missing_frameSeq"}
         return self.session.restart_frame(frame_seq)
 
     def _handle_get_timeline_summary(self, params: dict) -> dict:

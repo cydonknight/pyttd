@@ -685,7 +685,9 @@ static PyObject *hooked_uuid_uuid1(PyObject *self, PyObject *args, PyObject *kwa
 static PyObject *convert_datetime_to_subclass(PyObject *orig_result) {
     if (!g_hooked_datetime_class || !orig_result) return orig_result;
     /* Already our subclass — no conversion needed */
-    if (PyObject_IsInstance(orig_result, g_hooked_datetime_class) == 1) return orig_result;
+    int is_inst = PyObject_IsInstance(orig_result, g_hooked_datetime_class);
+    if (is_inst < 0) PyErr_Clear();
+    if (is_inst == 1) return orig_result;
 
     if (!PyDateTimeAPI) {
         PyDateTime_IMPORT;

@@ -65,10 +65,10 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.languages.registerInlineValuesProvider({ language: 'python' }, new PyttdInlineValuesProvider()),
         vscode.window.registerTreeDataProvider('pyttd.callHistory', callHistoryProvider),
         vscode.commands.registerCommand('pyttd.gotoFirstExecution', (seq: number) => {
-            vscode.debug.activeDebugSession?.customRequest('goto_frame', { target_seq: seq });
+            vscode.debug.activeDebugSession?.customRequest('goto_frame', { targetSeq: seq });
         }),
         vscode.commands.registerCommand('pyttd.gotoCallFrame', (seq: number) => {
-            vscode.debug.activeDebugSession?.customRequest('goto_frame', { target_seq: seq });
+            vscode.debug.activeDebugSession?.customRequest('goto_frame', { targetSeq: seq });
         }),
     );
 

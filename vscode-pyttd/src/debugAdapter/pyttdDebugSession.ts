@@ -268,6 +268,12 @@ export class PyttdDebugSession extends LoggingDebugSession {
             case 'logpoint':
                 this.sendEvent(new OutputEvent(params.message + '\n', 'console'));
                 break;
+            case 'conditionError':
+                this.sendEvent(new OutputEvent(
+                    `Breakpoint condition error at seq ${params.seq}: "${params.condition}" — ${params.error}\n`,
+                    'console'
+                ));
+                break;
         }
     }
 
@@ -782,7 +788,7 @@ export class PyttdDebugSession extends LoggingDebugSession {
         }
 
         this.backend
-            .sendRequest('goto_frame', { target_seq: args.targetId })
+            .sendRequest('goto_frame', { targetSeq: args.targetId })
             .then((result: any) => {
                 this.currentSeq = result.seq;
                 this.sendResponse(response);
@@ -803,7 +809,7 @@ export class PyttdDebugSession extends LoggingDebugSession {
         }
 
         this.backend
-            .sendRequest('restart_frame', { frame_seq: args.frameId })
+            .sendRequest('restart_frame', { frameSeq: args.frameId })
             .then((result: any) => {
                 this.currentSeq = result.seq;
                 this.sendResponse(response);

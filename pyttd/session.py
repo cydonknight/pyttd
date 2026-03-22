@@ -48,6 +48,7 @@ class Session:
         self._bp_hit_counts = {}  # (file, line) -> hit_count
         self._fn_bp_hit_counts = {}  # name -> hit_count
         self._log_messages = []  # accumulated log messages from logpoints
+        self._condition_errors = []  # [{seq, condition, error}, ...] from last navigation
         self.current_stack = []    # [{seq, name, file, line, depth}, ...]
         self.first_line_seq = None
         self.last_line_seq = None
@@ -250,6 +251,7 @@ class Session:
         self._require_replay()
         candidates = []
         self._log_messages = []
+        self._condition_errors = []
 
         for bp in self.breakpoints:
             if 'file' not in bp or 'line' not in bp:
@@ -295,27 +297,17 @@ class Session:
                 candidates.append((hit, "data breakpoint"))
 
         if "raised" in self.exception_filters:
-            hit = (ExecutionFrames.select(ExecutionFrames.sequence_no)
-                   .where((ExecutionFrames.run_id == self.run_id) &
-                          (ExecutionFrames.frame_event == 'exception') &
-                          (ExecutionFrames.sequence_no > self.current_frame_seq))
-                   .order_by(ExecutionFrames.sequence_no)
-                   .limit(1).first())
-            if hit:
-                snap = self._snap_to_line(hit.sequence_no)
-                candidates.append((snap, "exception"))
+            hit = self._find_next_exception_forward(
+                'exception', self.current_frame_seq)
+            if hit is not None:
+                candidates.append((hit, "exception"))
 
         if "uncaught" in self.exception_filters:
-            hit = (ExecutionFrames.select(ExecutionFrames.sequence_no)
-                   .where((ExecutionFrames.run_id == self.run_id) &
-                          (ExecutionFrames.frame_event == 'exception_unwind') &
-                          (ExecutionFrames.call_depth == 0) &
-                          (ExecutionFrames.sequence_no > self.current_frame_seq))
-                   .order_by(ExecutionFrames.sequence_no)
-                   .limit(1).first())
-            if hit:
-                snap = self._snap_to_line(hit.sequence_no)
-                candidates.append((snap, "exception"))
+            hit = self._find_next_exception_forward(
+                'exception_unwind', self.current_frame_seq,
+                depth_filter=0)
+            if hit is not None:
+                candidates.append((hit, "exception"))
 
         if not candidates:
             return self._navigate_to(self.last_line_seq, "end")
@@ -342,6 +334,7 @@ class Session:
     def reverse_continue(self) -> dict:
         self._require_replay()
         candidates = []
+        self._condition_errors = []
 
         for bp in self.breakpoints:
             if 'file' not in bp or 'line' not in bp:
@@ -383,27 +376,17 @@ class Session:
                 candidates.append((hit, "data breakpoint"))
 
         if "raised" in self.exception_filters:
-            hit = (ExecutionFrames.select(ExecutionFrames.sequence_no)
-                   .where((ExecutionFrames.run_id == self.run_id) &
-                          (ExecutionFrames.frame_event == 'exception') &
-                          (ExecutionFrames.sequence_no < self.current_frame_seq))
-                   .order_by(ExecutionFrames.sequence_no.desc())
-                   .limit(1).first())
-            if hit:
-                snap = self._snap_to_line(hit.sequence_no)
-                candidates.append((snap, "exception"))
+            hit = self._find_next_exception_reverse(
+                'exception', self.current_frame_seq)
+            if hit is not None:
+                candidates.append((hit, "exception"))
 
         if "uncaught" in self.exception_filters:
-            hit = (ExecutionFrames.select(ExecutionFrames.sequence_no)
-                   .where((ExecutionFrames.run_id == self.run_id) &
-                          (ExecutionFrames.frame_event == 'exception_unwind') &
-                          (ExecutionFrames.call_depth == 0) &
-                          (ExecutionFrames.sequence_no < self.current_frame_seq))
-                   .order_by(ExecutionFrames.sequence_no.desc())
-                   .limit(1).first())
-            if hit:
-                snap = self._snap_to_line(hit.sequence_no)
-                candidates.append((snap, "exception"))
+            hit = self._find_next_exception_reverse(
+                'exception_unwind', self.current_frame_seq,
+                depth_filter=0)
+            if hit is not None:
+                candidates.append((hit, "exception"))
 
         if not candidates:
             return self._navigate_to(self.first_line_seq, "start")
@@ -652,7 +635,15 @@ class Session:
             fn.SUM(SQL("CASE WHEN frame_event = 'exception_unwind' "
                        "THEN 1 ELSE 0 END")).alias('exception_count'),
             fn.MIN(SQL("CASE WHEN frame_event = 'call' THEN sequence_no END")).alias('first_call_seq'),
-            fn.MIN(SQL("CASE WHEN frame_event = 'call' THEN line_no END")).alias('def_line'),
+            # Use NULLIF to skip line_no=-1 (CPython returns -1 for
+            # metaclass/constructor frames). Fall back to the first line
+            # event's line_no via COALESCE.
+            fn.COALESCE(
+                fn.MIN(SQL("CASE WHEN frame_event = 'call' "
+                           "THEN NULLIF(line_no, -1) END")),
+                fn.MIN(SQL("CASE WHEN frame_event = 'line' "
+                           "THEN line_no END")),
+            ).alias('def_line'),
         ).where(
             (ExecutionFrames.run_id == self.run_id) &
             (ExecutionFrames.filename == filename)
@@ -663,7 +654,7 @@ class Session:
             'callCount': r['call_count'] or 0,
             'exceptionCount': r['exception_count'] or 0,
             'firstCallSeq': r['first_call_seq'],
-            'defLine': r['def_line'],
+            'defLine': r['def_line'] or 0,
         } for r in rows if r['call_count']]
 
     def get_call_children(self, parent_call_seq=None, parent_return_seq=None) -> list[dict]:
@@ -825,6 +816,11 @@ class Session:
             })
         return results
 
+    def get_condition_errors(self) -> list[dict]:
+        """Return condition eval errors from the last continue/reverse_continue.
+        Each entry: {seq, condition, error}."""
+        return list(self._condition_errors)
+
     # --- Internal helpers ---
 
     def _evaluate_condition(self, condition: str, seq: int) -> bool:
@@ -846,6 +842,9 @@ class Session:
             return bool(eval(condition, {"__builtins__": SAFE_BUILTINS}, eval_locals))
         except Exception as e:
             logger.warning("Condition eval error at seq %d: %s", seq, e)
+            self._condition_errors.append({
+                "seq": seq, "condition": condition, "error": str(e)
+            })
             return False
 
     def _find_conditional_hit_forward(self, filename: str, line: int,
@@ -855,32 +854,33 @@ class Session:
         bp_key = (filename, line)
 
         if not condition or not condition.strip():
-            # Fast path: no expression condition
-            hit = (ExecutionFrames.select(ExecutionFrames.sequence_no)
-                   .where((ExecutionFrames.run_id == self.run_id) &
-                          (ExecutionFrames.filename == filename) &
-                          (ExecutionFrames.line_no == line) &
-                          (ExecutionFrames.frame_event == 'line') &
-                          (ExecutionFrames.sequence_no > after_seq))
-                   .order_by(ExecutionFrames.sequence_no)
-                   .limit(1).first())
-            if hit is None:
-                return None
-            # Check hit condition
-            if hit_condition:
-                self._bp_hit_counts[bp_key] = self._bp_hit_counts.get(bp_key, 0) + 1
-                if not self._check_hit_condition(hit_condition, self._bp_hit_counts[bp_key]):
-                    # Recurse to find next
-                    return self._find_conditional_hit_forward(
-                        filename, line, condition, hit.sequence_no,
-                        hit_condition=hit_condition, log_message=log_message)
-            # Handle log points
-            if log_message:
-                msg = self._format_log_message(log_message, hit.sequence_no)
-                self._log_messages.append(msg)
-                # Don't stop, but return the seq so caller knows we hit something
+            # Fast path: no expression condition — use loop (not recursion)
+            # to avoid stack overflow with large hit conditions
+            cursor = after_seq
+            while True:
+                hit = (ExecutionFrames.select(ExecutionFrames.sequence_no)
+                       .where((ExecutionFrames.run_id == self.run_id) &
+                              (ExecutionFrames.filename == filename) &
+                              (ExecutionFrames.line_no == line) &
+                              (ExecutionFrames.frame_event == 'line') &
+                              (ExecutionFrames.sequence_no > cursor))
+                       .order_by(ExecutionFrames.sequence_no)
+                       .limit(1).first())
+                if hit is None:
+                    return None
+                # Check hit condition
+                if hit_condition:
+                    self._bp_hit_counts[bp_key] = self._bp_hit_counts.get(bp_key, 0) + 1
+                    if not self._check_hit_condition(hit_condition, self._bp_hit_counts[bp_key]):
+                        cursor = hit.sequence_no
+                        continue
+                # Handle log points
+                if log_message:
+                    msg = self._format_log_message(log_message, hit.sequence_no)
+                    self._log_messages.append(msg)
+                    # Don't stop, but return the seq so caller knows we hit something
+                    return hit.sequence_no
                 return hit.sequence_no
-            return hit.sequence_no
 
         cursor = after_seq
         for _ in range(MAX_CONDITIONAL_SEARCH):
@@ -1081,6 +1081,66 @@ class Session:
                     .order_by(ExecutionFrames.sequence_no)
                     .limit(1).first())
         return line_fwd.sequence_no if line_fwd else seq
+
+    def _find_next_exception_forward(self, event_type: str,
+                                      current_seq: int,
+                                      depth_filter: int | None = None) -> int | None:
+        """Find the next exception event after current_seq, snapped to a line.
+
+        Handles the snap-to-line aliasing problem: if the snapped position
+        equals current_seq, skip that exception and find the next one.
+        """
+        search_after = current_seq
+        while True:
+            conditions = [
+                (ExecutionFrames.run_id == self.run_id),
+                (ExecutionFrames.frame_event == event_type),
+                (ExecutionFrames.sequence_no > search_after),
+            ]
+            if depth_filter is not None:
+                conditions.append(ExecutionFrames.call_depth == depth_filter)
+            hit = (ExecutionFrames.select(ExecutionFrames.sequence_no)
+                   .where(*conditions)
+                   .order_by(ExecutionFrames.sequence_no)
+                   .limit(1).first())
+            if hit is None:
+                return None
+            snap = self._snap_to_line(hit.sequence_no)
+            if snap > current_seq:
+                return snap
+            # Snapped position didn't advance past current — skip this
+            # exception's raw seq and search for the next one.
+            search_after = hit.sequence_no
+
+    def _find_next_exception_reverse(self, event_type: str,
+                                      current_seq: int,
+                                      depth_filter: int | None = None) -> int | None:
+        """Find the previous exception event before current_seq, snapped to a line.
+
+        Handles the snap-to-line aliasing problem: if the snapped position
+        equals current_seq, skip that exception and find the previous one.
+        """
+        search_before = current_seq
+        while True:
+            conditions = [
+                (ExecutionFrames.run_id == self.run_id),
+                (ExecutionFrames.frame_event == event_type),
+                (ExecutionFrames.sequence_no < search_before),
+            ]
+            if depth_filter is not None:
+                conditions.append(ExecutionFrames.call_depth == depth_filter)
+            hit = (ExecutionFrames.select(ExecutionFrames.sequence_no)
+                   .where(*conditions)
+                   .order_by(ExecutionFrames.sequence_no.desc())
+                   .limit(1).first())
+            if hit is None:
+                return None
+            snap = self._snap_to_line(hit.sequence_no)
+            if snap < current_seq:
+                return snap
+            # Snapped position didn't retreat past current — skip this
+            # exception's raw seq and search for the previous one.
+            search_before = hit.sequence_no
 
     def _get_current_frame(self):
         return ExecutionFrames.get_or_none(

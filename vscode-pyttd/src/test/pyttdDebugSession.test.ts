@@ -252,7 +252,7 @@ describe('PyttdDebugSession', () => {
             mockServer.handlers.set('step_out', () => ({ seq: 20, reason: 'step' }));
             mockServer.handlers.set('step_back', () => ({ seq: 9, reason: 'step' }));
             mockServer.handlers.set('reverse_continue', () => ({ seq: 1, reason: 'start' }));
-            mockServer.handlers.set('goto_frame', (p: any) => ({ seq: p.target_seq, reason: 'goto' }));
+            mockServer.handlers.set('goto_frame', (p: any) => ({ seq: p.targetSeq, reason: 'goto' }));
             mockServer.handlers.set('goto_targets', () => ({
                 targets: [{ seq: 10, function_name: 'foo' }]
             }));
@@ -588,7 +588,7 @@ describe('PyttdDebugSession', () => {
             it('should handle goto_frame as navigation', async () => {
                 harness.clearEvents();
                 const response = { command: 'goto_frame', success: true } as DebugProtocol.Response;
-                (harness.session as any).customRequest('goto_frame', response, { target_seq: 30 });
+                (harness.session as any).customRequest('goto_frame', response, { targetSeq: 30 });
                 await new Promise(r => setTimeout(r, 100));
 
                 assert.strictEqual((harness.session as any).currentSeq, 30);

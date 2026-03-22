@@ -28,15 +28,20 @@ class Recorder:
         self._db_path = db_path
         storage.connect_to_db(db_path)
         storage.initialize_schema([Runs, ExecutionFrames, Checkpoint, IOEvent])
-        # Clear stale checkpoint state from crashed sessions (pid-liveness check)
-        for cp in Checkpoint.select().where(Checkpoint.is_alive == True):
-            if cp.child_pid:
-                try:
-                    os.kill(cp.child_pid, 0)
-                except (OSError, ProcessLookupError):
-                    cp.is_alive = False
-                    cp.child_pid = None
-                    cp.save()
+        # Clear stale checkpoint state from crashed sessions (pid-liveness check).
+        # Wrapped in try/except because orphaned WAL files from a prior killed
+        # recording can cause "database is locked" on the UPDATE.
+        try:
+            for cp in Checkpoint.select().where(Checkpoint.is_alive == True):
+                if cp.child_pid:
+                    try:
+                        os.kill(cp.child_pid, 0)
+                    except (OSError, ProcessLookupError):
+                        cp.is_alive = False
+                        cp.child_pid = None
+                        cp.save()
+        except Exception:
+            logger.debug("Could not clean stale checkpoints (DB may have been locked)")
         self._run = Runs.create(script_path=script_path, is_attach=attach)
         # Auto-evict old runs if keep_runs is configured
         if self.config.keep_runs > 0:
@@ -143,7 +148,8 @@ class Recorder:
         except Exception:
             logger.exception("batch_insert failed")
 
-        # Size monitoring (throttled to every 100 flush cycles)
+        # Size monitoring (throttled to every 100 flush cycles).
+        # Auto-stops recording when DB exceeds the configured limit.
         if self.config.max_db_size_mb > 0 and self._db_path:
             self._flush_count += 1
             if self._flush_count % 100 == 0 and not self._size_warned:
@@ -151,10 +157,11 @@ class Recorder:
                     size_mb = os.path.getsize(self._db_path) / (1024 * 1024)
                     if size_mb >= self.config.max_db_size_mb:
                         logger.warning(
-                            "Database size %.1f MB exceeds limit %d MB: %s",
+                            "Database size %.1f MB exceeds limit %d MB — stopping recording: %s",
                             size_mb, self.config.max_db_size_mb, self._db_path
                         )
                         self._size_warned = True
+                        pyttd_native.request_stop()
                 except OSError:
                     pass
 

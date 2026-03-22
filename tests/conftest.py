@@ -1,3 +1,4 @@
+import sys
 import textwrap
 import pytest
 import pyttd_native
@@ -10,6 +11,21 @@ from pyttd.models.runs import Runs
 from pyttd.models.checkpoints import Checkpoint
 from pyttd.models.io_events import IOEvent
 from pyttd.models.storage import delete_db_files, close_db
+
+
+@pytest.fixture(autouse=True)
+def _reset_trace_state():
+    """Reset CPython trace/monitoring state between tests.
+
+    PyEval_SetTrace on 3.12+ sets persistent monitoring events on code objects.
+    sys.settrace(None) + sys.monitoring.restart_events() clears them so that
+    tests that use attach mode (which calls PyEval_SetTrace) don't contaminate
+    subsequent tests.
+    """
+    yield
+    sys.settrace(None)
+    if hasattr(sys, 'monitoring'):
+        sys.monitoring.restart_events()
 
 @pytest.fixture
 def db_path(tmp_path):

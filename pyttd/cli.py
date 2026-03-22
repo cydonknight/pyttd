@@ -19,16 +19,16 @@ def main():
     record_parser.add_argument('--args', nargs='+', default=[])
     record_parser.add_argument('--no-redact', action='store_true',
                                help='Disable secrets redaction in recorded variables')
-    record_parser.add_argument('--secret-patterns', nargs='+', default=None,
-                               help='Additional secret patterns for variable redaction')
-    record_parser.add_argument('--include', nargs='+', default=None,
-                               help='Only record functions matching these patterns (supports glob: *, ?, [])')
-    record_parser.add_argument('--include-file', nargs='+', default=None,
-                               help='Only record functions in files matching these glob patterns')
-    record_parser.add_argument('--exclude', nargs='+', default=None,
-                               help='Exclude functions matching these patterns from recording')
-    record_parser.add_argument('--exclude-file', nargs='+', default=None,
-                               help='Exclude files matching these glob patterns from recording')
+    record_parser.add_argument('--secret-patterns', action='append', default=None,
+                               help='Additional secret pattern for variable redaction (repeatable)')
+    record_parser.add_argument('--include', action='append', default=None,
+                               help='Only record functions matching this pattern (repeatable, supports glob: *, ?, [])')
+    record_parser.add_argument('--include-file', action='append', default=None,
+                               help='Only record functions in files matching this glob pattern (repeatable)')
+    record_parser.add_argument('--exclude', action='append', default=None,
+                               help='Exclude functions matching this pattern from recording (repeatable)')
+    record_parser.add_argument('--exclude-file', action='append', default=None,
+                               help='Exclude files matching this glob pattern from recording (repeatable)')
     record_parser.add_argument('--max-frames', type=int, default=0,
                                help='Maximum frames to record (0 = unlimited)')
     record_parser.add_argument('--db-path', type=str, default=None,
@@ -63,14 +63,14 @@ def main():
     serve_parser.add_argument('--module', action='store_true')
     serve_parser.add_argument('--cwd', default='.')
     serve_parser.add_argument('--checkpoint-interval', type=int, default=1000)
-    serve_parser.add_argument('--include', nargs='+', default=None,
-                              help='Only record functions matching these patterns')
-    serve_parser.add_argument('--include-file', nargs='+', default=None,
-                              help='Only record functions in files matching these glob patterns')
-    serve_parser.add_argument('--exclude', nargs='+', default=None,
-                              help='Exclude functions matching these patterns from recording')
-    serve_parser.add_argument('--exclude-file', nargs='+', default=None,
-                              help='Exclude files matching these glob patterns from recording')
+    serve_parser.add_argument('--include', action='append', default=None,
+                              help='Only record functions matching this pattern (repeatable)')
+    serve_parser.add_argument('--include-file', action='append', default=None,
+                              help='Only record functions in files matching this glob pattern (repeatable)')
+    serve_parser.add_argument('--exclude', action='append', default=None,
+                              help='Exclude functions matching this pattern from recording (repeatable)')
+    serve_parser.add_argument('--exclude-file', action='append', default=None,
+                              help='Exclude files matching this glob pattern from recording (repeatable)')
     serve_parser.add_argument('--max-frames', type=int, default=0,
                               help='Maximum frames to record (0 = unlimited)')
     serve_parser.add_argument('--env', nargs='+', default=None,
