@@ -24,14 +24,14 @@ SAFE_BUILTINS = {
     # Iteration
     'enumerate': enumerate, 'zip': zip, 'map': map, 'filter': filter,
     'reversed': reversed, 'sorted': sorted, 'iter': iter, 'next': next,
-    # Attribute access
+    # Attribute access (read-only)
     'hasattr': hasattr, 'getattr': getattr,
     # String/repr
     'repr': repr, 'ascii': ascii, 'chr': chr, 'ord': ord,
     'format': format, 'bin': bin, 'hex': hex, 'oct': oct,
     # Object identity
     'id': id, 'hash': hash, 'callable': callable,
-    # Literals
+    # Constants
     'True': True, 'False': False, 'None': None,
 }
 
@@ -507,13 +507,12 @@ class Session:
 
     def evaluate_at(self, seq: int, expression: str, context: str) -> dict:
         self._require_replay()
-        if context == "repl":
-            return {"result": "Replay mode - expression evaluation not available. Use Variables panel to inspect recorded state."}
-
         frame = ExecutionFrames.get_or_none(
             (ExecutionFrames.run_id == self.run_id) &
             (ExecutionFrames.sequence_no == seq))
         if frame is None or not frame.locals_snapshot:
+            if context == "repl":
+                return {"result": "<no locals at current position>"}
             return {"result": "<not available>"}
         try:
             locals_data = json.loads(frame.locals_snapshot)
@@ -521,18 +520,23 @@ class Session:
             logger.warning("Failed to parse locals at seq %d: %s", seq, e)
             return {"result": "<not available>"}
 
+        # Fast path: simple variable lookup (all contexts including repl)
         if expression in locals_data:
             val = locals_data[expression]
             return {"result": _format_value(val), "type": _infer_type(val)}
 
-        # Try eval with restricted builtins
+        # Build eval locals from recorded repr strings
         eval_locals = {}
         for name, value in locals_data.items():
             eval_locals[name] = _parse_repr_value(value)
+
+        # Eval with restricted builtins (hover, watch, and repl)
         try:
             result = eval(expression, {"__builtins__": SAFE_BUILTINS}, eval_locals)
             return {"result": str(result), "type": type(result).__name__}
         except Exception:
+            if context == "repl":
+                return {"result": f"Error: cannot evaluate '{expression}' against recorded locals"}
             return {"result": "<not available>"}
 
     # --- Phase 6: CodeLens, Call History ---

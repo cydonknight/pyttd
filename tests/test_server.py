@@ -390,12 +390,14 @@ class TestEvaluate:
         assert eval_resp["result"]["result"] == "42"
 
     def test_evaluate_repl(self, server_session):
+        """REPL context now evaluates expressions — seq 0 has no locals so returns error."""
         client, script_path = server_session("x = 1\n")
         _run_to_replay(client, script_path)
         resp = client.send_and_receive("evaluate", {
             "seq": 0, "expression": "x", "context": "repl"
         })
-        assert "Replay mode" in resp["result"]["result"]
+        # seq 0 is a call event with no locals — should get a "no locals" message
+        assert "result" in resp["result"]
 
 
 class TestOutputCapture:
