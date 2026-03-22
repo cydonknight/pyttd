@@ -588,11 +588,28 @@ class TestEvaluateExpressions:
         assert result["result"] == "<not available>"
 
     def test_evaluate_repl_evaluates(self, record_func):
-        db_path, run_id, _ = record_func("x = 1\n")
+        db_path, run_id, _ = record_func("""\
+            def foo():
+                x = 42
+                return x
+            foo()
+        """)
         session = Session()
         _enter_replay(session, run_id)
-        result = session.evaluate_at(session.current_frame_seq, "x", "repl")
-        assert result["result"] == "1"
+        # Find a frame with x in locals
+        frames = list(ExecutionFrames.select()
+                      .where((ExecutionFrames.run_id == run_id) &
+                             (ExecutionFrames.function_name == 'foo') &
+                             (ExecutionFrames.frame_event == 'line'))
+                      .order_by(ExecutionFrames.sequence_no))
+        found = False
+        for f in frames:
+            if f.locals_snapshot and '"x"' in f.locals_snapshot:
+                result = session.evaluate_at(f.sequence_no, "x", "repl")
+                assert result["result"] == "42"
+                found = True
+                break
+        assert found, "No frame with x in locals"
 
 
 class TestSafeBuiltins:
