@@ -150,6 +150,75 @@ class TestSelectiveRecording:
             close_db()
             db.init(None)
 
+    def test_include_glob_star(self, tmp_path):
+        """Glob pattern 'process_*' matches 'process_data' but not 'my_process'."""
+        db_path, run_id, _ = _record_with_include(tmp_path, '''
+            def process_data():
+                return 1
+
+            def my_process():
+                return 2
+
+            process_data()
+            my_process()
+        ''', include_functions=['process_*'])
+        try:
+            funcs = set(f.function_name for f in
+                        ExecutionFrames.select(ExecutionFrames.function_name)
+                        .where(ExecutionFrames.run_id == run_id)
+                        .distinct())
+            assert 'process_data' in funcs
+            assert 'my_process' not in funcs
+        finally:
+            close_db()
+            db.init(None)
+
+    def test_include_glob_question(self, tmp_path):
+        """Glob pattern 'test_?' matches 'test_a' but not 'test_ab'."""
+        db_path, run_id, _ = _record_with_include(tmp_path, '''
+            def test_a():
+                return 1
+
+            def test_ab():
+                return 2
+
+            test_a()
+            test_ab()
+        ''', include_functions=['test_?'])
+        try:
+            funcs = set(f.function_name for f in
+                        ExecutionFrames.select(ExecutionFrames.function_name)
+                        .where(ExecutionFrames.run_id == run_id)
+                        .distinct())
+            assert 'test_a' in funcs
+            assert 'test_ab' not in funcs
+        finally:
+            close_db()
+            db.init(None)
+
+    def test_include_backward_compat(self, tmp_path):
+        """Plain pattern (no glob chars) still matches via auto-wrapping as *pattern*."""
+        db_path, run_id, _ = _record_with_include(tmp_path, '''
+            def process_data():
+                return 1
+
+            def unrelated():
+                return 2
+
+            process_data()
+            unrelated()
+        ''', include_functions=['process'])
+        try:
+            funcs = set(f.function_name for f in
+                        ExecutionFrames.select(ExecutionFrames.function_name)
+                        .where(ExecutionFrames.run_id == run_id)
+                        .distinct())
+            assert 'process_data' in funcs
+            assert 'unrelated' not in funcs
+        finally:
+            close_db()
+            db.init(None)
+
     def test_include_filter_resets_between_recordings(self, tmp_path):
         """Include filter doesn't leak between sessions."""
         # First recording with include

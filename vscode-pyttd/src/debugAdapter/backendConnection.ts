@@ -81,7 +81,10 @@ class JsonRpcConnection {
             const id = this.nextId++;
             const timer = setTimeout(() => {
                 this.pendingRequests.delete(id);
-                reject(new Error(`RPC timeout: ${method}`));
+                reject(new Error(
+                    `RPC timeout after ${this.rpcTimeout}ms calling '${method}'. ` +
+                    `The backend may be overloaded. Try increasing rpcTimeout in launch.json.`
+                ));
             }, this.rpcTimeout);
             this.pendingRequests.set(id, { resolve, reject, timer });
 
@@ -110,16 +113,21 @@ export class BackendConnection {
     private socket: net.Socket | null = null;
     private rpc: JsonRpcConnection | null = null;
     private notificationCallback: ((method: string, params: any) => void) | null = null;
+    private exitCallback: ((code: number | null) => void) | null = null;
 
-    async spawn(pythonPath: string, args: string[]): Promise<number> {
+    async spawn(pythonPath: string, args: string[], env?: { [key: string]: string }): Promise<number> {
+        const spawnEnv = env ? { ...process.env, ...env } : process.env;
         this.process = child_process.spawn(pythonPath, ['-m', 'pyttd', 'serve', ...args], {
             stdio: ['pipe', 'pipe', 'pipe'],
+            env: spawnEnv as NodeJS.ProcessEnv,
         });
 
-        return new Promise<number>((resolve, reject) => {
+        const port = await new Promise<number>((resolve, reject) => {
             const timeout = setTimeout(() => {
                 reject(new Error('Timeout waiting for backend port'));
             }, 10000);
+
+            let resolved = false;
 
             let stdoutBuffer = '';
             this.process!.stdout!.on('data', (data: Buffer) => {
@@ -130,6 +138,7 @@ export class BackendConnection {
                     const match = line.trim().match(/^PYTTD_PORT:(\d+)$/);
                     if (match) {
                         clearTimeout(timeout);
+                        resolved = true;
                         resolve(parseInt(match[1], 10));
                         return;
                     }
@@ -142,15 +151,32 @@ export class BackendConnection {
             });
 
             this.process!.on('exit', (code) => {
-                clearTimeout(timeout);
-                reject(new Error(`Backend exited with code ${code}: ${stderrBuffer}`));
+                if (!resolved) {
+                    clearTimeout(timeout);
+                    reject(new Error(`Backend exited with code ${code}: ${stderrBuffer}`));
+                }
             });
 
             this.process!.on('error', (err) => {
-                clearTimeout(timeout);
-                reject(new Error(`Failed to spawn backend: ${err.message}`));
+                if (!resolved) {
+                    clearTimeout(timeout);
+                    reject(new Error(`Failed to spawn backend: ${err.message}`));
+                }
             });
         });
+
+        // Install persistent exit listener for post-handshake crash detection
+        this.process!.on('exit', (code) => {
+            if (this.exitCallback) {
+                this.exitCallback(code);
+            }
+        });
+
+        return port;
+    }
+
+    onExit(callback: (code: number | null) => void): void {
+        this.exitCallback = callback;
     }
 
     async connect(port: number, rpcTimeout: number = 5000): Promise<void> {
@@ -193,6 +219,7 @@ export class BackendConnection {
     }
 
     close(): void {
+        this.exitCallback = null;
         if (this.rpc) {
             this.rpc.close();
             this.rpc = null;
@@ -214,7 +241,22 @@ export function findPythonPath(launchConfig: any, workspaceRoot: string): string
         return launchConfig.pythonPath;
     }
 
-    // 2. Common venv paths
+    // 2. VSCode Python extension's configured interpreter
+    try {
+        const vscode = require('vscode');
+        const pythonConfig = vscode.workspace.getConfiguration('python');
+        const defaultPath: string | undefined = pythonConfig.get('defaultInterpreterPath');
+        if (defaultPath && defaultPath !== 'python') {
+            const resolved = defaultPath.replace(/\$\{workspaceFolder\}/g, workspaceRoot);
+            if (fs.existsSync(resolved)) {
+                return resolved;
+            }
+        }
+    } catch {
+        // vscode module not available (running in tests or standalone)
+    }
+
+    // 3. Common venv paths
     for (const venvDir of ['.venv', 'venv']) {
         const candidate = path.join(workspaceRoot, venvDir, 'bin', 'python');
         if (fs.existsSync(candidate)) {

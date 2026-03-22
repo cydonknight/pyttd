@@ -13,6 +13,7 @@ typedef struct {
     const char *event_type;     /* "call", "line", "return", "exception", "exception_unwind" */
     const char *locals_json;    /* serialized repr() of locals, or NULL */
     double timestamp;           /* monotonic clock, seconds since recording start */
+    int is_coroutine;           /* 1 if code has CO_COROUTINE | CO_GENERATOR | CO_ASYNC_GENERATOR */
 } FrameEvent;
 
 #endif /* PYTTD_FRAME_EVENT_H */

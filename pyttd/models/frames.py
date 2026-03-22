@@ -1,5 +1,5 @@
 from peewee import (AutoField, CharField, IntegerField, BigIntegerField, TextField,
-                    ForeignKeyField, FloatField)
+                    ForeignKeyField, FloatField, BooleanField)
 from pyttd.models.base import _BaseModel
 from pyttd.models.runs import Runs
 
@@ -15,6 +15,7 @@ class ExecutionFrames(_BaseModel):
     call_depth = IntegerField()
     locals_snapshot = TextField(null=True)
     thread_id = BigIntegerField(default=0)
+    is_coroutine = BooleanField(default=False)
 
     class Meta:
         indexes = (

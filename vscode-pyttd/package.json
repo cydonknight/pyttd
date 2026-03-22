@@ -41,6 +41,90 @@
     "record"
   ],
   "contributes": {
+    "commands": [
+      {
+        "command": "pyttd.gotoFirstExecution",
+        "title": "Go to First Execution",
+        "category": "pyttd"
+      },
+      {
+        "command": "pyttd.gotoCallFrame",
+        "title": "Go to Call Frame",
+        "category": "pyttd"
+      },
+      {
+        "command": "pyttd.stepBack",
+        "title": "Step Back",
+        "category": "pyttd",
+        "icon": "$(debug-step-back)"
+      },
+      {
+        "command": "pyttd.reverseContinue",
+        "title": "Reverse Continue",
+        "category": "pyttd",
+        "icon": "$(debug-reverse-continue)"
+      },
+      {
+        "command": "pyttd.exportPerfetto",
+        "title": "Export Recording as Perfetto Trace",
+        "category": "pyttd"
+      },
+      {
+        "command": "pyttd.showVariableHistory",
+        "title": "Show Variable History",
+        "category": "pyttd"
+      },
+      {
+        "command": "pyttd.debugThisFile",
+        "title": "Time-Travel Debug This File",
+        "category": "pyttd"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "pyttd.stepBack",
+        "key": "ctrl+shift+f11",
+        "mac": "cmd+shift+f11",
+        "when": "debugType == 'pyttd' && inDebugMode"
+      },
+      {
+        "command": "pyttd.reverseContinue",
+        "key": "ctrl+shift+f5",
+        "mac": "cmd+shift+f5",
+        "when": "debugType == 'pyttd' && inDebugMode"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "pyttd.debugThisFile",
+          "when": "resourceLangId == python",
+          "group": "debug@1"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "pyttd.exportPerfetto",
+          "when": "debugType == 'pyttd' && inDebugMode"
+        },
+        {
+          "command": "pyttd.showVariableHistory",
+          "when": "debugType == 'pyttd' && inDebugMode"
+        },
+        {
+          "command": "pyttd.debugThisFile",
+          "when": "resourceLangId == python"
+        },
+        {
+          "command": "pyttd.stepBack",
+          "when": "debugType == 'pyttd' && inDebugMode"
+        },
+        {
+          "command": "pyttd.reverseContinue",
+          "when": "debugType == 'pyttd' && inDebugMode"
+        }
+      ]
+    },
     "views": {
       "debug": [
         {
@@ -97,6 +181,36 @@
               "checkpointInterval": {
                 "type": "number",
                 "description": "Frames between checkpoints (default: 1000)"
+              },
+              "env": {
+                "type": "object",
+                "additionalProperties": { "type": "string" },
+                "description": "Environment variables for the recorded process"
+              },
+              "envFile": {
+                "type": "string",
+                "description": "Path to a dotenv file to load environment variables from"
+              },
+              "stopOnEntry": {
+                "type": "boolean",
+                "description": "Pause at the first line when replay begins (default: true)",
+                "default": true
+              },
+              "maxFrames": {
+                "type": "number",
+                "description": "Maximum frames to record (0 = unlimited)",
+                "default": 0
+              },
+              "rpcTimeout": {
+                "type": "number",
+                "description": "Timeout for RPC calls to backend (ms)",
+                "default": 5000
+              },
+              "console": {
+                "type": "string",
+                "enum": ["integratedTerminal", "internalConsole"],
+                "description": "Where to launch the debug target",
+                "default": "internalConsole"
               }
             }
           }
@@ -109,7 +223,8 @@
               "type": "pyttd",
               "request": "launch",
               "name": "Time-Travel Debug",
-              "program": "^\"${file}\""
+              "program": "^\"${file}\"",
+              "env": {}
             }
           }
         ],

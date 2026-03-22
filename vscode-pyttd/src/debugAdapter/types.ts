@@ -29,4 +29,9 @@ export interface PyttdLaunchConfig {
     traceDb?: string;
     checkpointInterval?: number;
     rpcTimeout?: number;
+    env?: { [key: string]: string };
+    envFile?: string;
+    stopOnEntry?: boolean;
+    maxFrames?: number;
+    console?: 'integratedTerminal' | 'internalConsole';
 }

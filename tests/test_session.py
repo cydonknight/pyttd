@@ -375,3 +375,80 @@ class TestInferType:
 
     def test_string(self):
         assert _infer_type("hello") == "str"
+
+
+class TestSessionStateValidation:
+    def test_navigation_before_replay_raises(self):
+        session = Session()
+        with pytest.raises(RuntimeError, match="not in replay state"):
+            session.step_into()
+
+    def test_query_before_replay_raises(self):
+        session = Session()
+        with pytest.raises(RuntimeError, match="not in replay state"):
+            session.get_variables_at(0)
+
+
+class TestEvaluateExpressions:
+    def test_evaluate_arithmetic(self, record_func):
+        db_path, run_id, _ = record_func("""\
+            def foo():
+                x = 3
+                y = 5
+                return x + y
+            foo()
+        """)
+        session = Session()
+        _enter_replay(session, run_id)
+        frames = list(ExecutionFrames.select()
+                      .where((ExecutionFrames.run_id == run_id) &
+                             (ExecutionFrames.function_name == 'foo') &
+                             (ExecutionFrames.frame_event == 'line'))
+                      .order_by(ExecutionFrames.sequence_no))
+        found = False
+        for f in frames:
+            if f.locals_snapshot and '"x"' in f.locals_snapshot and '"y"' in f.locals_snapshot:
+                result = session.evaluate_at(f.sequence_no, "x + y", "hover")
+                assert result["result"] == "8"
+                found = True
+                break
+        assert found, "No frame found with both x and y in locals"
+
+    def test_evaluate_len(self, record_func):
+        db_path, run_id, _ = record_func("""\
+            def foo():
+                msg = "hello"
+                return msg
+            foo()
+        """)
+        session = Session()
+        _enter_replay(session, run_id)
+        frames = list(ExecutionFrames.select()
+                      .where((ExecutionFrames.run_id == run_id) &
+                             (ExecutionFrames.function_name == 'foo') &
+                             (ExecutionFrames.frame_event == 'line'))
+                      .order_by(ExecutionFrames.sequence_no))
+        found = False
+        for f in frames:
+            if f.locals_snapshot and '"msg"' in f.locals_snapshot:
+                result = session.evaluate_at(f.sequence_no, "len(msg)", "hover")
+                assert result["result"] == "5"
+                found = True
+                break
+        assert found, "No frame found with msg in locals"
+
+    def test_evaluate_no_import(self, record_func):
+        db_path, run_id, _ = record_func("""\
+            x = 1
+        """)
+        session = Session()
+        _enter_replay(session, run_id)
+        result = session.evaluate_at(session.current_frame_seq, "__import__('os')", "hover")
+        assert result["result"] == "<not available>"
+
+    def test_evaluate_repl_unchanged(self, record_func):
+        db_path, run_id, _ = record_func("x = 1\n")
+        session = Session()
+        _enter_replay(session, run_id)
+        result = session.evaluate_at(0, "x", "repl")
+        assert "Replay mode" in result["result"]

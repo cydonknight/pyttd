@@ -32,6 +32,11 @@ class Recorder:
             pyttd_native.set_secret_patterns([])
 
         pyttd_native.set_include_patterns(self.config.include_functions)
+        pyttd_native.set_file_include_patterns(self.config.include_files)
+        pyttd_native.set_exclude_patterns(
+            self.config.exclude_functions,
+            self.config.exclude_files,
+        )
 
         kwargs = dict(
             flush_callback=self._on_flush,
@@ -56,6 +61,9 @@ class Recorder:
         # os.environ dict (cached at import time). Update it explicitly so user
         # scripts can see it via os.environ.get('PYTTD_RECORDING').
         os.environ['PYTTD_RECORDING'] = '1'
+        # Set max_frames AFTER start_recording (which resets it to 0)
+        if self.config.max_frames > 0:
+            pyttd_native.set_max_frames(self.config.max_frames)
         self._recording = True
 
     def stop(self) -> dict:

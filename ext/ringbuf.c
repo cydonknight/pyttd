@@ -227,6 +227,7 @@ int ringbuf_push_to(ThreadRingBuffer *rb, const FrameEvent *event) {
     slot->thread_id = event->thread_id;
     slot->timestamp = event->timestamp;
     slot->event_type = event->event_type;
+    slot->is_coroutine = event->is_coroutine;
 
     slot->filename = pool_copy_string(pool, event->filename);
     if (event->filename && !slot->filename) pool_overflow = 1;

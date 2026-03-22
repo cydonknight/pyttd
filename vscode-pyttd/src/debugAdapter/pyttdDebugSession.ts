@@ -16,8 +16,29 @@ import {
 } from '@vscode/debugadapter';
 import { DebugProtocol } from '@vscode/debugprotocol';
 import * as path from 'path';
+import * as fs from 'fs';
 import { BackendConnection, findPythonPath } from './backendConnection';
 import { PyttdLaunchConfig } from './types';
+
+function parseEnvFile(filePath: string): { [key: string]: string } {
+    const result: { [key: string]: string } = {};
+    if (!fs.existsSync(filePath)) return result;
+    const content = fs.readFileSync(filePath, 'utf-8');
+    for (const line of content.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#')) continue;
+        const eqIdx = trimmed.indexOf('=');
+        if (eqIdx < 0) continue;
+        const key = trimmed.substring(0, eqIdx).trim();
+        let value = trimmed.substring(eqIdx + 1).trim();
+        if ((value.startsWith('"') && value.endsWith('"')) ||
+            (value.startsWith("'") && value.endsWith("'"))) {
+            value = value.substring(1, value.length - 1);
+        }
+        result[key] = value;
+    }
+    return result;
+}
 
 export class PyttdDebugSession extends LoggingDebugSession {
     private backend: BackendConnection = new BackendConnection();
@@ -28,6 +49,10 @@ export class PyttdDebugSession extends LoggingDebugSession {
     private timelineEndSeq: number | null = null;
     private breakpointsByFile = new Map<string, DebugProtocol.SourceBreakpoint[]>();
     private readonly progressId = 'pyttd-recording';
+    private nextVarRef = 0x4000_0000;
+    private childRefMap = new Map<number, number>();
+    private stopOnEntry = true;
+    private droppedFrameWarningShown = false;
 
     public constructor() {
         super();
@@ -46,6 +71,7 @@ export class PyttdDebugSession extends LoggingDebugSession {
         response.body.supportsStepBack = true;
         response.body.supportsGotoTargetsRequest = true;
         response.body.supportsRestartFrame = true;
+        response.body.supportsConditionalBreakpoints = true;
         this.sendResponse(response);
     }
 
@@ -56,11 +82,21 @@ export class PyttdDebugSession extends LoggingDebugSession {
         const config = args as unknown as PyttdLaunchConfig;
         const workspaceRoot = config.cwd || '.';
 
+        this.stopOnEntry = config.stopOnEntry !== false; // default true
+
+        if (config.console === 'integratedTerminal') {
+            this.sendEvent(new OutputEvent(
+                'Warning: integratedTerminal console is not yet supported. Using internalConsole.\n',
+                'console'
+            ));
+        }
+
         let pythonPath: string;
         try {
             pythonPath = findPythonPath(config, workspaceRoot);
         } catch (e: any) {
-            this.sendErrorResponse(response, 1, e.message);
+            this.sendErrorResponse(response, 1,
+                e.message + '\nHint: Install the VSCode Python extension and configure python.defaultInterpreterPath.');
             this.sendEvent(new TerminatedEvent());
             return;
         }
@@ -81,15 +117,38 @@ export class PyttdDebugSession extends LoggingDebugSession {
             spawnArgs.push('--checkpoint-interval', String(config.checkpointInterval));
         }
 
+        // Build environment from envFile + env
+        let envVars: { [key: string]: string } = {};
+        if (config.envFile) {
+            const envFilePath = path.resolve(workspaceRoot, config.envFile);
+            envVars = parseEnvFile(envFilePath);
+        }
+        if (config.env) {
+            envVars = { ...envVars, ...config.env };
+        }
+
         const rpcTimeout = config.rpcTimeout || 5000;
 
         this.backend
-            .spawn(pythonPath, spawnArgs)
+            .spawn(pythonPath, spawnArgs, Object.keys(envVars).length > 0 ? envVars : undefined)
             .then((port: number) => this.backend.connect(port, rpcTimeout))
             .then(() => {
                 // Register notification handler
                 this.backend.onNotification((method: string, params: any) => {
                     this.handleNotification(method, params);
+                });
+
+                // Monitor for unexpected backend exit
+                this.backend.onExit((code) => {
+                    this.sendEvent(new OutputEvent(
+                        `Backend exited unexpectedly (code ${code})\n`, 'stderr'
+                    ));
+                    this.sendEvent(new Event('pyttd/error', {
+                        message: `pyttd backend crashed (exit code ${code}).`,
+                        detail: 'Check the Debug Console. Try running "pyttd record" from the terminal for details.',
+                        severity: 'error',
+                    }));
+                    this.sendEvent(new TerminatedEvent());
                 });
 
                 return this.backend.sendRequest('backend_init');
@@ -103,6 +162,12 @@ export class PyttdDebugSession extends LoggingDebugSession {
                 }
                 if (config.traceDb) {
                     launchParams.traceDb = config.traceDb;
+                }
+                if (config.maxFrames) {
+                    launchParams.maxFrames = config.maxFrames;
+                }
+                if (Object.keys(envVars).length > 0) {
+                    launchParams.env = envVars;
                 }
                 return this.backend.sendRequest('launch', launchParams);
             })
@@ -123,8 +188,21 @@ export class PyttdDebugSession extends LoggingDebugSession {
                 this.currentSeq = params.seq;
                 this.totalFrames = params.totalFrames || 0;
                 this.isReplaying = true;
+                this.droppedFrameWarningShown = false;
                 this.sendEvent(new ProgressEndEvent(this.progressId));
-                this.sendEvent(new StoppedEvent('entry', params.thread_id || 1));
+
+                if (!this.stopOnEntry && params.reason === 'recording_complete') {
+                    // Auto-continue to first breakpoint
+                    this.backend.sendRequest('continue').then((result: any) => {
+                        this.currentSeq = result.seq;
+                        this.sendStoppedForReason(result.reason, result);
+                    }).catch(() => {
+                        this.sendEvent(new StoppedEvent('entry', params.thread_id || 1));
+                    });
+                } else {
+                    this.sendEvent(new StoppedEvent('entry', params.thread_id || 1));
+                }
+
                 // Send initial position to timeline
                 this.sendEvent(new Event('pyttd/positionChanged', {
                     seq: params.seq,
@@ -146,11 +224,23 @@ export class PyttdDebugSession extends LoggingDebugSession {
             case 'output':
                 this.sendEvent(new OutputEvent(params.output, params.category));
                 break;
-            case 'progress':
-                this.sendEvent(
-                    new ProgressUpdateEvent(this.progressId, `Recording: ${params.frameCount} frames`)
-                );
+            case 'progress': {
+                let msg = `Recording: ${params.frameCount} frames`;
+                const warnings: string[] = [];
+                if (params.droppedFrames > 0) warnings.push(`${params.droppedFrames} dropped`);
+                if (params.poolOverflows > 0) warnings.push(`${params.poolOverflows} overflows`);
+                if (warnings.length > 0) msg += ` (${warnings.join(', ')})`;
+                this.sendEvent(new ProgressUpdateEvent(this.progressId, msg));
+                if (params.droppedFrames > 0 && !this.droppedFrameWarningShown) {
+                    this.droppedFrameWarningShown = true;
+                    this.sendEvent(new Event('pyttd/error', {
+                        message: `Recording is dropping frames (${params.droppedFrames} so far).`,
+                        detail: 'The ring buffer is full. Try increasing checkpointInterval or reducing recording scope with --include.',
+                        severity: 'warning',
+                    }));
+                }
                 break;
+            }
         }
     }
 
@@ -165,22 +255,42 @@ export class PyttdDebugSession extends LoggingDebugSession {
         this.breakpointsByFile.set(filePath, breakpoints);
 
         // Build merged breakpoint list
-        const allBreakpoints: Array<{ file: string; line: number }> = [];
+        const allBreakpoints: Array<{ file: string; line: number; condition?: string }> = [];
         for (const [file, bps] of this.breakpointsByFile) {
             for (const bp of bps) {
-                allBreakpoints.push({ file, line: bp.line });
+                const entry: { file: string; line: number; condition?: string } = { file, line: bp.line };
+                if (bp.condition) { entry.condition = bp.condition; }
+                allBreakpoints.push(entry);
             }
         }
 
-        // Respond with verified breakpoints
-        const responseBreakpoints = breakpoints.map((bp) => ({
-            verified: true,
-            line: bp.line,
-        }));
-        response.body = { breakpoints: responseBreakpoints as DebugProtocol.Breakpoint[] };
-
-        // Forward to backend (fire-and-forget)
-        this.backend.sendRequest('set_breakpoints', { breakpoints: allBreakpoints }).catch(() => {});
+        // Forward to backend and await verification
+        this.backend.sendRequest('set_breakpoints', { breakpoints: allBreakpoints })
+            .then((result: any) => {
+                const verified = result.verified || [];
+                const responseBreakpoints = breakpoints.map((bp) => {
+                    const v = verified.find((r: any) =>
+                        r.file === filePath && r.line === bp.line);
+                    if (v && !v.verified) {
+                        return {
+                            verified: false,
+                            line: bp.line,
+                            message: v.message || 'Breakpoint could not be verified',
+                        } as DebugProtocol.Breakpoint;
+                    }
+                    return { verified: true, line: bp.line } as DebugProtocol.Breakpoint;
+                });
+                response.body = { breakpoints: responseBreakpoints };
+                this.sendResponse(response);
+            })
+            .catch(() => {
+                // Fallback: mark all verified (backend not ready or pre-recording)
+                const responseBreakpoints = breakpoints.map((bp) => ({
+                    verified: true, line: bp.line,
+                }));
+                response.body = { breakpoints: responseBreakpoints as DebugProtocol.Breakpoint[] };
+                this.sendResponse(response);
+            });
 
         // Refresh timeline breakpoint markers if in replay mode
         if (this.isReplaying) {
@@ -197,8 +307,6 @@ export class PyttdDebugSession extends LoggingDebugSession {
                 }));
             }).catch(() => {});
         }
-
-        this.sendResponse(response);
     }
 
     protected setExceptionBreakPointsRequest(
@@ -303,20 +411,46 @@ export class PyttdDebugSession extends LoggingDebugSession {
             return;
         }
 
-        const seq = args.variablesReference - 1;
-        this.backend
-            .sendRequest('get_variables', { seq })
-            .then((result: any) => {
-                const variables: DebugProtocol.Variable[] = (result.variables || []).map(
-                    (v: any) => new Variable(v.name, v.value, 0)
-                );
-                response.body = { variables };
-                this.sendResponse(response);
-            })
-            .catch(() => {
-                response.body = { variables: [] };
-                this.sendResponse(response);
-            });
+        const backendRef = this.childRefMap.get(args.variablesReference);
+        if (backendRef !== undefined) {
+            // Child expansion request — get children of an expandable variable
+            this.backend
+                .sendRequest('get_variable_children', { variablesReference: backendRef })
+                .then((result: any) => {
+                    const variables: DebugProtocol.Variable[] = (result.variables || []).map(
+                        (v: any) => new Variable(v.name, v.value, 0)
+                    );
+                    response.body = { variables };
+                    this.sendResponse(response);
+                })
+                .catch(() => {
+                    response.body = { variables: [] };
+                    this.sendResponse(response);
+                });
+        } else {
+            // Scope request — get all locals for frame
+            const seq = args.variablesReference - 1;
+            this.backend
+                .sendRequest('get_variables', { seq })
+                .then((result: any) => {
+                    const variables: DebugProtocol.Variable[] = (result.variables || []).map(
+                        (v: any) => {
+                            let ref = 0;
+                            if (v.variablesReference > 0) {
+                                ref = this.nextVarRef++;
+                                this.childRefMap.set(ref, v.variablesReference);
+                            }
+                            return new Variable(v.name, v.value, ref);
+                        }
+                    );
+                    response.body = { variables };
+                    this.sendResponse(response);
+                })
+                .catch(() => {
+                    response.body = { variables: [] };
+                    this.sendResponse(response);
+                });
+        }
     }
 
     protected evaluateRequest(
@@ -460,6 +594,9 @@ export class PyttdDebugSession extends LoggingDebugSession {
     }
 
     private sendStoppedForReason(reason: string, navResult?: { seq: number; file?: string; line?: number; thread_id?: number }): void {
+        // Clear variable expansion refs on navigation — stale refs from previous position
+        this.childRefMap.clear();
+        this.nextVarRef = 0x4000_0000;
         const threadId = navResult?.thread_id || 1;
         switch (reason) {
             case 'breakpoint':
@@ -649,7 +786,8 @@ export class PyttdDebugSession extends LoggingDebugSession {
                     this.sendErrorResponse(response, 1, err.message);
                 });
         } else if (['get_execution_stats', 'get_traced_files',
-                     'get_call_children', 'get_variables'].includes(command)) {
+                     'get_call_children', 'get_variables',
+                     'get_variable_history'].includes(command)) {
             // Query pass-throughs — no state modification, just forward and return.
             this.backend.sendRequest(command, args || {})
                 .then((result: any) => {

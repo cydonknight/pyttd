@@ -22,7 +22,15 @@ def main():
     record_parser.add_argument('--secret-patterns', nargs='+', default=None,
                                help='Additional secret patterns for variable redaction')
     record_parser.add_argument('--include', nargs='+', default=None,
-                               help='Only record functions matching these patterns')
+                               help='Only record functions matching these patterns (supports glob: *, ?, [])')
+    record_parser.add_argument('--include-file', nargs='+', default=None,
+                               help='Only record functions in files matching these glob patterns')
+    record_parser.add_argument('--exclude', nargs='+', default=None,
+                               help='Exclude functions matching these patterns from recording')
+    record_parser.add_argument('--exclude-file', nargs='+', default=None,
+                               help='Exclude files matching these glob patterns from recording')
+    record_parser.add_argument('--max-frames', type=int, default=0,
+                               help='Maximum frames to record (0 = unlimited)')
 
     query_parser = subparsers.add_parser('query', help='Query trace data')
     query_parser.add_argument('--last-run', action='store_true')
@@ -44,6 +52,18 @@ def main():
     serve_parser.add_argument('--checkpoint-interval', type=int, default=1000)
     serve_parser.add_argument('--include', nargs='+', default=None,
                               help='Only record functions matching these patterns')
+    serve_parser.add_argument('--include-file', nargs='+', default=None,
+                              help='Only record functions in files matching these glob patterns')
+    serve_parser.add_argument('--exclude', nargs='+', default=None,
+                              help='Exclude functions matching these patterns from recording')
+    serve_parser.add_argument('--exclude-file', nargs='+', default=None,
+                              help='Exclude files matching these glob patterns from recording')
+    serve_parser.add_argument('--max-frames', type=int, default=0,
+                              help='Maximum frames to record (0 = unlimited)')
+    serve_parser.add_argument('--env', nargs='+', default=None,
+                              help='Environment variables (KEY=VALUE format)')
+    serve_parser.add_argument('--env-file', type=str, default=None,
+                              help='Path to dotenv file to load environment variables from')
 
     export_parser = subparsers.add_parser('export', help='Export trace data')
     export_parser.add_argument('--format', choices=['perfetto'], default='perfetto',
@@ -106,6 +126,14 @@ def _cmd_record(args):
         config_kwargs['secret_patterns'] = list(_DEFAULT_SECRET_PATTERNS) + args.secret_patterns
     if args.include is not None:
         config_kwargs['include_functions'] = args.include
+    if args.include_file is not None:
+        config_kwargs['include_files'] = args.include_file
+    if args.exclude is not None:
+        config_kwargs['exclude_functions'] = args.exclude
+    if args.exclude_file is not None:
+        config_kwargs['exclude_files'] = args.exclude_file
+    if args.max_frames > 0:
+        config_kwargs['max_frames'] = args.max_frames
     config = PyttdConfig(**config_kwargs)
     recorder = Recorder(config)
     runner = Runner()
@@ -142,12 +170,25 @@ def _cmd_serve(args):
             print(f"Error: script not found: {args.script}", file=sys.stderr)
             sys.exit(1)
         include_functions = args.include if args.include is not None else []
+        env_vars = {}
+        if args.env_file:
+            env_vars.update(_parse_env_file(args.env_file))
+        if args.env:
+            for item in args.env:
+                if '=' in item:
+                    key, value = item.split('=', 1)
+                    env_vars[key] = value
         server = PyttdServer(
             script=args.script,
             is_module=args.module,
             cwd=args.cwd,
             checkpoint_interval=args.checkpoint_interval,
             include_functions=include_functions,
+            max_frames=args.max_frames,
+            env_vars=env_vars if env_vars else None,
+            include_files=args.include_file or [],
+            exclude_functions=args.exclude or [],
+            exclude_files=args.exclude_file or [],
         )
     else:
         # --db mode: replay existing recording
@@ -224,6 +265,21 @@ def _cmd_replay(args):
         print(f"Frame {args.goto_frame}: {result}")
     finally:
         storage.close_db()
+
+def _parse_env_file(filepath: str) -> dict:
+    result = {}
+    with open(filepath) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            if '=' not in line:
+                continue
+            key, value = line.split('=', 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            result[key] = value
+    return result
 
 def _cmd_export(args):
     from pyttd.export import export_perfetto

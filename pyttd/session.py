@@ -1,7 +1,39 @@
 import json
+import logging
 import os
 from pyttd.models.frames import ExecutionFrames
 from pyttd.replay import ReplayController
+
+logger = logging.getLogger(__name__)
+
+MAX_CONDITIONAL_SEARCH = 10_000
+
+SAFE_BUILTINS = {
+    # Types and constructors
+    'len': len, 'str': str, 'int': int, 'float': float, 'bool': bool,
+    'list': list, 'dict': dict, 'tuple': tuple, 'set': set, 'type': type,
+    'bytes': bytes, 'bytearray': bytearray, 'frozenset': frozenset,
+    'complex': complex, 'range': range, 'slice': slice,
+    # Type checking
+    'isinstance': isinstance, 'issubclass': issubclass,
+    # Math
+    'abs': abs, 'min': min, 'max': max, 'sum': sum,
+    'round': round, 'pow': pow, 'divmod': divmod,
+    # Comparison and logic
+    'all': all, 'any': any,
+    # Iteration
+    'enumerate': enumerate, 'zip': zip, 'map': map, 'filter': filter,
+    'reversed': reversed, 'sorted': sorted, 'iter': iter, 'next': next,
+    # Attribute access
+    'hasattr': hasattr, 'getattr': getattr,
+    # String/repr
+    'repr': repr, 'ascii': ascii, 'chr': chr, 'ord': ord,
+    'format': format, 'bin': bin, 'hex': hex, 'oct': oct,
+    # Object identity
+    'id': id, 'hash': hash, 'callable': callable,
+    # Literals
+    'True': True, 'False': False, 'None': None,
+}
 
 
 class Session:
@@ -72,9 +104,14 @@ class Session:
     def get_threads(self) -> list[dict]:
         return [{"id": tid, "name": name} for tid, name in self.known_threads.items()]
 
+    def _require_replay(self):
+        if self.state != "replay":
+            raise RuntimeError("Session not in replay state")
+
     # --- Forward Navigation ---
 
     def step_into(self) -> dict:
+        self._require_replay()
         frame = (ExecutionFrames.select()
                  .where((ExecutionFrames.run_id == self.run_id) &
                         (ExecutionFrames.frame_event == 'line') &
@@ -86,6 +123,7 @@ class Session:
         return self._navigate_to(frame.sequence_no, "step")
 
     def step_over(self) -> dict:
+        self._require_replay()
         current = self._get_current_frame()
         if current is None:
             return self._navigate_to(self.last_line_seq, "end")
@@ -104,23 +142,54 @@ class Session:
         return self._navigate_to(frame.sequence_no, "step")
 
     def step_out(self) -> dict:
+        self._require_replay()
         current = self._get_current_frame()
         if current is None:
             return self._navigate_to(self.last_line_seq, "end")
         current_depth = current.call_depth
         current_thread = current.thread_id
+        current_func = current.function_name
 
         if current_depth == 0:
             return self._navigate_to(self.last_line_seq, "end")
 
-        exit_event = (ExecutionFrames.select()
-                      .where((ExecutionFrames.run_id == self.run_id) &
-                             (ExecutionFrames.frame_event.in_(['return', 'exception_unwind'])) &
-                             (ExecutionFrames.call_depth == current_depth) &
-                             (ExecutionFrames.thread_id == current_thread) &
-                             (ExecutionFrames.sequence_no > self.current_frame_seq))
-                      .order_by(ExecutionFrames.sequence_no)
-                      .first())
+        # Find exit event, skipping coroutine suspension returns.
+        # A suspension return for a coroutine/generator is followed by a
+        # matching call (resume) at the same depth for the same function.
+        search_after = self.current_frame_seq
+        exit_event = None
+        for _ in range(100):  # bounded search to avoid infinite loops
+            candidate = (ExecutionFrames.select()
+                         .where((ExecutionFrames.run_id == self.run_id) &
+                                (ExecutionFrames.frame_event.in_(['return', 'exception_unwind'])) &
+                                (ExecutionFrames.call_depth == current_depth) &
+                                (ExecutionFrames.thread_id == current_thread) &
+                                (ExecutionFrames.sequence_no > search_after))
+                         .order_by(ExecutionFrames.sequence_no)
+                         .first())
+            if candidate is None:
+                break
+
+            # Check if this is a coroutine suspension (return followed by resume)
+            if (candidate.frame_event == 'return' and
+                    getattr(candidate, 'is_coroutine', False)):
+                resume = (ExecutionFrames.select()
+                          .where((ExecutionFrames.run_id == self.run_id) &
+                                 (ExecutionFrames.frame_event == 'call') &
+                                 (ExecutionFrames.call_depth == current_depth) &
+                                 (ExecutionFrames.function_name == candidate.function_name) &
+                                 (ExecutionFrames.thread_id == current_thread) &
+                                 (ExecutionFrames.sequence_no > candidate.sequence_no))
+                          .order_by(ExecutionFrames.sequence_no)
+                          .first())
+                if resume is not None:
+                    # Suspension — skip past the resume and keep searching
+                    search_after = resume.sequence_no
+                    continue
+
+            exit_event = candidate
+            break
+
         if exit_event is None:
             return self._navigate_to(self.last_line_seq, "end")
 
@@ -148,6 +217,7 @@ class Session:
         return self._navigate_to(parent_line.sequence_no, "step")
 
     def continue_forward(self) -> dict:
+        self._require_replay()
         candidates = []
 
         for bp in self.breakpoints:
@@ -191,6 +261,7 @@ class Session:
     # --- Reverse Navigation (Phase 4) ---
 
     def step_back(self) -> dict:
+        self._require_replay()
         if self.current_frame_seq is None or self.current_frame_seq <= self.first_line_seq:
             return self._navigate_to(self.first_line_seq, "start")
         frame = (ExecutionFrames.select()
@@ -204,6 +275,7 @@ class Session:
         return self._navigate_to(frame.sequence_no, "step")
 
     def reverse_continue(self) -> dict:
+        self._require_replay()
         candidates = []
 
         for bp in self.breakpoints:
@@ -247,6 +319,7 @@ class Session:
     # --- Frame Jump Navigation (Phase 4) ---
 
     def goto_frame(self, target_seq: int) -> dict:
+        self._require_replay()
         # 1. Validate target exists
         frame = ExecutionFrames.get_or_none(
             (ExecutionFrames.run_id == self.run_id) &
@@ -317,6 +390,7 @@ class Session:
         return {"seq": target_seq, "reason": "goto"}
 
     def goto_targets(self, filename: str, line: int) -> list[dict]:
+        self._require_replay()
         filename = os.path.realpath(filename)
         results = list(ExecutionFrames.select(
             ExecutionFrames.sequence_no, ExecutionFrames.function_name
@@ -329,6 +403,7 @@ class Session:
         return [{"seq": r["sequence_no"], "function_name": r["function_name"]} for r in results]
 
     def restart_frame(self, frame_seq: int) -> dict:
+        self._require_replay()
         frame = ExecutionFrames.get_or_none(
             (ExecutionFrames.run_id == self.run_id) &
             (ExecutionFrames.sequence_no == frame_seq))
@@ -359,11 +434,13 @@ class Session:
     # --- Query ---
 
     def get_stack_at(self, seq: int) -> list[dict]:
+        self._require_replay()
         if seq == self.current_frame_seq and self.current_stack:
             return self.current_stack
         return self._build_stack_at(seq)
 
     def get_variables_at(self, seq: int) -> list[dict]:
+        self._require_replay()
         frame = ExecutionFrames.get_or_none(
             (ExecutionFrames.run_id == self.run_id) &
             (ExecutionFrames.sequence_no == seq))
@@ -372,10 +449,13 @@ class Session:
         try:
             locals_data = json.loads(frame.locals_snapshot)
         except (json.JSONDecodeError, TypeError) as e:
-            import logging
-            logging.getLogger(__name__).warning(
-                "Failed to parse locals at seq %d: %s", seq, e)
-            return []
+            logger.warning("Failed to parse locals at seq %d: %s", seq, e)
+            return [{
+                "name": "<parse error>",
+                "value": f"Locals recorded but could not be deserialized: {e}",
+                "type": "error",
+                "variablesReference": 0,
+            }]
         variables = []
         for name, value in locals_data.items():
             ref = 0
@@ -390,6 +470,7 @@ class Session:
         return variables
 
     def get_variable_children(self, reference: int) -> list[dict]:
+        self._require_replay()
         decoded = self._decode_var_ref(reference)
         if decoded is None:
             return []
@@ -425,6 +506,7 @@ class Session:
         return self._var_ref_cache.get(ref)
 
     def evaluate_at(self, seq: int, expression: str, context: str) -> dict:
+        self._require_replay()
         if context == "repl":
             return {"result": "Replay mode - expression evaluation not available. Use Variables panel to inspect recorded state."}
 
@@ -436,30 +518,34 @@ class Session:
         try:
             locals_data = json.loads(frame.locals_snapshot)
         except (json.JSONDecodeError, TypeError) as e:
-            import logging
-            logging.getLogger(__name__).warning(
-                "Failed to parse locals at seq %d: %s", seq, e)
+            logger.warning("Failed to parse locals at seq %d: %s", seq, e)
             return {"result": "<not available>"}
 
         if expression in locals_data:
             val = locals_data[expression]
-            return {"result": str(val), "type": _infer_type(val)}
+            return {"result": _format_value(val), "type": _infer_type(val)}
 
-        base = expression.split('.')[0]
-        if base in locals_data:
-            return {"result": str(locals_data[base]), "type": _infer_type(locals_data[base])}
-
-        return {"result": "<not available>"}
+        # Try eval with restricted builtins
+        eval_locals = {}
+        for name, value in locals_data.items():
+            eval_locals[name] = _parse_repr_value(value)
+        try:
+            result = eval(expression, {"__builtins__": SAFE_BUILTINS}, eval_locals)
+            return {"result": str(result), "type": type(result).__name__}
+        except Exception:
+            return {"result": "<not available>"}
 
     # --- Phase 6: CodeLens, Call History ---
 
     def get_traced_files(self) -> list[str]:
+        self._require_replay()
         rows = (ExecutionFrames.select(ExecutionFrames.filename)
                 .where(ExecutionFrames.run_id == self.run_id)
                 .distinct())
         return [row.filename for row in rows]
 
     def get_execution_stats(self, filename: str) -> list[dict]:
+        self._require_replay()
         from peewee import fn, SQL
         rows = list(ExecutionFrames.select(
             ExecutionFrames.function_name,
@@ -482,6 +568,7 @@ class Session:
         } for r in rows if r['call_count']]
 
     def get_call_children(self, parent_call_seq=None, parent_return_seq=None) -> list[dict]:
+        self._require_replay()
         if parent_call_seq is None:
             target_depth = 0
             range_filter = (ExecutionFrames.sequence_no >= 0)
@@ -551,6 +638,7 @@ class Session:
 
     def get_variable_history(self, variable_name: str, start_seq: int, end_seq: int,
                              max_points: int = 500) -> list[dict]:
+        self._require_replay()
         frames = ExecutionFrames.select(
             ExecutionFrames.sequence_no,
             ExecutionFrames.line_no,
@@ -591,6 +679,53 @@ class Session:
                 break
         return result
 
+    # --- Breakpoint Verification (P1-2 + P1-5) ---
+
+    def verify_breakpoints(self, breakpoints: list[dict]) -> list[dict]:
+        """Verify breakpoints: check line exists in recording, validate condition syntax."""
+        results = []
+        for bp in breakpoints:
+            file = bp.get('file', '')
+            line = bp.get('line', 0)
+            condition = bp.get('condition', '')
+            verified = True
+            message = ''
+
+            if file and line and self.state == "replay":
+                real_file = os.path.realpath(file)
+                exists = ExecutionFrames.select().where(
+                    (ExecutionFrames.run_id == self.run_id) &
+                    (ExecutionFrames.filename == real_file) &
+                    (ExecutionFrames.line_no == line) &
+                    (ExecutionFrames.frame_event == 'line')
+                ).limit(1).exists()
+                if not exists:
+                    file_exists = ExecutionFrames.select().where(
+                        (ExecutionFrames.run_id == self.run_id) &
+                        (ExecutionFrames.filename == real_file)
+                    ).limit(1).exists()
+                    if not file_exists:
+                        verified = False
+                        message = f"File not in recording: {os.path.basename(file)}"
+                    else:
+                        verified = False
+                        message = f"Line {line} was not executed in the recording"
+
+            if condition and condition.strip():
+                try:
+                    compile(condition, '<breakpoint_condition>', 'eval')
+                except SyntaxError as e:
+                    verified = False
+                    message = f"Invalid condition: {e.msg}"
+
+            results.append({
+                'verified': verified,
+                'message': message,
+                'file': file,
+                'line': line,
+            })
+        return results
+
     # --- Internal helpers ---
 
     def _evaluate_condition(self, condition: str, seq: int) -> bool:
@@ -609,9 +744,10 @@ class Session:
         for name, value in locals_data.items():
             eval_locals[name] = _parse_repr_value(value)
         try:
-            return bool(eval(condition, {"__builtins__": {}}, eval_locals))
-        except Exception:
-            return True
+            return bool(eval(condition, {"__builtins__": SAFE_BUILTINS}, eval_locals))
+        except Exception as e:
+            logger.warning("Condition eval error at seq %d: %s", seq, e)
+            return False
 
     def _find_conditional_hit_forward(self, filename: str, line: int,
                                        condition: str, after_seq: int) -> int | None:
@@ -627,7 +763,7 @@ class Session:
             return hit.sequence_no if hit else None
 
         cursor = after_seq
-        for _ in range(10000):
+        for _ in range(MAX_CONDITIONAL_SEARCH):
             hit = (ExecutionFrames.select(ExecutionFrames.sequence_no)
                    .where((ExecutionFrames.run_id == self.run_id) &
                           (ExecutionFrames.filename == filename) &
@@ -641,6 +777,8 @@ class Session:
             if self._evaluate_condition(condition, hit.sequence_no):
                 return hit.sequence_no
             cursor = hit.sequence_no
+        logger.warning("Conditional breakpoint search exhausted %d iterations (forward, %s:%d)",
+                       MAX_CONDITIONAL_SEARCH, filename, line)
         return None
 
     def _find_conditional_hit_reverse(self, filename: str, line: int,
@@ -657,7 +795,7 @@ class Session:
             return hit.sequence_no if hit else None
 
         cursor = before_seq
-        for _ in range(10000):
+        for _ in range(MAX_CONDITIONAL_SEARCH):
             hit = (ExecutionFrames.select(ExecutionFrames.sequence_no)
                    .where((ExecutionFrames.run_id == self.run_id) &
                           (ExecutionFrames.filename == filename) &
@@ -671,6 +809,8 @@ class Session:
             if self._evaluate_condition(condition, hit.sequence_no):
                 return hit.sequence_no
             cursor = hit.sequence_no
+        logger.warning("Conditional breakpoint search exhausted %d iterations (reverse, %s:%d)",
+                       MAX_CONDITIONAL_SEARCH, filename, line)
         return None
 
     def _snap_to_line(self, seq: int) -> int:
@@ -822,8 +962,9 @@ def _parse_repr_value(value):
     Falls back to the raw string on failure."""
     import ast
     if isinstance(value, dict) and '__type__' in value:
-        return _format_value(value)
-    s = str(value)
+        s = _format_value(value)
+    else:
+        s = str(value)
     try:
         return ast.literal_eval(s)
     except (ValueError, SyntaxError):

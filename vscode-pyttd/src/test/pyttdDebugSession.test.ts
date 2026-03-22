@@ -166,6 +166,7 @@ describe('PyttdDebugSession', () => {
             assert.strictEqual(body.supportsStepBack, true);
             assert.strictEqual(body.supportsGotoTargetsRequest, true);
             assert.strictEqual(body.supportsRestartFrame, true);
+            assert.strictEqual(body.supportsConditionalBreakpoints, true);
         });
     });
 
@@ -447,6 +448,33 @@ describe('PyttdDebugSession', () => {
             assert.strictEqual(resp2.body.breakpoints[0].verified, true);
         });
 
+        it('should forward condition field in breakpoints', async () => {
+            const resp = { command: 'setBreakpoints', success: true } as DebugProtocol.SetBreakpointsResponse;
+            (harness.session as any).setBreakPointsRequest(resp, {
+                source: { path: '/test/script.py' },
+                breakpoints: [{ line: 10, condition: 'x > 5' }],
+            });
+            await new Promise(r => setTimeout(r, 50));
+
+            const bpReqs = mockServer.receivedRequests.filter(r => r.method === 'set_breakpoints');
+            const last = bpReqs[bpReqs.length - 1];
+            assert.strictEqual(last.params.breakpoints.length, 1);
+            assert.strictEqual(last.params.breakpoints[0].condition, 'x > 5');
+        });
+
+        it('should omit condition field when not set', async () => {
+            const resp = { command: 'setBreakpoints', success: true } as DebugProtocol.SetBreakpointsResponse;
+            (harness.session as any).setBreakPointsRequest(resp, {
+                source: { path: '/test/script.py' },
+                breakpoints: [{ line: 10 }],
+            });
+            await new Promise(r => setTimeout(r, 50));
+
+            const bpReqs = mockServer.receivedRequests.filter(r => r.method === 'set_breakpoints');
+            const last = bpReqs[bpReqs.length - 1];
+            assert.strictEqual(last.params.breakpoints[0].condition, undefined);
+        });
+
         it('should handle notifications from backend', async () => {
             harness.clearEvents();
             (harness.session as any).isReplaying = false;
@@ -576,6 +604,101 @@ describe('PyttdDebugSession', () => {
                 const last = harness.lastResponse('get_traced_files');
                 assert.ok(last?.success);
                 assert.deepStrictEqual(last?.body?.files, ['/test/script.py']);
+            });
+        });
+
+        describe('variable expansion', () => {
+            it('should assign non-zero variablesReference for expandable variables', async () => {
+                // Override get_variables to return an expandable variable
+                mockServer.handlers.set('get_variables', () => ({
+                    variables: [
+                        { name: 'x', value: '42', type: 'int', variablesReference: 0 },
+                        { name: 'data', value: "{'a': 1}", type: 'dict', variablesReference: 1000 },
+                    ]
+                }));
+
+                const response = { command: 'variables', success: true } as DebugProtocol.VariablesResponse;
+                (harness.session as any).variablesRequest(response, { variablesReference: 11 });
+                await new Promise(r => setTimeout(r, 100));
+
+                const last = harness.lastResponse('variables');
+                assert.ok(last?.success);
+                assert.strictEqual(last?.body?.variables?.length, 2);
+                // x should have ref 0 (not expandable)
+                assert.strictEqual(last?.body?.variables[0].variablesReference, 0);
+                // data should have a non-zero ref (expandable)
+                assert.ok(last?.body?.variables[1].variablesReference > 0,
+                    'expandable variable should have non-zero variablesReference');
+            });
+
+            it('should call get_variable_children for child expansion', async () => {
+                // First, set up expandable variables
+                mockServer.handlers.set('get_variables', () => ({
+                    variables: [
+                        { name: 'data', value: "{'a': 1}", type: 'dict', variablesReference: 1000 },
+                    ]
+                }));
+                mockServer.handlers.set('get_variable_children', (params: any) => ({
+                    variables: [
+                        { name: "'a'", value: '1', type: 'int', variablesReference: 0 },
+                    ]
+                }));
+
+                // Request scope variables first to populate childRefMap
+                const resp1 = { command: 'variables', success: true } as DebugProtocol.VariablesResponse;
+                (harness.session as any).variablesRequest(resp1, { variablesReference: 11 });
+                await new Promise(r => setTimeout(r, 100));
+
+                const vars = harness.lastResponse('variables');
+                const dataRef = vars?.body?.variables[0].variablesReference;
+                assert.ok(dataRef > 0, 'should have non-zero ref');
+
+                // Now request children using that ref
+                harness.clearResponses();
+                const resp2 = { command: 'variables', success: true } as DebugProtocol.VariablesResponse;
+                (harness.session as any).variablesRequest(resp2, { variablesReference: dataRef });
+                await new Promise(r => setTimeout(r, 100));
+
+                const children = harness.lastResponse('variables');
+                assert.ok(children?.success);
+                assert.strictEqual(children?.body?.variables?.length, 1);
+                assert.strictEqual(children?.body?.variables[0].name, "'a'");
+                assert.strictEqual(children?.body?.variables[0].value, '1');
+                // Children should have ref 0 (flat, one level)
+                assert.strictEqual(children?.body?.variables[0].variablesReference, 0);
+
+                // Verify the backend received get_variable_children
+                const childReq = mockServer.receivedRequests.find(
+                    r => r.method === 'get_variable_children'
+                );
+                assert.ok(childReq, 'should call get_variable_children');
+                assert.strictEqual(childReq!.params.variablesReference, 1000);
+            });
+
+            it('should clear childRefMap on navigation', async () => {
+                // Set up an expandable variable
+                mockServer.handlers.set('get_variables', () => ({
+                    variables: [
+                        { name: 'data', value: "{'a': 1}", type: 'dict', variablesReference: 1000 },
+                    ]
+                }));
+
+                // Populate childRefMap
+                const resp1 = { command: 'variables', success: true } as DebugProtocol.VariablesResponse;
+                (harness.session as any).variablesRequest(resp1, { variablesReference: 11 });
+                await new Promise(r => setTimeout(r, 100));
+
+                const vars = harness.lastResponse('variables');
+                const dataRef = vars?.body?.variables[0].variablesReference;
+                assert.ok(dataRef > 0);
+
+                // Simulate navigation (clears childRefMap)
+                (harness.session as any).sendStoppedForReason('step', { seq: 20 });
+
+                // Now the old ref should not be in childRefMap
+                // Requesting with it should treat it as scope request
+                const childRefMap = (harness.session as any).childRefMap as Map<number, number>;
+                assert.strictEqual(childRefMap.size, 0, 'childRefMap should be cleared after navigation');
             });
         });
     });

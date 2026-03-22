@@ -23,3 +23,47 @@ def ttdbg(func):
             recorder.stop()
             recorder.cleanup()
     return wrapper
+
+
+# Module-level state for the public API
+_active_recorder: Recorder | None = None
+
+
+def start_recording(db_path: str | None = None, **kwargs):
+    """Start recording execution. Call stop_recording() to stop.
+
+    Args:
+        db_path: Path to save the .pyttd.db file. Default: <caller_script>.pyttd.db
+        **kwargs: Passed to PyttdConfig (checkpoint_interval, max_frames, etc.)
+    """
+    global _active_recorder
+    if _active_recorder is not None and _active_recorder._recording:
+        raise RuntimeError("Recording is already active. Call stop_recording() first.")
+
+    if db_path is None:
+        import inspect
+        caller_frame = inspect.stack()[1]
+        source_file = os.path.realpath(caller_frame.filename)
+        script_name = os.path.splitext(os.path.basename(source_file))[0]
+        db_path = os.path.join(os.path.dirname(source_file) or '.', script_name + DB_NAME_SUFFIX)
+
+    delete_db_files(db_path)
+    config = PyttdConfig(**kwargs)
+    _active_recorder = Recorder(config)
+    _active_recorder.start(db_path)
+
+
+def stop_recording() -> dict:
+    """Stop the active recording and return stats dict.
+
+    Returns:
+        dict with frame_count, elapsed_time, dropped_frames, etc.
+    """
+    global _active_recorder
+    if _active_recorder is None or not _active_recorder._recording:
+        raise RuntimeError("No active recording. Call start_recording() first.")
+
+    stats = _active_recorder.stop()
+    _active_recorder.cleanup()
+    _active_recorder = None
+    return stats

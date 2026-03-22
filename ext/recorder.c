@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <signal.h>
+#include <fnmatch.h>
 #endif
 
 #include "platform.h"
@@ -43,6 +44,18 @@ typedef PyObject *(*EvalFrameFunc)(PyThreadState *, struct _PyInterpreterFrame *
 #define MAX_REPR_LENGTH        256
 #define FLUSH_BATCH_SIZE       4096
 
+/* Coroutine/generator detection flags from co_flags */
+#ifndef CO_COROUTINE
+#define CO_COROUTINE        0x0100
+#endif
+#ifndef CO_GENERATOR
+#define CO_GENERATOR        0x0020
+#endif
+#ifndef CO_ASYNC_GENERATOR
+#define CO_ASYNC_GENERATOR  0x0200
+#endif
+#define PYTTD_CORO_FLAGS (CO_COROUTINE | CO_GENERATOR | CO_ASYNC_GENERATOR)
+
 /* ---- Global State ---- */
 
 _Atomic int g_recording = 0;
@@ -56,6 +69,8 @@ static PyObject *g_flush_callback = NULL;
 static double g_start_time = 0.0;
 static double g_stop_time = 0.0;
 PYTTD_THREAD_LOCAL int g_inside_repr = 0;
+
+static uint64_t g_max_frames = 0;  /* 0 = unlimited */
 
 /* ---- Phase 2: Checkpoint/fast-forward state ---- */
 static int g_fast_forward = 0;
@@ -94,6 +109,15 @@ static SubstringFilter g_secret_filter = {.count = 0};
 /* ---- Include Filter (Phase 9B) ---- */
 static SubstringFilter g_include_filter = {.count = 0};
 static int g_include_mode = 0;  /* 1 if include patterns active */
+
+/* ---- File Include Filter (P1-6) ---- */
+static SubstringFilter g_file_include_filter = {.count = 0};
+static int g_file_include_mode = 0;
+
+/* ---- Exclude Filter (P1-6) ---- */
+static SubstringFilter g_exclude_func_filter = {.count = 0};
+static SubstringFilter g_exclude_file_filter = {.count = 0};
+static int g_exclude_mode = 0;
 
 /* ---- Flush Thread ---- */
 #ifdef _WIN32
@@ -230,14 +254,27 @@ static void clear_secret_filter(void) {
 
 /* ---- Include Filter (Phase 9B) ---- */
 
+static int has_glob_chars(const char *s) {
+    for (; *s; s++) {
+        if (*s == '*' || *s == '?' || *s == '[') return 1;
+    }
+    return 0;
+}
+
 static int should_include(const char *funcname) {
     if (!g_include_mode) return 1;
     /* <module> always included — top-level code must record */
     if (strcmp(funcname, "<module>") == 0) return 1;
     for (int i = 0; i < g_include_filter.count; i++) {
+#ifndef _WIN32
+        if (fnmatch(g_include_filter.patterns[i], funcname, 0) == 0) {
+            return 1;
+        }
+#else
         if (strstr(funcname, g_include_filter.patterns[i]) != NULL) {
             return 1;
         }
+#endif
     }
     return 0;
 }
@@ -249,6 +286,45 @@ static void clear_include_filter(void) {
     }
     g_include_filter.count = 0;
     g_include_mode = 0;
+}
+
+/* P1-6: File-path include filter */
+static int should_include_file(const char *filename) {
+    if (!g_file_include_mode) return 1;
+    for (int i = 0; i < g_file_include_filter.count; i++) {
+#ifndef _WIN32
+        if (fnmatch(g_file_include_filter.patterns[i], filename, FNM_PATHNAME) == 0) {
+            return 1;
+        }
+#else
+        if (strstr(filename, g_file_include_filter.patterns[i]) != NULL) {
+            return 1;
+        }
+#endif
+    }
+    return 0;
+}
+
+/* P1-6: Exclude filter (takes precedence over includes) */
+static int should_exclude(const char *filename, const char *funcname) {
+    if (!g_exclude_mode) return 0;
+    /* Never exclude <module> — script entry must always record */
+    if (strcmp(funcname, "<module>") == 0) return 0;
+    for (int i = 0; i < g_exclude_func_filter.count; i++) {
+#ifndef _WIN32
+        if (fnmatch(g_exclude_func_filter.patterns[i], funcname, 0) == 0) return 1;
+#else
+        if (strstr(funcname, g_exclude_func_filter.patterns[i]) != NULL) return 1;
+#endif
+    }
+    for (int i = 0; i < g_exclude_file_filter.count; i++) {
+#ifndef _WIN32
+        if (fnmatch(g_exclude_file_filter.patterns[i], filename, FNM_PATHNAME) == 0) return 1;
+#else
+        if (strstr(filename, g_exclude_file_filter.patterns[i]) != NULL) return 1;
+#endif
+    }
+    return 0;
 }
 
 /* ---- JSON Escaping ---- */
@@ -791,9 +867,16 @@ static int pyttd_trace_func(PyObject *obj, PyFrameObject *frame, int what, PyObj
         event.filename = filename;
         event.function_name = funcname;
         event.locals_json = locals_json;
+        event.is_coroutine = (code->co_flags & PYTTD_CORO_FLAGS) ? 1 : 0;
 
         ringbuf_push(&event);
         atomic_fetch_add_explicit(&g_frame_count, 1, memory_order_relaxed);
+
+        /* P1-4: Auto-stop when max_frames reached (line events are most frequent) */
+        if (g_max_frames > 0 && event.sequence_no >= g_max_frames) {
+            atomic_store_explicit(&g_stop_requested, 1, memory_order_relaxed);
+        }
+
         Py_DECREF(code);
 
         /* Checkpoint trigger on line events (not just call events in eval hook).
@@ -850,6 +933,7 @@ static int pyttd_trace_func(PyObject *obj, PyFrameObject *frame, int what, PyObj
         event.filename = filename;
         event.function_name = funcname;
         event.locals_json = locals_json;
+        event.is_coroutine = (code->co_flags & PYTTD_CORO_FLAGS) ? 1 : 0;
 
         ringbuf_push(&event);
         atomic_fetch_add_explicit(&g_frame_count, 1, memory_order_relaxed);
@@ -892,6 +976,7 @@ static int pyttd_trace_func(PyObject *obj, PyFrameObject *frame, int what, PyObj
         event.filename = filename;
         event.function_name = funcname;
         event.locals_json = locals_json;
+        event.is_coroutine = (code->co_flags & PYTTD_CORO_FLAGS) ? 1 : 0;
 
         ringbuf_push(&event);
         atomic_fetch_add_explicit(&g_frame_count, 1, memory_order_relaxed);
@@ -1045,6 +1130,40 @@ static PyObject *pyttd_eval_hook(PyThreadState *tstate,
         return result;
     }
 
+    /* P1-6: Exclude filter — skip if excluded (takes precedence over includes) */
+    if (should_exclude(filename, funcname)) {
+        Py_tracefunc saved_trace = tstate->c_tracefunc;
+        PyObject *saved_traceobj = tstate->c_traceobj;
+        Py_XINCREF(saved_traceobj);
+        if (saved_trace) {
+            PyEval_SetTrace(NULL, NULL);
+        }
+        PyObject *result = g_original_eval(tstate, iframe, throwflag);
+        if (saved_trace) {
+            PyEval_SetTrace(saved_trace, saved_traceobj);
+        }
+        Py_XDECREF(saved_traceobj);
+        Py_DECREF(code);
+        return result;
+    }
+
+    /* P1-6: File include filter */
+    if (!should_include_file(filename)) {
+        Py_tracefunc saved_trace = tstate->c_tracefunc;
+        PyObject *saved_traceobj = tstate->c_traceobj;
+        Py_XINCREF(saved_traceobj);
+        if (saved_trace) {
+            PyEval_SetTrace(NULL, NULL);
+        }
+        PyObject *result = g_original_eval(tstate, iframe, throwflag);
+        if (saved_trace) {
+            PyEval_SetTrace(saved_trace, saved_traceobj);
+        }
+        Py_XDECREF(saved_traceobj);
+        Py_DECREF(code);
+        return result;
+    }
+
     /* Phase 9B: Include filter — skip non-matching functions (same pattern as ignore) */
     if (!should_include(funcname)) {
         Py_tracefunc saved_trace = tstate->c_tracefunc;
@@ -1070,6 +1189,7 @@ static PyObject *pyttd_eval_hook(PyThreadState *tstate,
     /* Record call event */
     g_call_depth++;
     int line_no = PyUnstable_InterpreterFrame_GetLine(iframe);
+    int is_coro = (code->co_flags & PYTTD_CORO_FLAGS) ? 1 : 0;
 
     FrameEvent call_event;
     call_event.sequence_no = atomic_fetch_add_explicit(&g_sequence_counter, 1, memory_order_relaxed);
@@ -1081,9 +1201,15 @@ static PyObject *pyttd_eval_hook(PyThreadState *tstate,
     call_event.filename = filename;
     call_event.function_name = funcname;
     call_event.locals_json = NULL;
+    call_event.is_coroutine = is_coro;
 
     ringbuf_push(&call_event);
     atomic_fetch_add_explicit(&g_frame_count, 1, memory_order_relaxed);
+
+    /* P1-4: Auto-stop when max_frames reached */
+    if (g_max_frames > 0 && call_event.sequence_no >= g_max_frames) {
+        atomic_store_explicit(&g_stop_requested, 1, memory_order_relaxed);
+    }
 
     /* Phase 2: Checkpoint trigger (delta-based, guarded against recursion) */
 #ifdef PYTTD_HAS_FORK
@@ -1130,6 +1256,7 @@ static PyObject *pyttd_eval_hook(PyThreadState *tstate,
         unwind_event.filename = filename;
         unwind_event.function_name = funcname;
         unwind_event.locals_json = NULL;
+        unwind_event.is_coroutine = is_coro;
 
         ringbuf_push(&unwind_event);
         atomic_fetch_add_explicit(&g_frame_count, 1, memory_order_relaxed);
@@ -1317,11 +1444,13 @@ static void flush_one_buffer(ThreadRingBuffer *rb) {
         PyObject *depth = PyLong_FromLong(e->call_depth);
         PyObject *locals_obj = e->locals_json ? PyUnicode_FromString(e->locals_json) : Py_NewRef(Py_None);
         PyObject *tid = PyLong_FromUnsignedLong(e->thread_id);
+        PyObject *is_coro = PyBool_FromLong(e->is_coroutine);
 
-        if (!seq || !ts || !ln || !fn || !func || !evt || !depth || !locals_obj || !tid) {
+        if (!seq || !ts || !ln || !fn || !func || !evt || !depth || !locals_obj || !tid || !is_coro) {
             Py_XDECREF(seq); Py_XDECREF(ts); Py_XDECREF(ln);
             Py_XDECREF(fn); Py_XDECREF(func); Py_XDECREF(evt);
             Py_XDECREF(depth); Py_XDECREF(locals_obj); Py_XDECREF(tid);
+            Py_XDECREF(is_coro);
             Py_DECREF(dict);
             PyErr_Clear();
             PyObject *empty = PyDict_New();
@@ -1337,13 +1466,15 @@ static void flush_one_buffer(ThreadRingBuffer *rb) {
             PyDict_SetItemString(dict, "frame_event", evt) < 0 ||
             PyDict_SetItemString(dict, "call_depth", depth) < 0 ||
             PyDict_SetItemString(dict, "locals_snapshot", locals_obj) < 0 ||
-            PyDict_SetItemString(dict, "thread_id", tid) < 0) {
+            PyDict_SetItemString(dict, "thread_id", tid) < 0 ||
+            PyDict_SetItemString(dict, "is_coroutine", is_coro) < 0) {
             PyErr_Clear();
         }
 
         Py_DECREF(seq); Py_DECREF(ts); Py_DECREF(ln);
         Py_DECREF(fn); Py_DECREF(func); Py_DECREF(evt);
         Py_DECREF(depth); Py_DECREF(locals_obj); Py_DECREF(tid);
+        Py_DECREF(is_coro);
 
         PyList_SET_ITEM(list, i, dict);
     }
@@ -1527,6 +1658,7 @@ PyObject *pyttd_start_recording(PyObject *self, PyObject *args, PyObject *kwargs
     g_inside_repr = 0;
     g_fast_forward = 0;
     g_fast_forward_target = 0;
+    g_max_frames = 0;
     atomic_store_explicit(&g_last_checkpoint_seq, 0, memory_order_relaxed);
     g_in_checkpoint = 0;
     g_cmd_fd = -1;
@@ -1794,9 +1926,109 @@ PyObject *pyttd_set_include_patterns(PyObject *self, PyObject *args) {
             PyObject *item = PyList_GET_ITEM(patterns_list, i);
             const char *pattern = PyUnicode_AsUTF8(item);
             if (!pattern) { PyErr_Clear(); continue; }
+#ifndef _WIN32
+            if (!has_glob_chars(pattern)) {
+                /* Auto-wrap plain substring patterns as *pattern* for fnmatch */
+                size_t len = strlen(pattern);
+                char *wrapped = (char *)malloc(len + 3);
+                if (wrapped) {
+                    snprintf(wrapped, len + 3, "*%s*", pattern);
+                    g_include_filter.patterns[g_include_filter.count++] = wrapped;
+                }
+            } else {
+                char *dup = strdup(pattern);
+                if (dup) g_include_filter.patterns[g_include_filter.count++] = dup;
+            }
+#else
             char *dup = strdup(pattern);
             if (dup) g_include_filter.patterns[g_include_filter.count++] = dup;
+#endif
         }
+    }
+    Py_RETURN_NONE;
+}
+
+PyObject *pyttd_set_max_frames(PyObject *self, PyObject *args) {
+    (void)self;
+    unsigned long long max_frames;
+    if (!PyArg_ParseTuple(args, "K", &max_frames)) {
+        return NULL;
+    }
+    g_max_frames = (uint64_t)max_frames;
+    Py_RETURN_NONE;
+}
+
+PyObject *pyttd_set_file_include_patterns(PyObject *self, PyObject *args) {
+    (void)self;
+    PyObject *patterns_list;
+    if (!PyArg_ParseTuple(args, "O!", &PyList_Type, &patterns_list)) return NULL;
+    /* Clear existing file include patterns */
+    for (int i = 0; i < g_file_include_filter.count; i++) {
+        free(g_file_include_filter.patterns[i]);
+        g_file_include_filter.patterns[i] = NULL;
+    }
+    g_file_include_filter.count = 0;
+    g_file_include_mode = 0;
+    Py_ssize_t n = PyList_GET_SIZE(patterns_list);
+    if (n > 0) {
+        g_file_include_mode = 1;
+        for (Py_ssize_t i = 0; i < n && g_file_include_filter.count < MAX_IGNORE_PATTERNS; i++) {
+            PyObject *item = PyList_GET_ITEM(patterns_list, i);
+            const char *pattern = PyUnicode_AsUTF8(item);
+            if (!pattern) { PyErr_Clear(); continue; }
+            char *dup = strdup(pattern);
+            if (dup) g_file_include_filter.patterns[g_file_include_filter.count++] = dup;
+        }
+    }
+    Py_RETURN_NONE;
+}
+
+PyObject *pyttd_set_exclude_patterns(PyObject *self, PyObject *args) {
+    (void)self;
+    PyObject *func_list, *file_list;
+    if (!PyArg_ParseTuple(args, "O!O!", &PyList_Type, &func_list, &PyList_Type, &file_list))
+        return NULL;
+    /* Clear existing exclude patterns */
+    for (int i = 0; i < g_exclude_func_filter.count; i++) {
+        free(g_exclude_func_filter.patterns[i]);
+    }
+    g_exclude_func_filter.count = 0;
+    for (int i = 0; i < g_exclude_file_filter.count; i++) {
+        free(g_exclude_file_filter.patterns[i]);
+    }
+    g_exclude_file_filter.count = 0;
+    g_exclude_mode = 0;
+
+    Py_ssize_t nf = PyList_GET_SIZE(func_list);
+    for (Py_ssize_t i = 0; i < nf && g_exclude_func_filter.count < MAX_IGNORE_PATTERNS; i++) {
+        const char *p = PyUnicode_AsUTF8(PyList_GET_ITEM(func_list, i));
+        if (!p) { PyErr_Clear(); continue; }
+#ifndef _WIN32
+        if (!has_glob_chars(p)) {
+            size_t len = strlen(p);
+            char *wrapped = (char *)malloc(len + 3);
+            if (wrapped) {
+                snprintf(wrapped, len + 3, "*%s*", p);
+                g_exclude_func_filter.patterns[g_exclude_func_filter.count++] = wrapped;
+            }
+        } else {
+            char *dup = strdup(p);
+            if (dup) g_exclude_func_filter.patterns[g_exclude_func_filter.count++] = dup;
+        }
+#else
+        char *dup = strdup(p);
+        if (dup) g_exclude_func_filter.patterns[g_exclude_func_filter.count++] = dup;
+#endif
+    }
+    Py_ssize_t nfi = PyList_GET_SIZE(file_list);
+    for (Py_ssize_t i = 0; i < nfi && g_exclude_file_filter.count < MAX_IGNORE_PATTERNS; i++) {
+        const char *p = PyUnicode_AsUTF8(PyList_GET_ITEM(file_list, i));
+        if (!p) { PyErr_Clear(); continue; }
+        char *dup = strdup(p);
+        if (dup) g_exclude_file_filter.patterns[g_exclude_file_filter.count++] = dup;
+    }
+    if (g_exclude_func_filter.count > 0 || g_exclude_file_filter.count > 0) {
+        g_exclude_mode = 1;
     }
     Py_RETURN_NONE;
 }

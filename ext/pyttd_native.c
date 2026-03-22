@@ -36,6 +36,12 @@ static PyMethodDef PyttdMethods[] = {
      "Set variable name patterns for secret redaction during recording"},
     {"set_include_patterns", (PyCFunction)pyttd_set_include_patterns, METH_VARARGS,
      "Set function name patterns for selective recording (empty = record all)"},
+    {"set_max_frames", (PyCFunction)pyttd_set_max_frames, METH_VARARGS,
+     "Set maximum frame count for auto-stop (0 = unlimited)"},
+    {"set_file_include_patterns", (PyCFunction)pyttd_set_file_include_patterns, METH_VARARGS,
+     "Set file path glob patterns for selective recording (empty = record all)"},
+    {"set_exclude_patterns", (PyCFunction)pyttd_set_exclude_patterns, METH_VARARGS,
+     "Set exclude patterns: (func_patterns, file_patterns). Excluded functions/files are never recorded."},
     {NULL, NULL, 0, NULL}
 };
 

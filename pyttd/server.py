@@ -21,14 +21,23 @@ logger = logging.getLogger(__name__)
 class PyttdServer:
     def __init__(self, script: str | None, is_module: bool = False, cwd: str = '.',
                  checkpoint_interval: int = 1000, replay_db: str | None = None,
-                 include_functions: list[str] | None = None):
+                 include_functions: list[str] | None = None,
+                 max_frames: int = 0, env_vars: dict | None = None,
+                 include_files: list[str] | None = None,
+                 exclude_functions: list[str] | None = None,
+                 exclude_files: list[str] | None = None):
         self.script = script
         self.is_module = is_module
         self.cwd = os.path.abspath(cwd)
         self.config = PyttdConfig(
             checkpoint_interval=checkpoint_interval,
             include_functions=include_functions or [],
+            max_frames=max_frames,
+            include_files=include_files or [],
+            exclude_functions=exclude_functions or [],
+            exclude_files=exclude_files or [],
         )
+        self._launch_env = env_vars or {}
         self.recorder = Recorder(self.config)
         self.runner = Runner()
         self.session = Session()
@@ -187,7 +196,7 @@ class PyttdServer:
 
     def _event_loop(self):
         while not self._shutdown:
-            timeout = 0.5 if self._recording else 1.0
+            timeout = 0.5 if self._recording else 0.1
             try:
                 events = self._sel.select(timeout=timeout)
             except OSError:
@@ -247,10 +256,18 @@ class PyttdServer:
             if self._recording and not self._shutdown and self._rpc and not self._rpc.is_closed:
                 with self._frame_count_lock:
                     fc = self._frame_count
-                self._rpc.send_notification("progress", {
+                progress_data = {
                     "frameCount": fc,
                     "elapsedMs": int((time.monotonic() - self._recording_start) * 1000),
-                })
+                }
+                try:
+                    import pyttd_native
+                    stats = pyttd_native.get_recording_stats()
+                    progress_data["droppedFrames"] = stats.get('dropped_frames', 0)
+                    progress_data["poolOverflows"] = stats.get('pool_overflows', 0)
+                except Exception:
+                    pass
+                self._rpc.send_notification("progress", progress_data)
 
     def _process_messages(self):
         while True:
@@ -367,6 +384,11 @@ class PyttdServer:
             self._db_path = db_path
         if "includePatterns" in params:
             self.config.include_functions = params["includePatterns"]
+        if "maxFrames" in params:
+            self.config.max_frames = params["maxFrames"]
+        env_vars = params.get("env", {})
+        if env_vars:
+            self._launch_env = env_vars
         return {}
 
     def _handle_configuration_done(self, params: dict) -> dict:
@@ -377,7 +399,11 @@ class PyttdServer:
         return {}
 
     def _handle_set_breakpoints(self, params: dict) -> dict:
-        self.session.set_breakpoints(params.get("breakpoints", []))
+        breakpoints = params.get("breakpoints", [])
+        self.session.set_breakpoints(breakpoints)
+        if self.session.state == "replay":
+            verification = self.session.verify_breakpoints(breakpoints)
+            return {"verified": verification}
         return {}
 
     def _handle_set_exception_breakpoints(self, params: dict) -> dict:
@@ -403,15 +429,21 @@ class PyttdServer:
         return {"frames": frames}
 
     def _handle_get_scopes(self, params: dict) -> dict:
+        if self.session.state != "replay":
+            return {"scopes": []}
         seq = params.get("seq", self.session.current_frame_seq)
         return {"scopes": [{"name": "Locals", "variablesReference": seq + 1}]}
 
     def _handle_get_variables(self, params: dict) -> dict:
+        if self.session.state != "replay":
+            return {"variables": []}
         seq = params.get("seq", self.session.current_frame_seq)
         variables = self.session.get_variables_at(seq)
         return {"variables": variables}
 
     def _handle_evaluate(self, params: dict) -> dict:
+        if self.session.state != "replay":
+            return {"result": "", "error": "not_in_replay"}
         seq = params.get("seq", self.session.current_frame_seq)
         expression = params.get("expression", "")
         context = params.get("context", "hover")
@@ -594,6 +626,11 @@ class PyttdServer:
     def _recording_thread_main(self):
         import pyttd_native
         pyttd_native.set_recording_thread()
+        # Apply launch env vars to the recording thread's environment
+        for key, value in self._launch_env.items():
+            if key == 'PYTTD_RECORDING':
+                continue  # Don't let user override internal env var
+            os.environ[key] = value
         error_info = None
         try:
             if self.is_module:

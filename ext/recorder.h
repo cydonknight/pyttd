@@ -14,6 +14,9 @@ PyObject *pyttd_request_stop(PyObject *self, PyObject *Py_UNUSED(args));
 PyObject *pyttd_set_recording_thread(PyObject *self, PyObject *Py_UNUSED(args));
 PyObject *pyttd_set_secret_patterns(PyObject *self, PyObject *args);
 PyObject *pyttd_set_include_patterns(PyObject *self, PyObject *args);
+PyObject *pyttd_set_max_frames(PyObject *self, PyObject *args);
+PyObject *pyttd_set_file_include_patterns(PyObject *self, PyObject *args);
+PyObject *pyttd_set_exclude_patterns(PyObject *self, PyObject *args);
 
 /* Phase 2 getters/setters — used by checkpoint.c and replay.c */
 void recorder_set_fast_forward(int enabled, uint64_t target_seq);

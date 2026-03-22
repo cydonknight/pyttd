@@ -119,7 +119,8 @@ class TestConditionalBreakpoints:
         result = session.continue_forward()
         assert result['reason'] == 'breakpoint'
 
-    def test_condition_eval_error_fails_open(self, record_func):
+    def test_condition_eval_error_does_not_fire(self, record_func):
+        """Broken conditions should NOT fire breakpoints (fail-closed)."""
         db_path, run_id, _ = record_func('''
             for i in range(5):
                 x = i
@@ -138,8 +139,32 @@ class TestConditionalBreakpoints:
             'condition': '!!!invalid_syntax!!!',
         }])
         result = session.continue_forward()
-        # Should still stop (fail-open)
-        assert result['reason'] == 'breakpoint'
+        # Should NOT stop — broken condition fails closed
+        assert result['reason'] == 'end'
+
+    def test_condition_eval_error_logs_warning(self, record_func, caplog):
+        """Broken conditions should log a warning."""
+        import logging
+        db_path, run_id, _ = record_func('''
+            for i in range(3):
+                x = i
+        ''')
+        session = _setup_session(run_id)
+        frame = (ExecutionFrames.select()
+                 .where((ExecutionFrames.run_id == run_id) &
+                        (ExecutionFrames.frame_event == 'line') &
+                        (ExecutionFrames.locals_snapshot.contains('"i"')))
+                 .order_by(ExecutionFrames.sequence_no)
+                 .first())
+        assert frame is not None
+        session.set_breakpoints([{
+            'file': frame.filename,
+            'line': frame.line_no,
+            'condition': '!!!invalid!!!',
+        }])
+        with caplog.at_level(logging.WARNING, logger='pyttd.session'):
+            session.continue_forward()
+        assert any('Condition eval error' in r.message for r in caplog.records)
 
     def test_condition_with_comparison(self, record_func):
         db_path, run_id, _ = record_func('''
@@ -182,7 +207,7 @@ class TestConditionalBreakpoints:
             'condition': "name == 'Bob'",
         }])
         result = session.continue_forward()
-        # May hit due to fail-open or matching
+        # May hit due to matching or end if condition can't be evaluated
         assert result['reason'] in ('breakpoint', 'end')
 
     def test_multiple_conditional_breakpoints(self, record_func):
