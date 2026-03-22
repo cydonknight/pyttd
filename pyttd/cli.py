@@ -273,6 +273,8 @@ def _parse_env_file(filepath: str) -> dict:
             line = line.strip()
             if not line or line.startswith('#'):
                 continue
+            if line.startswith('export '):
+                line = line[7:]
             if '=' not in line:
                 continue
             key, value = line.split('=', 1)
