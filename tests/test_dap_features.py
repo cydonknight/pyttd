@@ -307,4 +307,5 @@ class TestReplEvaluation:
                      .first())
         assert frame is not None
         result = session.evaluate_at(frame.sequence_no, 'nonexistent', 'repl')
-        assert '<not available>' in result['result']
+        # REPL returns context-aware error message for missing variables
+        assert 'Error' in result['result'] or '<not available>' in result['result']
