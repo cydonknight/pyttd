@@ -22,6 +22,7 @@ class PyttdConfig:
     include_files: list[str] = field(default_factory=list)
     exclude_functions: list[str] = field(default_factory=list)
     exclude_files: list[str] = field(default_factory=list)
+    checkpoint_memory_limit_mb: int = 0  # 0 = unlimited
 
     def __post_init__(self):
         if self.checkpoint_interval < 0:
@@ -38,3 +39,5 @@ class PyttdConfig:
             raise ValueError("max_db_size_mb must be >= 0")
         if self.keep_runs < 0:
             raise ValueError("keep_runs must be >= 0")
+        if self.checkpoint_memory_limit_mb < 0:
+            raise ValueError("checkpoint_memory_limit_mb must be >= 0")

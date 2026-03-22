@@ -11,7 +11,7 @@ def test_method_names():
         'start_recording', 'stop_recording', 'get_recording_stats',
         'set_ignore_patterns', 'request_stop', 'set_recording_thread',
         'create_checkpoint', 'restore_checkpoint', 'kill_all_checkpoints',
-        'get_checkpoint_count',
+        'get_checkpoint_count', 'get_checkpoint_memory', 'set_checkpoint_memory_limit',
     ]
     members = dir(pyttd_native)
     for name in expected:

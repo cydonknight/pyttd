@@ -225,12 +225,24 @@ export class PyttdDebugSession extends LoggingDebugSession {
                 this.sendEvent(new OutputEvent(params.output, params.category));
                 break;
             case 'progress': {
+                const cpCount = params.checkpointCount ?? 0;
+                const cpMB = params.checkpointMemoryMB ?? 0;
                 let msg = `Recording: ${params.frameCount} frames`;
+                if (cpCount > 0) {
+                    msg += ` | ${cpCount} checkpoints (${cpMB} MB)`;
+                }
                 const warnings: string[] = [];
                 if (params.droppedFrames > 0) warnings.push(`${params.droppedFrames} dropped`);
                 if (params.poolOverflows > 0) warnings.push(`${params.poolOverflows} overflows`);
                 if (warnings.length > 0) msg += ` (${warnings.join(', ')})`;
                 this.sendEvent(new ProgressUpdateEvent(this.progressId, msg));
+                // Emit checkpoint memory custom event for status bar
+                if (cpCount > 0) {
+                    this.sendEvent(new Event('pyttd/checkpointMemory', {
+                        checkpointCount: cpCount,
+                        checkpointMemoryMB: cpMB,
+                    }));
+                }
                 if (params.droppedFrames > 0 && !this.droppedFrameWarningShown) {
                     this.droppedFrameWarningShown = true;
                     this.sendEvent(new Event('pyttd/error', {
@@ -787,7 +799,8 @@ export class PyttdDebugSession extends LoggingDebugSession {
                 });
         } else if (['get_execution_stats', 'get_traced_files',
                      'get_call_children', 'get_variables',
-                     'get_variable_history'].includes(command)) {
+                     'get_variable_history',
+                     'get_checkpoint_memory'].includes(command)) {
             // Query pass-throughs — no state modification, just forward and return.
             this.backend.sendRequest(command, args || {})
                 .then((result: any) => {

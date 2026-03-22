@@ -213,6 +213,33 @@
                 "default": "internalConsole"
               }
             }
+          },
+          "attach": {
+            "required": ["traceDb"],
+            "properties": {
+              "traceDb": {
+                "type": "string",
+                "description": "Path to existing .pyttd.db trace file to replay"
+              },
+              "pythonPath": {
+                "type": "string",
+                "description": "Path to Python interpreter"
+              },
+              "cwd": {
+                "type": "string",
+                "description": "Working directory"
+              },
+              "stopOnEntry": {
+                "type": "boolean",
+                "description": "Pause at the first line when replay begins (default: true)",
+                "default": true
+              },
+              "rpcTimeout": {
+                "type": "number",
+                "description": "Timeout for RPC calls to backend (ms)",
+                "default": 5000
+              }
+            }
           }
         },
         "configurationSnippets": [
@@ -225,6 +252,16 @@
               "name": "Time-Travel Debug",
               "program": "^\"${file}\"",
               "env": {}
+            }
+          },
+          {
+            "label": "pyttd: Attach (replay trace)",
+            "description": "Replay an existing pyttd trace recording",
+            "body": {
+              "type": "pyttd",
+              "request": "attach",
+              "name": "Replay Trace",
+              "traceDb": "^\"${workspaceFolder}/${input:traceDb}\""
             }
           }
         ],

@@ -269,6 +269,9 @@ class PyttdServer:
                     stats = pyttd_native.get_recording_stats()
                     progress_data["droppedFrames"] = stats.get('dropped_frames', 0)
                     progress_data["poolOverflows"] = stats.get('pool_overflows', 0)
+                    progress_data["checkpointCount"] = stats.get('checkpoint_count', 0)
+                    progress_data["checkpointMemoryMB"] = round(
+                        stats.get('checkpoint_memory_bytes', 0) / (1024 * 1024), 1)
                 except Exception:
                     pass
                 try:
@@ -351,6 +354,7 @@ class PyttdServer:
             "get_call_children": self._handle_get_call_children,
             "get_variable_children": self._handle_get_variable_children,
             "get_variable_history": self._handle_get_variable_history,
+            "get_checkpoint_memory": self._handle_get_checkpoint_memory,
             "disconnect": self._handle_disconnect,
         }.get(method)
 
@@ -554,6 +558,12 @@ class PyttdServer:
         end_seq = params.get("endSeq", self.session.last_line_seq or 0)
         max_points = params.get("maxPoints", 500)
         return {"history": self.session.get_variable_history(name, start_seq, end_seq, max_points)}
+
+    def _handle_get_checkpoint_memory(self, params: dict) -> dict:
+        import pyttd_native
+        mem_info = pyttd_native.get_checkpoint_memory()
+        mem_info["limitMB"] = self.config.checkpoint_memory_limit_mb
+        return mem_info
 
     def _handle_disconnect(self, params: dict) -> dict:
         if self._recording:

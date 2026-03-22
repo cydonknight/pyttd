@@ -15,6 +15,27 @@ export function activate(context: vscode.ExtensionContext) {
         })
     );
 
+    // Status bar item for checkpoint memory during recording
+    const memoryStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 50);
+    memoryStatusBar.command = 'pyttd.showCheckpointMemory';
+    context.subscriptions.push(memoryStatusBar);
+
+    let lastCheckpointMemoryInfo: any = null;
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('pyttd.showCheckpointMemory', () => {
+            if (!lastCheckpointMemoryInfo) {
+                vscode.window.showInformationMessage('No checkpoint memory data available.');
+                return;
+            }
+            const info = lastCheckpointMemoryInfo;
+            const items = [
+                `Total: ${info.checkpointMemoryMB ?? 0} MB across ${info.checkpointCount ?? 0} checkpoints`,
+            ];
+            vscode.window.showQuickPick(items, { title: 'Checkpoint Memory' });
+        }),
+    );
+
     // Register timeline webview provider
     const timelineProvider = new TimelineScrubberProvider(context.extensionUri);
     context.subscriptions.push(
@@ -127,6 +148,8 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.debug.onDidStartDebugSession((session) => {
             if (session.type === 'pyttd') {
                 codeLensProvider.refresh();
+                memoryStatusBar.text = '$(pulse) TTD: Recording...';
+                memoryStatusBar.show();
             }
         }),
         vscode.debug.onDidTerminateDebugSession((session) => {
@@ -134,6 +157,8 @@ export function activate(context: vscode.ExtensionContext) {
                 codeLensProvider.refresh();
                 callHistoryProvider.refresh();
                 callHistoryRefreshed = false;
+                memoryStatusBar.hide();
+                lastCheckpointMemoryInfo = null;
             }
         }),
     );
@@ -154,6 +179,18 @@ export function activate(context: vscode.ExtensionContext) {
                 } else if (severity === 'warning') {
                     vscode.window.showWarningMessage(fullMsg);
                 }
+            }
+            // Hide memory status bar when entering replay mode
+            if (e.event === 'pyttd/timelineData') {
+                memoryStatusBar.hide();
+            }
+            // Update status bar with checkpoint memory during recording
+            if (e.event === 'pyttd/checkpointMemory') {
+                lastCheckpointMemoryInfo = e.body;
+                const count = e.body.checkpointCount ?? 0;
+                const mb = e.body.checkpointMemoryMB ?? 0;
+                memoryStatusBar.text = `$(database) TTD: ${count} checkpoints (${mb} MB)`;
+                memoryStatusBar.tooltip = `Checkpoint memory: ${mb} MB across ${count} checkpoints. Click for details.`;
             }
             // Refresh call history once when entering replay mode
             if (e.event === 'pyttd/timelineData' && !callHistoryRefreshed) {

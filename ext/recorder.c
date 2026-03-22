@@ -1595,6 +1595,95 @@ static void *flush_thread_func(void *arg) {
 }
 #endif
 
+/* ---- Attach Mode: Synthesize existing stack ---- */
+
+#define MAX_SYNTH_DEPTH 256
+
+static void synthesize_existing_stack(void) {
+    PyFrameObject *current = PyEval_GetFrame();
+    if (!current) return;
+    Py_INCREF(current);
+
+    struct {
+        PyFrameObject *frame;
+        PyCodeObject *code;
+        const char *filename;
+        const char *funcname;
+    } stack[MAX_SYNTH_DEPTH];
+    int count = 0;
+
+    PyFrameObject *f = current;
+    while (f && count < MAX_SYNTH_DEPTH) {
+        PyCodeObject *code = PyFrame_GetCode(f);
+        const char *filename = PyUnicode_AsUTF8(code->co_filename);
+        const char *funcname = PyUnicode_AsUTF8(code->co_qualname);
+
+        if (!filename || !funcname) {
+            PyErr_Clear();
+            Py_DECREF(code);
+            PyFrameObject *back = PyFrame_GetBack(f);
+            if (f != current) Py_DECREF(f);
+            f = back;
+            continue;
+        }
+
+        if (should_ignore(filename, funcname) ||
+            should_exclude(filename, funcname) ||
+            !should_include_file(filename) ||
+            !should_include(funcname)) {
+            Py_DECREF(code);
+            PyFrameObject *back = PyFrame_GetBack(f);
+            if (f != current) Py_DECREF(f);
+            f = back;
+            continue;
+        }
+
+        stack[count].frame = f;
+        stack[count].code = code;
+        stack[count].filename = filename;
+        stack[count].funcname = funcname;
+        count++;
+
+        PyFrameObject *back = PyFrame_GetBack(f);
+        f = back;
+    }
+    if (f && f != current) {
+        Py_DECREF(f);
+    }
+
+    for (int i = count - 1; i >= 0; i--) {
+        g_call_depth++;
+        int line_no = PyFrame_GetLineNumber(stack[i].frame);
+        int is_coro = (stack[i].code->co_flags & PYTTD_CORO_FLAGS) ? 1 : 0;
+
+        const char *locals_json = serialize_locals(
+            (PyObject *)stack[i].frame, g_locals_buf, sizeof(g_locals_buf),
+            NULL, NULL);
+
+        FrameEvent event;
+        event.sequence_no = atomic_fetch_add_explicit(&g_sequence_counter, 1, memory_order_relaxed);
+        event.line_no = line_no;
+        event.call_depth = g_call_depth;
+        event.thread_id = PyThread_get_thread_ident();
+        event.timestamp = get_monotonic_time() - g_start_time;
+        event.event_type = "call";
+        event.filename = stack[i].filename;
+        event.function_name = stack[i].funcname;
+        event.locals_json = locals_json;
+        event.is_coroutine = is_coro;
+
+        ringbuf_push(&event);
+        atomic_fetch_add_explicit(&g_frame_count, 1, memory_order_relaxed);
+
+        Py_DECREF(stack[i].code);
+    }
+
+    Py_DECREF(current);
+    for (int i = 1; i < count; i++) {
+        Py_DECREF(stack[i].frame);
+    }
+}
+
 /* ---- Python-Facing Functions ---- */
 
 PyObject *pyttd_start_recording(PyObject *self, PyObject *args, PyObject *kwargs) {
@@ -1607,7 +1696,8 @@ PyObject *pyttd_start_recording(PyObject *self, PyObject *args, PyObject *kwargs
 
     static char *kwlist[] = {"flush_callback", "buffer_size", "flush_interval_ms",
                              "checkpoint_callback", "checkpoint_interval",
-                             "io_flush_callback", "io_replay_loader", NULL};
+                             "io_flush_callback", "io_replay_loader",
+                             "attach_mode", NULL};
     PyObject *callback = NULL;
     int buffer_size = PYTTD_DEFAULT_CAPACITY;
     int flush_interval_ms = 10;
@@ -1615,11 +1705,13 @@ PyObject *pyttd_start_recording(PyObject *self, PyObject *args, PyObject *kwargs
     int checkpoint_interval = 0;
     PyObject *io_flush_cb = NULL;
     PyObject *io_replay_loader = NULL;
+    int attach_mode = 0;
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|iiOiOO", kwlist,
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|iiOiOOp", kwlist,
                                       &callback, &buffer_size, &flush_interval_ms,
                                       &checkpoint_cb, &checkpoint_interval,
-                                      &io_flush_cb, &io_replay_loader)) {
+                                      &io_flush_cb, &io_replay_loader,
+                                      &attach_mode)) {
         return NULL;
     }
 
@@ -1715,10 +1807,24 @@ PyObject *pyttd_start_recording(PyObject *self, PyObject *args, PyObject *kwargs
         install_io_hooks_internal(io_flush_cb, io_replay_loader);
     }
 
+    /* Attach mode: force-disable checkpoints (unsafe with unknown process state) */
+    if (attach_mode) {
+        g_checkpoint_interval = 0;
+        Py_XDECREF(g_checkpoint_callback);
+        g_checkpoint_callback = NULL;
+    }
+
     /* Save original eval function and install our hook */
     PyInterpreterState *interp = PyInterpreterState_Get();
     g_original_eval = PYTTD_GET_EVAL_FUNC(interp);
     atomic_store_explicit(&g_recording, 1, memory_order_relaxed);
+
+    /* Attach mode: synthesize call events for existing stack frames
+     * BEFORE installing the eval hook */
+    if (attach_mode) {
+        synthesize_existing_stack();
+    }
+
     PYTTD_SET_EVAL_FUNC(interp, pyttd_eval_hook);
 
     /* Start flush thread */
@@ -1853,6 +1959,17 @@ PyObject *pyttd_get_recording_stats(PyObject *self, PyObject *Py_UNUSED(args)) {
 
     Py_DECREF(fc); Py_DECREF(df); Py_DECREF(et);
     Py_DECREF(flc); Py_DECREF(po);
+
+    /* Checkpoint memory stats */
+    checkpoint_store_refresh_rss();
+    PyObject *cp_count = PyLong_FromLong(checkpoint_store_count());
+    PyObject *cp_mem = PyLong_FromUnsignedLongLong(checkpoint_store_total_rss());
+    if (cp_count && cp_mem) {
+        PyDict_SetItemString(dict, "checkpoint_count", cp_count);
+        PyDict_SetItemString(dict, "checkpoint_memory_bytes", cp_mem);
+    }
+    Py_XDECREF(cp_count);
+    Py_XDECREF(cp_mem);
 
     return dict;
 }

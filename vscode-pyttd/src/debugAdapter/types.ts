@@ -35,3 +35,13 @@ export interface PyttdLaunchConfig {
     maxFrames?: number;
     console?: 'integratedTerminal' | 'internalConsole';
 }
+
+export interface PyttdAttachConfig {
+    type: 'pyttd';
+    request: 'attach';
+    traceDb: string;
+    pythonPath?: string;
+    cwd?: string;
+    rpcTimeout?: number;
+    stopOnEntry?: boolean;
+}

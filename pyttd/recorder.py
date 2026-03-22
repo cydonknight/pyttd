@@ -23,7 +23,7 @@ class Recorder:
         self._flush_count = 0
         self._size_warned = False
 
-    def start(self, db_path: str, script_path: str | None = None):
+    def start(self, db_path: str, script_path: str | None = None, attach: bool = False):
         """Initialize DB, create Runs record, set ignore patterns, install frame eval hook."""
         self._db_path = db_path
         storage.connect_to_db(db_path)
@@ -37,7 +37,7 @@ class Recorder:
                     cp.is_alive = False
                     cp.child_pid = None
                     cp.save()
-        self._run = Runs.create(script_path=script_path)
+        self._run = Runs.create(script_path=script_path, is_attach=attach)
         # Auto-evict old runs if keep_runs is configured
         if self.config.keep_runs > 0:
             evicted = storage._evict_old_runs_internal(self.config.keep_runs)
@@ -70,6 +70,9 @@ class Recorder:
         kwargs['io_flush_callback'] = self._on_io_event
         kwargs['io_replay_loader'] = self._load_io_events_for_replay
 
+        if attach:
+            kwargs['attach_mode'] = 1
+
         try:
             pyttd_native.start_recording(**kwargs)
         except Exception:
@@ -84,6 +87,10 @@ class Recorder:
         # Set max_frames AFTER start_recording (which resets it to 0)
         if self.config.max_frames > 0:
             pyttd_native.set_max_frames(self.config.max_frames)
+        # Set checkpoint memory limit if configured
+        if self.config.checkpoint_memory_limit_mb > 0:
+            pyttd_native.set_checkpoint_memory_limit(
+                self.config.checkpoint_memory_limit_mb * 1024 * 1024)
         self._recording = True
 
     def stop(self) -> dict:

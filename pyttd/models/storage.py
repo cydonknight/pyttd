@@ -39,6 +39,14 @@ def connect_to_db(db_path: str):
 def initialize_schema(models: List[Type[Model]]):
     """Create tables for the given models (safe=True for idempotency)."""
     db.create_tables(models, safe=True)
+    # Migrate: add columns that may not exist in older databases
+    for sql in [
+        'ALTER TABLE runs ADD COLUMN is_attach INTEGER DEFAULT 0',
+    ]:
+        try:
+            db.execute_sql(sql)
+        except Exception:
+            pass  # Column already exists
 
 def delete_db_files(db_path: str):
     """Delete a SQLite database and its WAL/SHM companion files."""

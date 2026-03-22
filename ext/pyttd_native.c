@@ -44,6 +44,10 @@ static PyMethodDef PyttdMethods[] = {
      "Set exclude patterns: (func_patterns, file_patterns). Excluded functions/files are never recorded."},
     {"trace_current_frame", pyttd_trace_current_frame, METH_NOARGS,
      "Install trace function on current thread to capture line events in the caller's frame."},
+    {"get_checkpoint_memory", (PyCFunction)pyttd_get_checkpoint_memory, METH_NOARGS,
+     "Return dict with checkpoint memory info (total_bytes, entries, etc.)"},
+    {"set_checkpoint_memory_limit", (PyCFunction)pyttd_set_checkpoint_memory_limit, METH_VARARGS,
+     "Set checkpoint memory limit in bytes (0 = unlimited). Triggers aggressive eviction."},
     {NULL, NULL, 0, NULL}
 };
 

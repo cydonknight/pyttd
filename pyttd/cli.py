@@ -37,6 +37,8 @@ def main():
                                help='Warn when DB exceeds this size in MB (0 = unlimited)')
     record_parser.add_argument('--keep-runs', type=int, default=0,
                                help='Keep only last N runs, evict older (0 = keep all)')
+    record_parser.add_argument('--checkpoint-memory-limit', type=int, default=0,
+                               help='Checkpoint memory limit in MB (0 = unlimited)')
 
     query_parser = subparsers.add_parser('query', help='Query trace data')
     query_parser.add_argument('--last-run', action='store_true')
@@ -171,6 +173,8 @@ def _cmd_record(args):
         config_kwargs['max_db_size_mb'] = args.max_db_size
     if args.keep_runs > 0:
         config_kwargs['keep_runs'] = args.keep_runs
+    if args.checkpoint_memory_limit > 0:
+        config_kwargs['checkpoint_memory_limit_mb'] = args.checkpoint_memory_limit
     config = PyttdConfig(**config_kwargs)
     recorder = Recorder(config)
     runner = Runner()
@@ -293,6 +297,8 @@ def _cmd_query(args):
             from datetime import datetime
             for r in runs:
                 script = os.path.basename(r.script_path) if r.script_path else 'unknown'
+                if getattr(r, 'is_attach', False):
+                    script += ' [attach]'
                 started = datetime.fromtimestamp(r.timestamp_start).strftime('%Y-%m-%d %H:%M:%S') if r.timestamp_start else '?'
                 if r.timestamp_end and r.timestamp_start:
                     duration = f"{r.timestamp_end - r.timestamp_start:.1f}s"

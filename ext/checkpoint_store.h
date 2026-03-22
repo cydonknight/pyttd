@@ -13,6 +13,7 @@ typedef struct {
     uint64_t current_position;  /* updated after each RESUME/STEP */
     int is_alive;
     int is_busy;                /* 1 during active RESUME/STEP I/O */
+    uint64_t rss_bytes;         /* last measured RSS of checkpoint child */
 } CheckpointEntry;
 
 /* Initialize/reset the checkpoint store */
@@ -51,5 +52,19 @@ PyObject *pyttd_kill_all_checkpoints(PyObject *self, PyObject *Py_UNUSED(args));
 
 /* Python-facing: return count of live checkpoints */
 PyObject *pyttd_get_checkpoint_count(PyObject *self, PyObject *Py_UNUSED(args));
+
+/* RSS tracking */
+uint64_t checkpoint_get_rss(int child_pid);
+void checkpoint_store_refresh_rss(void);
+uint64_t checkpoint_store_total_rss(void);
+
+/* Memory limit for aggressive eviction */
+void checkpoint_store_set_memory_limit(uint64_t limit_bytes);
+
+/* Python-facing: get checkpoint memory info */
+PyObject *pyttd_get_checkpoint_memory(PyObject *self, PyObject *Py_UNUSED(args));
+
+/* Python-facing: set checkpoint memory limit */
+PyObject *pyttd_set_checkpoint_memory_limit(PyObject *self, PyObject *args);
 
 #endif
