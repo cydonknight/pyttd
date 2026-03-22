@@ -27,6 +27,8 @@ export class PyttdDebugSession extends LoggingDebugSession {
     private timelineStartSeq: number | null = null;
     private timelineEndSeq: number | null = null;
     private breakpointsByFile = new Map<string, DebugProtocol.SourceBreakpoint[]>();
+    private functionBreakpoints: Array<{ name: string; condition?: string; hitCondition?: string }> = [];
+    private dataBreakpoints: Array<{ name: string; dataId: string; accessType?: string }> = [];
     private readonly progressId = 'pyttd-recording';
 
     public constructor() {
@@ -46,6 +48,11 @@ export class PyttdDebugSession extends LoggingDebugSession {
         response.body.supportsStepBack = true;
         response.body.supportsGotoTargetsRequest = true;
         response.body.supportsRestartFrame = true;
+        response.body.supportsConditionalBreakpoints = true;
+        response.body.supportsFunctionBreakpoints = true;
+        response.body.supportsHitConditionalBreakpoints = true;
+        response.body.supportsLogPoints = true;
+        response.body.supportsDataBreakpoints = true;
         this.sendResponse(response);
     }
 
@@ -150,6 +157,15 @@ export class PyttdDebugSession extends LoggingDebugSession {
                 this.sendEvent(
                     new ProgressUpdateEvent(this.progressId, `Recording: ${params.frameCount} frames`)
                 );
+                // Emit custom event so extension.ts can update status bar
+                this.sendEvent(new Event('pyttd/recordingProgress', {
+                    frameCount: params.frameCount,
+                    droppedFrames: params.droppedFrames || 0,
+                    poolOverflows: params.poolOverflows || 0,
+                }));
+                break;
+            case 'logpoint':
+                this.sendEvent(new OutputEvent(params.message + '\n', 'console'));
                 break;
         }
     }
@@ -164,11 +180,15 @@ export class PyttdDebugSession extends LoggingDebugSession {
 
         this.breakpointsByFile.set(filePath, breakpoints);
 
-        // Build merged breakpoint list
-        const allBreakpoints: Array<{ file: string; line: number }> = [];
+        // Build merged breakpoint list with condition, hitCondition, logMessage
+        const allBreakpoints: Array<any> = [];
         for (const [file, bps] of this.breakpointsByFile) {
             for (const bp of bps) {
-                allBreakpoints.push({ file, line: bp.line });
+                const entry: any = { file, line: bp.line };
+                if (bp.condition) entry.condition = bp.condition;
+                if (bp.hitCondition) entry.hitCondition = bp.hitCondition;
+                if (bp.logMessage) entry.logMessage = bp.logMessage;
+                allBreakpoints.push(entry);
             }
         }
 
@@ -199,6 +219,39 @@ export class PyttdDebugSession extends LoggingDebugSession {
         }
 
         this.sendResponse(response);
+    }
+
+    protected setFunctionBreakPointsRequest(
+        response: DebugProtocol.SetFunctionBreakpointsResponse,
+        args: DebugProtocol.SetFunctionBreakpointsArguments
+    ): void {
+        const bps = args.breakpoints || [];
+        this.functionBreakpoints = bps.map(bp => ({
+            name: bp.name,
+            condition: bp.condition,
+            hitCondition: bp.hitCondition,
+        }));
+
+        this.backend.sendRequest('set_function_breakpoints', {
+            breakpoints: this.functionBreakpoints,
+        }).then((result: any) => {
+            const verified = result.verified || [];
+            response.body = {
+                breakpoints: bps.map((bp, i) => {
+                    const v = verified[i];
+                    return {
+                        verified: v ? v.verified !== false : true,
+                        message: v?.message,
+                    } as DebugProtocol.Breakpoint;
+                }),
+            };
+            this.sendResponse(response);
+        }).catch(() => {
+            response.body = {
+                breakpoints: bps.map(() => ({ verified: true } as DebugProtocol.Breakpoint)),
+            };
+            this.sendResponse(response);
+        });
     }
 
     protected setExceptionBreakPointsRequest(
@@ -613,6 +666,54 @@ export class PyttdDebugSession extends LoggingDebugSession {
             .catch((err: Error) => {
                 this.sendErrorResponse(response, 1, err.message);
             });
+    }
+
+    protected dataBreakpointInfoRequest(
+        response: DebugProtocol.DataBreakpointInfoResponse,
+        args: DebugProtocol.DataBreakpointInfoArguments
+    ): void {
+        if (!this.isReplaying) {
+            response.body = { dataId: null, description: 'Not in replay mode' };
+            this.sendResponse(response);
+            return;
+        }
+        const name = args.name || '';
+        response.body = {
+            dataId: name,
+            description: `Break when '${name}' changes value`,
+            accessTypes: ['write'],
+        };
+        this.sendResponse(response);
+    }
+
+    protected setDataBreakpointsRequest(
+        response: DebugProtocol.SetDataBreakpointsResponse,
+        args: DebugProtocol.SetDataBreakpointsArguments
+    ): void {
+        const bps = args.breakpoints || [];
+        this.dataBreakpoints = bps.map(bp => ({
+            name: bp.dataId.split('.').pop() || bp.dataId,
+            dataId: bp.dataId,
+            accessType: bp.accessType,
+        }));
+
+        this.backend.sendRequest('set_data_breakpoints', {
+            breakpoints: this.dataBreakpoints.map(bp => ({ variableName: bp.name })),
+        }).then((result: any) => {
+            const verified = result.verified || [];
+            response.body = {
+                breakpoints: bps.map((bp, i) => ({
+                    verified: verified[i]?.verified !== false,
+                    message: verified[i]?.message,
+                } as DebugProtocol.Breakpoint)),
+            };
+            this.sendResponse(response);
+        }).catch(() => {
+            response.body = {
+                breakpoints: bps.map(() => ({ verified: true } as DebugProtocol.Breakpoint)),
+            };
+            this.sendResponse(response);
+        });
     }
 
     protected customRequest(command: string, response: DebugProtocol.Response, args: any): void {

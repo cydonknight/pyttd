@@ -166,6 +166,11 @@ describe('PyttdDebugSession', () => {
             assert.strictEqual(body.supportsStepBack, true);
             assert.strictEqual(body.supportsGotoTargetsRequest, true);
             assert.strictEqual(body.supportsRestartFrame, true);
+            assert.strictEqual(body.supportsConditionalBreakpoints, true);
+            assert.strictEqual(body.supportsFunctionBreakpoints, true);
+            assert.strictEqual(body.supportsHitConditionalBreakpoints, true);
+            assert.strictEqual(body.supportsLogPoints, true);
+            assert.strictEqual(body.supportsDataBreakpoints, true);
         });
     });
 
@@ -576,6 +581,115 @@ describe('PyttdDebugSession', () => {
                 const last = harness.lastResponse('get_traced_files');
                 assert.ok(last?.success);
                 assert.deepStrictEqual(last?.body?.files, ['/test/script.py']);
+            });
+        });
+
+        describe('function breakpoints', () => {
+            it('should send function breakpoints to backend', async () => {
+                mockServer.handlers.set('set_function_breakpoints', () => ({
+                    verified: [{ verified: true }],
+                }));
+
+                const response = { command: 'setFunctionBreakpoints', success: true } as DebugProtocol.SetFunctionBreakpointsResponse;
+                (harness.session as any).setFunctionBreakPointsRequest(response, {
+                    breakpoints: [{ name: 'my_func' }],
+                });
+                await new Promise(r => setTimeout(r, 100));
+
+                const last = harness.lastResponse('setFunctionBreakpoints');
+                assert.ok(last?.success);
+                assert.strictEqual(last?.body?.breakpoints?.length, 1);
+                assert.strictEqual(last?.body?.breakpoints[0].verified, true);
+
+                const req = mockServer.receivedRequests.find(r => r.method === 'set_function_breakpoints');
+                assert.ok(req);
+                assert.strictEqual(req!.params.breakpoints[0].name, 'my_func');
+            });
+        });
+
+        describe('data breakpoints', () => {
+            it('should provide data breakpoint info in replay mode', () => {
+                const response = { command: 'dataBreakpointInfo', success: true } as DebugProtocol.DataBreakpointInfoResponse;
+                (harness.session as any).dataBreakpointInfoRequest(response, { name: 'my_var' });
+
+                assert.strictEqual(response.body.dataId, 'my_var');
+                assert.ok(response.body.description?.includes('my_var'));
+            });
+
+            it('should reject data breakpoint info when not replaying', () => {
+                (harness.session as any).isReplaying = false;
+                const response = { command: 'dataBreakpointInfo', success: true } as DebugProtocol.DataBreakpointInfoResponse;
+                (harness.session as any).dataBreakpointInfoRequest(response, { name: 'my_var' });
+
+                assert.strictEqual(response.body.dataId, null);
+                (harness.session as any).isReplaying = true;
+            });
+
+            it('should set data breakpoints via backend', async () => {
+                mockServer.handlers.set('set_data_breakpoints', () => ({
+                    verified: [{ verified: true }],
+                }));
+
+                const response = { command: 'setDataBreakpoints', success: true } as DebugProtocol.SetDataBreakpointsResponse;
+                (harness.session as any).setDataBreakpointsRequest(response, {
+                    breakpoints: [{ dataId: 'my_var' }],
+                });
+                await new Promise(r => setTimeout(r, 100));
+
+                const last = harness.lastResponse('setDataBreakpoints');
+                assert.ok(last?.success);
+                assert.strictEqual(last?.body?.breakpoints?.length, 1);
+            });
+        });
+
+        describe('breakpoints with conditions', () => {
+            it('should send hitCondition and logMessage to backend', async () => {
+                const response = { command: 'setBreakpoints', success: true } as DebugProtocol.SetBreakpointsResponse;
+                (harness.session as any).setBreakPointsRequest(response, {
+                    source: { path: '/test/script.py' },
+                    breakpoints: [
+                        { line: 5, condition: 'x > 3', hitCondition: '3', logMessage: 'value: {x}' },
+                    ],
+                });
+                await new Promise(r => setTimeout(r, 100));
+
+                const bpReqs = mockServer.receivedRequests.filter(r => r.method === 'set_breakpoints');
+                const last = bpReqs[bpReqs.length - 1];
+                const bp = last.params.breakpoints[0];
+                assert.strictEqual(bp.condition, 'x > 3');
+                assert.strictEqual(bp.hitCondition, '3');
+                assert.strictEqual(bp.logMessage, 'value: {x}');
+            });
+        });
+
+        describe('recording progress notification', () => {
+            it('should emit recordingProgress custom event', () => {
+                harness.clearEvents();
+                (harness.session as any).handleNotification('progress', {
+                    frameCount: 1000,
+                    droppedFrames: 5,
+                    poolOverflows: 2,
+                });
+
+                const progressEvent = harness.events.find(e => e.type === 'pyttd/recordingProgress');
+                assert.ok(progressEvent, 'should emit pyttd/recordingProgress event');
+                assert.strictEqual(progressEvent!.body.frameCount, 1000);
+                assert.strictEqual(progressEvent!.body.droppedFrames, 5);
+                assert.strictEqual(progressEvent!.body.poolOverflows, 2);
+            });
+        });
+
+        describe('logpoint notification', () => {
+            it('should emit output event for logpoint notification', () => {
+                harness.clearEvents();
+                (harness.session as any).handleNotification('logpoint', {
+                    message: 'x = 42',
+                });
+
+                const output = harness.events.find(e => e.type === 'output');
+                assert.ok(output, 'should emit output event');
+                assert.ok(output!.body.output.includes('x = 42'));
+                assert.strictEqual(output!.body.category, 'console');
             });
         });
     });

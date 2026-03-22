@@ -9,8 +9,13 @@ class Session:
         self.run_id = None
         self.current_frame_seq = None
         self.state = "idle"  # "idle" | "recording" | "replay"
-        self.breakpoints = []      # [{file: str, line: int}, ...]
+        self.breakpoints = []      # [{file: str, line: int, condition?, hitCondition?, logMessage?}, ...]
         self.exception_filters = []  # ["raised", "uncaught"]
+        self.function_breakpoints = []  # [{name: str, condition?, hitCondition?}]
+        self.data_breakpoints = []  # [{variableName: str}]
+        self._bp_hit_counts = {}  # (file, line) -> hit_count
+        self._fn_bp_hit_counts = {}  # name -> hit_count
+        self._log_messages = []  # accumulated log messages from logpoints
         self.current_stack = []    # [{seq, name, file, line, depth}, ...]
         self.first_line_seq = None
         self.last_line_seq = None
@@ -68,6 +73,31 @@ class Session:
 
     def set_exception_filters(self, filters: list[str]):
         self.exception_filters = filters
+
+    def set_function_breakpoints(self, breakpoints: list[dict]):
+        self.function_breakpoints = breakpoints  # [{name, condition?, hitCondition?}]
+        self._fn_bp_hit_counts = {}
+
+    def set_data_breakpoints(self, breakpoints: list[dict]):
+        self.data_breakpoints = breakpoints  # [{variableName}]
+
+    def verify_function_breakpoints(self, breakpoints: list[dict]) -> list[dict]:
+        results = []
+        for bp in breakpoints:
+            name = bp.get('name', '')
+            if self.state == "replay" and name:
+                exists = ExecutionFrames.select().where(
+                    (ExecutionFrames.run_id == self.run_id) &
+                    (ExecutionFrames.frame_event == 'call') &
+                    (ExecutionFrames.function_name.contains(name))
+                ).limit(1).exists()
+                if not exists:
+                    results.append({'verified': False, 'message': f"Function '{name}' not found in recording"})
+                else:
+                    results.append({'verified': True})
+            else:
+                results.append({'verified': True})
+        return results
 
     def get_threads(self) -> list[dict]:
         return [{"id": tid, "name": name} for tid, name in self.known_threads.items()]
@@ -149,15 +179,50 @@ class Session:
 
     def continue_forward(self) -> dict:
         candidates = []
+        self._log_messages = []
 
         for bp in self.breakpoints:
             if 'file' not in bp or 'line' not in bp:
                 continue
             condition = bp.get('condition', '')
+            hit_condition = bp.get('hitCondition', '')
+            log_message = bp.get('logMessage', '')
             hit = self._find_conditional_hit_forward(bp['file'], bp['line'],
-                                                      condition, self.current_frame_seq)
+                                                      condition, self.current_frame_seq,
+                                                      hit_condition=hit_condition,
+                                                      log_message=log_message)
             if hit is not None:
-                candidates.append((hit, "breakpoint"))
+                if log_message:
+                    # Log points don't stop; they just emit messages
+                    pass
+                else:
+                    candidates.append((hit, "breakpoint"))
+
+        # Function breakpoints
+        for fbp in self.function_breakpoints:
+            name = fbp.get('name', '')
+            if not name:
+                continue
+            hit = (ExecutionFrames.select(ExecutionFrames.sequence_no)
+                   .where((ExecutionFrames.run_id == self.run_id) &
+                          (ExecutionFrames.frame_event == 'call') &
+                          (ExecutionFrames.function_name.contains(name)) &
+                          (ExecutionFrames.sequence_no > self.current_frame_seq))
+                   .order_by(ExecutionFrames.sequence_no)
+                   .limit(1).first())
+            if hit:
+                snap = self._snap_to_line(hit.sequence_no)
+                candidates.append((snap, "function breakpoint"))
+
+        # Data breakpoints
+        for dbp in self.data_breakpoints:
+            var_name = dbp.get('variableName', '')
+            if not var_name:
+                continue
+            current_val = self._get_variable_value_at(self.current_frame_seq, var_name)
+            hit = self._find_data_change_forward(var_name, current_val, self.current_frame_seq)
+            if hit is not None:
+                candidates.append((hit, "data breakpoint"))
 
         if "raised" in self.exception_filters:
             hit = (ExecutionFrames.select(ExecutionFrames.sequence_no)
@@ -210,10 +275,40 @@ class Session:
             if 'file' not in bp or 'line' not in bp:
                 continue
             condition = bp.get('condition', '')
+            log_message = bp.get('logMessage', '')
+            # Skip log-only breakpoints for reverse continue
+            if log_message:
+                continue
             hit = self._find_conditional_hit_reverse(bp['file'], bp['line'],
                                                       condition, self.current_frame_seq)
             if hit is not None:
                 candidates.append((hit, "breakpoint"))
+
+        # Function breakpoints (reverse)
+        for fbp in self.function_breakpoints:
+            name = fbp.get('name', '')
+            if not name:
+                continue
+            hit = (ExecutionFrames.select(ExecutionFrames.sequence_no)
+                   .where((ExecutionFrames.run_id == self.run_id) &
+                          (ExecutionFrames.frame_event == 'call') &
+                          (ExecutionFrames.function_name.contains(name)) &
+                          (ExecutionFrames.sequence_no < self.current_frame_seq))
+                   .order_by(ExecutionFrames.sequence_no.desc())
+                   .limit(1).first())
+            if hit:
+                snap = self._snap_to_line(hit.sequence_no)
+                candidates.append((snap, "function breakpoint"))
+
+        # Data breakpoints (reverse)
+        for dbp in self.data_breakpoints:
+            var_name = dbp.get('variableName', '')
+            if not var_name:
+                continue
+            current_val = self._get_variable_value_at(self.current_frame_seq, var_name)
+            hit = self._find_data_change_reverse(var_name, current_val, self.current_frame_seq)
+            if hit is not None:
+                candidates.append((hit, "data breakpoint"))
 
         if "raised" in self.exception_filters:
             hit = (ExecutionFrames.select(ExecutionFrames.sequence_no)
@@ -425,9 +520,6 @@ class Session:
         return self._var_ref_cache.get(ref)
 
     def evaluate_at(self, seq: int, expression: str, context: str) -> dict:
-        if context == "repl":
-            return {"result": "Replay mode - expression evaluation not available. Use Variables panel to inspect recorded state."}
-
         frame = ExecutionFrames.get_or_none(
             (ExecutionFrames.run_id == self.run_id) &
             (ExecutionFrames.sequence_no == seq))
@@ -614,8 +706,13 @@ class Session:
             return True
 
     def _find_conditional_hit_forward(self, filename: str, line: int,
-                                       condition: str, after_seq: int) -> int | None:
+                                       condition: str, after_seq: int,
+                                       hit_condition: str = '',
+                                       log_message: str = '') -> int | None:
+        bp_key = (filename, line)
+
         if not condition or not condition.strip():
+            # Fast path: no expression condition
             hit = (ExecutionFrames.select(ExecutionFrames.sequence_no)
                    .where((ExecutionFrames.run_id == self.run_id) &
                           (ExecutionFrames.filename == filename) &
@@ -624,7 +721,23 @@ class Session:
                           (ExecutionFrames.sequence_no > after_seq))
                    .order_by(ExecutionFrames.sequence_no)
                    .limit(1).first())
-            return hit.sequence_no if hit else None
+            if hit is None:
+                return None
+            # Check hit condition
+            if hit_condition:
+                self._bp_hit_counts[bp_key] = self._bp_hit_counts.get(bp_key, 0) + 1
+                if not self._check_hit_condition(hit_condition, self._bp_hit_counts[bp_key]):
+                    # Recurse to find next
+                    return self._find_conditional_hit_forward(
+                        filename, line, condition, hit.sequence_no,
+                        hit_condition=hit_condition, log_message=log_message)
+            # Handle log points
+            if log_message:
+                msg = self._format_log_message(log_message, hit.sequence_no)
+                self._log_messages.append(msg)
+                # Don't stop, but return the seq so caller knows we hit something
+                return hit.sequence_no
+            return hit.sequence_no
 
         cursor = after_seq
         for _ in range(10000):
@@ -639,6 +752,17 @@ class Session:
             if hit is None:
                 return None
             if self._evaluate_condition(condition, hit.sequence_no):
+                # Check hit condition
+                if hit_condition:
+                    self._bp_hit_counts[bp_key] = self._bp_hit_counts.get(bp_key, 0) + 1
+                    if not self._check_hit_condition(hit_condition, self._bp_hit_counts[bp_key]):
+                        cursor = hit.sequence_no
+                        continue
+                # Handle log points
+                if log_message:
+                    msg = self._format_log_message(log_message, hit.sequence_no)
+                    self._log_messages.append(msg)
+                    return hit.sequence_no
                 return hit.sequence_no
             cursor = hit.sequence_no
         return None
@@ -671,6 +795,125 @@ class Session:
             if self._evaluate_condition(condition, hit.sequence_no):
                 return hit.sequence_no
             cursor = hit.sequence_no
+        return None
+
+    def _check_hit_condition(self, hit_condition: str, count: int) -> bool:
+        """Check if hit count satisfies the hit condition expression.
+        Supports: plain number (==), >=N, >N, <=N, <N, ==N, %N (modulo)."""
+        hit_condition = hit_condition.strip()
+        if not hit_condition:
+            return True
+        try:
+            if hit_condition.startswith('>='):
+                return count >= int(hit_condition[2:].strip())
+            elif hit_condition.startswith('>'):
+                return count > int(hit_condition[1:].strip())
+            elif hit_condition.startswith('<='):
+                return count <= int(hit_condition[2:].strip())
+            elif hit_condition.startswith('<'):
+                return count < int(hit_condition[1:].strip())
+            elif hit_condition.startswith('=='):
+                return count == int(hit_condition[2:].strip())
+            elif hit_condition.startswith('%'):
+                mod = int(hit_condition[1:].strip())
+                return mod > 0 and count % mod == 0
+            else:
+                return count == int(hit_condition)
+        except (ValueError, ZeroDivisionError):
+            return True
+
+    def _format_log_message(self, template: str, seq: int) -> str:
+        """Format a DAP log message template using {expression} syntax."""
+        import re
+        frame = ExecutionFrames.get_or_none(
+            (ExecutionFrames.run_id == self.run_id) &
+            (ExecutionFrames.sequence_no == seq))
+        if frame is None or not frame.locals_snapshot:
+            return template
+        try:
+            locals_data = json.loads(frame.locals_snapshot)
+        except (json.JSONDecodeError, TypeError):
+            return template
+
+        def _replace(m):
+            expr = m.group(1)
+            if expr in locals_data:
+                return _format_value(locals_data[expr])
+            return m.group(0)  # Leave as-is if not found
+
+        return re.sub(r'\{([^}]+)\}', _replace, template)
+
+    def _get_variable_value_at(self, seq: int, var_name: str) -> str | None:
+        """Get the value of a variable at a specific frame sequence."""
+        frame = ExecutionFrames.get_or_none(
+            (ExecutionFrames.run_id == self.run_id) &
+            (ExecutionFrames.sequence_no == seq))
+        if frame is None or not frame.locals_snapshot:
+            return None
+        try:
+            locals_data = json.loads(frame.locals_snapshot)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if var_name not in locals_data:
+            return None
+        return _format_value(locals_data[var_name])
+
+    def _find_data_change_forward(self, var_name: str, current_val: str | None,
+                                   after_seq: int) -> int | None:
+        """Find the next frame where var_name has a different value than current_val."""
+        frames = ExecutionFrames.select(
+            ExecutionFrames.sequence_no,
+            ExecutionFrames.locals_snapshot,
+        ).where(
+            (ExecutionFrames.run_id == self.run_id) &
+            (ExecutionFrames.frame_event == 'line') &
+            (ExecutionFrames.sequence_no > after_seq) &
+            (ExecutionFrames.locals_snapshot.contains(f'"{var_name}"'))
+        ).order_by(ExecutionFrames.sequence_no).limit(10000).iterator()
+
+        for frame in frames:
+            if not frame.locals_snapshot:
+                continue
+            try:
+                locals_data = json.loads(frame.locals_snapshot)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if var_name not in locals_data:
+                if current_val is not None:
+                    return frame.sequence_no
+                continue
+            val = _format_value(locals_data[var_name])
+            if val != current_val:
+                return frame.sequence_no
+        return None
+
+    def _find_data_change_reverse(self, var_name: str, current_val: str | None,
+                                   before_seq: int) -> int | None:
+        """Find the previous frame where var_name had a different value than current_val."""
+        frames = ExecutionFrames.select(
+            ExecutionFrames.sequence_no,
+            ExecutionFrames.locals_snapshot,
+        ).where(
+            (ExecutionFrames.run_id == self.run_id) &
+            (ExecutionFrames.frame_event == 'line') &
+            (ExecutionFrames.sequence_no < before_seq) &
+            (ExecutionFrames.locals_snapshot.contains(f'"{var_name}"'))
+        ).order_by(ExecutionFrames.sequence_no.desc()).limit(10000).iterator()
+
+        for frame in frames:
+            if not frame.locals_snapshot:
+                continue
+            try:
+                locals_data = json.loads(frame.locals_snapshot)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if var_name not in locals_data:
+                if current_val is not None:
+                    return frame.sequence_no
+                continue
+            val = _format_value(locals_data[var_name])
+            if val != current_val:
+                return frame.sequence_no
         return None
 
     def _snap_to_line(self, seq: int) -> int:

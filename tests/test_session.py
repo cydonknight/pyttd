@@ -346,11 +346,13 @@ class TestSessionEvaluate:
         assert found, "No frame found with 'x' in locals_snapshot"
 
     def test_evaluate_repl_context(self, record_func):
+        """REPL context now evaluates expressions (no longer blocked)."""
         db_path, run_id, stats = record_func("x = 1\n")
         session = Session()
         _enter_replay(session, run_id)
         result = session.evaluate_at(0, "x", "repl")
-        assert "Replay mode" in result["result"]
+        # REPL context should attempt evaluation, same as hover/watch
+        assert "result" in result
 
 
 class TestInferType:
