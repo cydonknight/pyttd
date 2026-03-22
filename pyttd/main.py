@@ -107,6 +107,11 @@ def arm(db_path: str | None = None, **kwargs) -> ArmContext:
     config = PyttdConfig(**kwargs)
     _active_recorder = Recorder(config)
     _active_recorder.start(db_path, attach=True)
+    # Install trace function on the current thread so line events fire
+    # in the caller's already-entered frame (the eval hook only fires on
+    # new frame entries, missing the caller's in-progress frame).
+    import pyttd_native
+    pyttd_native.trace_current_frame()
     return ArmContext()
 
 
@@ -143,12 +148,15 @@ def install_signal_handler(sig=None, db_path=None, **kwargs):
         sig = signal.SIGUSR1
 
     def _handler(signum, frame):
-        if _active_recorder is not None and _active_recorder._recording:
-            stats = disarm()
-            print(f"pyttd: Recording stopped ({stats.get('frame_count', 0)} frames)",
-                  file=sys.stderr)
-        else:
-            arm(db_path=db_path, **kwargs)
-            print("pyttd: Recording started", file=sys.stderr)
+        try:
+            if _active_recorder is not None and _active_recorder._recording:
+                stats = disarm()
+                print(f"pyttd: Recording stopped ({stats.get('frame_count', 0)} frames)",
+                      file=sys.stderr)
+            else:
+                arm(db_path=db_path, **kwargs)
+                print("pyttd: Recording started", file=sys.stderr)
+        except Exception as e:
+            print(f"pyttd: Signal handler error: {e}", file=sys.stderr)
 
     signal.signal(sig, _handler)

@@ -71,6 +71,7 @@ static double g_stop_time = 0.0;
 PYTTD_THREAD_LOCAL int g_inside_repr = 0;
 
 static uint64_t g_max_frames = 0;  /* 0 = unlimited */
+static int g_trace_installed_externally = 0;  /* set by trace_current_frame */
 
 /* ---- Phase 2: Checkpoint/fast-forward state ---- */
 static int g_fast_forward = 0;
@@ -1602,6 +1603,9 @@ static void *flush_thread_func(void *arg) {
 static void synthesize_existing_stack(void) {
     PyFrameObject *current = PyEval_GetFrame();
     if (!current) return;
+    /* Hold an extra ref to keep the current frame alive during the stack
+     * walk. Without this, DECREF'ing intermediate back-frames during
+     * traversal can trigger GC cycles that invalidate the current frame. */
     Py_INCREF(current);
 
     struct {
@@ -1751,6 +1755,7 @@ PyObject *pyttd_start_recording(PyObject *self, PyObject *args, PyObject *kwargs
     g_fast_forward = 0;
     g_fast_forward_target = 0;
     g_max_frames = 0;
+    g_trace_installed_externally = 0;
     atomic_store_explicit(&g_last_checkpoint_seq, 0, memory_order_relaxed);
     g_in_checkpoint = 0;
     g_cmd_fd = -1;
@@ -1886,8 +1891,17 @@ PyObject *pyttd_stop_recording(PyObject *self, PyObject *Py_UNUSED(args)) {
     PyInterpreterState *interp = PyInterpreterState_Get();
     PYTTD_SET_EVAL_FUNC(interp, g_original_eval);
 
-    /* Remove trace function */
+    /* Remove trace function.  If trace_current_frame was used (attach mode),
+     * PyEval_SetTrace modified internal monitoring state that persists even
+     * after clearing.  Install a dummy trace then clear again to force the
+     * monitoring system to fully reset. */
     PyEval_SetTrace(NULL, NULL);
+    if (g_trace_installed_externally) {
+        /* Re-install and remove to force full monitoring cleanup on 3.12+ */
+        PyEval_SetTrace((Py_tracefunc)pyttd_trace_func, Py_None);
+        PyEval_SetTrace(NULL, NULL);
+        g_trace_installed_externally = 0;
+    }
 
     /* Stop flush thread */
     atomic_store_explicit(&g_flush_stop, 1, memory_order_relaxed);
@@ -2164,9 +2178,18 @@ PyObject *pyttd_set_recording_thread(PyObject *self, PyObject *Py_UNUSED(args)) 
 
 PyObject *pyttd_trace_current_frame(PyObject *self, PyObject *Py_UNUSED(args)) {
     (void)self;
-    /* No-op: PyEval_SetTrace on Python 3.12+ has persistent monitoring
-     * side effects that corrupt subsequent recordings. The public API
-     * captures function calls via the eval hook but NOT line events in
-     * the caller's already-entered frame. */
+    /* Install the trace function on the current thread so that line events
+     * fire in the caller's already-entered frame (used by arm() / attach mode).
+     * Uses PyEval_SetTrace which activates CPython's internal monitoring on
+     * 3.12+. The g_trace_installed_externally flag tells stop_recording to
+     * perform extra cleanup to fully reset the monitoring state. */
+    if (!atomic_load_explicit(&g_recording, memory_order_relaxed)) {
+        Py_RETURN_NONE;
+    }
+    PyThreadState *tstate = PyThreadState_Get();
+    if (tstate->c_tracefunc != (Py_tracefunc)pyttd_trace_func) {
+        PyEval_SetTrace((Py_tracefunc)pyttd_trace_func, Py_None);
+        g_trace_installed_externally = 1;
+    }
     Py_RETURN_NONE;
 }
