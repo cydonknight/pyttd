@@ -5,7 +5,7 @@ stack reconstruction, variable queries, and evaluate.
 """
 import json
 import pytest
-from pyttd.session import Session, _infer_type
+from pyttd.session import Session, _infer_type, SAFE_BUILTINS
 from pyttd.models.frames import ExecutionFrames
 
 
@@ -346,11 +346,152 @@ class TestSessionEvaluate:
         assert found, "No frame found with 'x' in locals_snapshot"
 
     def test_evaluate_repl_context(self, record_func):
+        """REPL context now supports eval — should return value or error, not static message."""
+        db_path, run_id, stats = record_func("""\
+            def foo():
+                x = 42
+                return x
+            foo()
+        """)
+        session = Session()
+        _enter_replay(session, run_id)
+        # Find a frame where x is set
+        frames = list(ExecutionFrames.select()
+                      .where((ExecutionFrames.run_id == run_id) &
+                             (ExecutionFrames.function_name == 'foo') &
+                             (ExecutionFrames.frame_event == 'line'))
+                      .order_by(ExecutionFrames.sequence_no))
+        found = False
+        for f in frames:
+            if f.locals_snapshot and '"x"' in f.locals_snapshot:
+                result = session.evaluate_at(f.sequence_no, "x", "repl")
+                assert result["result"] == "42"
+                found = True
+                break
+        assert found, "No frame found with 'x'"
+
+    def test_evaluate_repl_expression(self, record_func):
+        """REPL supports full expressions with builtins."""
+        db_path, run_id, stats = record_func("""\
+            def foo():
+                x = 3
+                y = 5
+                return x + y
+            foo()
+        """)
+        session = Session()
+        _enter_replay(session, run_id)
+        frames = list(ExecutionFrames.select()
+                      .where((ExecutionFrames.run_id == run_id) &
+                             (ExecutionFrames.function_name == 'foo') &
+                             (ExecutionFrames.frame_event == 'line'))
+                      .order_by(ExecutionFrames.sequence_no))
+        found = False
+        for f in frames:
+            if f.locals_snapshot and '"x"' in f.locals_snapshot and '"y"' in f.locals_snapshot:
+                result = session.evaluate_at(f.sequence_no, "x + y", "repl")
+                assert result["result"] == "8"
+                found = True
+                break
+        assert found, "No frame found with both x and y"
+
+    def test_evaluate_repl_error(self, record_func):
+        """REPL eval errors return descriptive message."""
         db_path, run_id, stats = record_func("x = 1\n")
         session = Session()
         _enter_replay(session, run_id)
-        result = session.evaluate_at(0, "x", "repl")
-        assert "Replay mode" in result["result"]
+        # Eval at a frame that exists but expression fails
+        first_line = ExecutionFrames.get_or_none(
+            (ExecutionFrames.run_id == run_id) &
+            (ExecutionFrames.frame_event == 'line'))
+        if first_line:
+            result = session.evaluate_at(first_line.sequence_no, "__import__('os')", "repl")
+            assert "Error" in result["result"] or "<not available>" in result["result"]
+
+    def test_evaluate_arithmetic(self, record_func):
+        """Hover/watch supports arithmetic expressions."""
+        db_path, run_id, stats = record_func("""\
+            def foo():
+                x = 3
+                y = 5
+                return x + y
+            foo()
+        """)
+        session = Session()
+        _enter_replay(session, run_id)
+        frames = list(ExecutionFrames.select()
+                      .where((ExecutionFrames.run_id == run_id) &
+                             (ExecutionFrames.function_name == 'foo') &
+                             (ExecutionFrames.frame_event == 'line'))
+                      .order_by(ExecutionFrames.sequence_no))
+        found = False
+        for f in frames:
+            if f.locals_snapshot and '"x"' in f.locals_snapshot and '"y"' in f.locals_snapshot:
+                result = session.evaluate_at(f.sequence_no, "x + y", "hover")
+                assert result["result"] == "8"
+                found = True
+                break
+        assert found
+
+    def test_evaluate_builtin_len(self, record_func):
+        """Eval supports len() and other builtins."""
+        db_path, run_id, stats = record_func("""\
+            def foo():
+                msg = "hello"
+                return msg
+            foo()
+        """)
+        session = Session()
+        _enter_replay(session, run_id)
+        frames = list(ExecutionFrames.select()
+                      .where((ExecutionFrames.run_id == run_id) &
+                             (ExecutionFrames.function_name == 'foo') &
+                             (ExecutionFrames.frame_event == 'line'))
+                      .order_by(ExecutionFrames.sequence_no))
+        found = False
+        for f in frames:
+            if f.locals_snapshot and '"msg"' in f.locals_snapshot:
+                result = session.evaluate_at(f.sequence_no, "len(msg)", "hover")
+                assert result["result"] == "5"
+                found = True
+                break
+        assert found
+
+    def test_evaluate_isinstance(self, record_func):
+        """Eval supports isinstance()."""
+        db_path, run_id, stats = record_func("""\
+            def foo():
+                x = 42
+                return x
+            foo()
+        """)
+        session = Session()
+        _enter_replay(session, run_id)
+        frames = list(ExecutionFrames.select()
+                      .where((ExecutionFrames.run_id == run_id) &
+                             (ExecutionFrames.function_name == 'foo') &
+                             (ExecutionFrames.frame_event == 'line'))
+                      .order_by(ExecutionFrames.sequence_no))
+        found = False
+        for f in frames:
+            if f.locals_snapshot and '"x"' in f.locals_snapshot:
+                result = session.evaluate_at(f.sequence_no, "isinstance(x, int)", "hover")
+                assert result["result"] == "True"
+                found = True
+                break
+        assert found
+
+    def test_evaluate_no_import(self, record_func):
+        """__import__ is NOT in SAFE_BUILTINS."""
+        db_path, run_id, stats = record_func("x = 1\n")
+        session = Session()
+        _enter_replay(session, run_id)
+        first_line = ExecutionFrames.get_or_none(
+            (ExecutionFrames.run_id == run_id) &
+            (ExecutionFrames.frame_event == 'line'))
+        if first_line:
+            result = session.evaluate_at(first_line.sequence_no, "__import__('os')", "hover")
+            assert result["result"] == "<not available>"
 
 
 class TestInferType:
@@ -375,3 +516,31 @@ class TestInferType:
 
     def test_string(self):
         assert _infer_type("hello") == "str"
+
+
+class TestSafeBuiltins:
+    def test_safe_builtins_has_essentials(self):
+        for name in ['len', 'str', 'int', 'float', 'bool', 'list', 'dict',
+                      'tuple', 'set', 'type', 'isinstance', 'abs', 'min',
+                      'max', 'sum', 'sorted', 'repr', 'round']:
+            assert name in SAFE_BUILTINS, f"{name} should be in SAFE_BUILTINS"
+
+    def test_safe_builtins_has_iteration(self):
+        for name in ['any', 'all', 'enumerate', 'zip', 'map', 'filter',
+                      'reversed', 'iter', 'next']:
+            assert name in SAFE_BUILTINS, f"{name} should be in SAFE_BUILTINS"
+
+    def test_safe_builtins_has_attribute_access(self):
+        assert 'hasattr' in SAFE_BUILTINS
+        assert 'getattr' in SAFE_BUILTINS
+
+    def test_safe_builtins_excludes_dangerous(self):
+        for name in ['eval', 'exec', 'compile', '__import__', 'open',
+                      'input', 'breakpoint', 'exit', 'quit',
+                      'globals', 'locals', 'vars', 'setattr', 'delattr']:
+            assert name not in SAFE_BUILTINS, f"{name} should NOT be in SAFE_BUILTINS"
+
+    def test_safe_builtins_has_constants(self):
+        assert SAFE_BUILTINS['True'] is True
+        assert SAFE_BUILTINS['False'] is False
+        assert SAFE_BUILTINS['None'] is None

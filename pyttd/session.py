@@ -1,7 +1,37 @@
 import json
+import logging
 import os
 from pyttd.models.frames import ExecutionFrames
 from pyttd.replay import ReplayController
+
+logger = logging.getLogger(__name__)
+
+MAX_CONDITIONAL_SEARCH = 10_000
+
+SAFE_BUILTINS = {
+    # Types and constructors
+    'len': len, 'str': str, 'int': int, 'float': float, 'bool': bool,
+    'list': list, 'dict': dict, 'tuple': tuple, 'set': set, 'type': type,
+    'bytes': bytes, 'bytearray': bytearray, 'frozenset': frozenset,
+    'complex': complex, 'range': range, 'slice': slice,
+    # Type checking
+    'isinstance': isinstance, 'issubclass': issubclass,
+    # Math
+    'abs': abs, 'min': min, 'max': max, 'sum': sum,
+    'round': round, 'pow': pow, 'divmod': divmod,
+    # Comparison and logic
+    'all': all, 'any': any,
+    # Iteration
+    'enumerate': enumerate, 'zip': zip, 'map': map, 'filter': filter,
+    'reversed': reversed, 'sorted': sorted, 'iter': iter, 'next': next,
+    # Attribute access (read-only)
+    'hasattr': hasattr, 'getattr': getattr,
+    # String/repr
+    'repr': repr, 'ascii': ascii, 'chr': chr, 'ord': ord,
+    'format': format, 'id': id, 'hash': hash, 'callable': callable,
+    # Constants
+    'True': True, 'False': False, 'None': None,
+}
 
 
 class Session:
@@ -372,9 +402,7 @@ class Session:
         try:
             locals_data = json.loads(frame.locals_snapshot)
         except (json.JSONDecodeError, TypeError) as e:
-            import logging
-            logging.getLogger(__name__).warning(
-                "Failed to parse locals at seq %d: %s", seq, e)
+            logger.warning("Failed to parse locals at seq %d: %s", seq, e)
             return []
         variables = []
         for name, value in locals_data.items():
@@ -425,31 +453,37 @@ class Session:
         return self._var_ref_cache.get(ref)
 
     def evaluate_at(self, seq: int, expression: str, context: str) -> dict:
-        if context == "repl":
-            return {"result": "Replay mode - expression evaluation not available. Use Variables panel to inspect recorded state."}
-
         frame = ExecutionFrames.get_or_none(
             (ExecutionFrames.run_id == self.run_id) &
             (ExecutionFrames.sequence_no == seq))
         if frame is None or not frame.locals_snapshot:
+            if context == "repl":
+                return {"result": "<no locals at current position>"}
             return {"result": "<not available>"}
         try:
             locals_data = json.loads(frame.locals_snapshot)
         except (json.JSONDecodeError, TypeError) as e:
-            import logging
-            logging.getLogger(__name__).warning(
-                "Failed to parse locals at seq %d: %s", seq, e)
+            logger.warning("Failed to parse locals at seq %d: %s", seq, e)
             return {"result": "<not available>"}
 
+        # Fast path: simple variable lookup (all contexts including repl)
         if expression in locals_data:
             val = locals_data[expression]
-            return {"result": str(val), "type": _infer_type(val)}
+            return {"result": _format_value(val), "type": _infer_type(val)}
 
-        base = expression.split('.')[0]
-        if base in locals_data:
-            return {"result": str(locals_data[base]), "type": _infer_type(locals_data[base])}
+        # Build eval locals from recorded repr strings
+        eval_locals = {}
+        for name, value in locals_data.items():
+            eval_locals[name] = _parse_repr_value(value)
 
-        return {"result": "<not available>"}
+        # Eval with restricted builtins (hover, watch, and repl)
+        try:
+            result = eval(expression, {"__builtins__": SAFE_BUILTINS}, eval_locals)
+            return {"result": str(result), "type": type(result).__name__}
+        except Exception:
+            if context == "repl":
+                return {"result": f"Error: cannot evaluate '{expression}' against recorded locals"}
+            return {"result": "<not available>"}
 
     # --- Phase 6: CodeLens, Call History ---
 
@@ -609,9 +643,10 @@ class Session:
         for name, value in locals_data.items():
             eval_locals[name] = _parse_repr_value(value)
         try:
-            return bool(eval(condition, {"__builtins__": {}}, eval_locals))
-        except Exception:
-            return True
+            return bool(eval(condition, {"__builtins__": SAFE_BUILTINS}, eval_locals))
+        except Exception as e:
+            logger.warning("Condition eval error at seq %d: %s", seq, e)
+            return False
 
     def _find_conditional_hit_forward(self, filename: str, line: int,
                                        condition: str, after_seq: int) -> int | None:
@@ -627,7 +662,7 @@ class Session:
             return hit.sequence_no if hit else None
 
         cursor = after_seq
-        for _ in range(10000):
+        for _ in range(MAX_CONDITIONAL_SEARCH):
             hit = (ExecutionFrames.select(ExecutionFrames.sequence_no)
                    .where((ExecutionFrames.run_id == self.run_id) &
                           (ExecutionFrames.filename == filename) &
@@ -641,6 +676,8 @@ class Session:
             if self._evaluate_condition(condition, hit.sequence_no):
                 return hit.sequence_no
             cursor = hit.sequence_no
+        logger.warning("Conditional breakpoint search exhausted %d iterations (forward, %s:%d)",
+                       MAX_CONDITIONAL_SEARCH, filename, line)
         return None
 
     def _find_conditional_hit_reverse(self, filename: str, line: int,
@@ -657,7 +694,7 @@ class Session:
             return hit.sequence_no if hit else None
 
         cursor = before_seq
-        for _ in range(10000):
+        for _ in range(MAX_CONDITIONAL_SEARCH):
             hit = (ExecutionFrames.select(ExecutionFrames.sequence_no)
                    .where((ExecutionFrames.run_id == self.run_id) &
                           (ExecutionFrames.filename == filename) &
@@ -671,6 +708,8 @@ class Session:
             if self._evaluate_condition(condition, hit.sequence_no):
                 return hit.sequence_no
             cursor = hit.sequence_no
+        logger.warning("Conditional breakpoint search exhausted %d iterations (reverse, %s:%d)",
+                       MAX_CONDITIONAL_SEARCH, filename, line)
         return None
 
     def _snap_to_line(self, seq: int) -> int:
