@@ -1,8 +1,10 @@
 """Tests for selective function recording (Phase 9B)."""
 import json
+import sys
 import textwrap
 import runpy
-import sys
+
+import pytest
 
 import pyttd_native
 from pyttd.config import PyttdConfig
@@ -150,6 +152,7 @@ class TestSelectiveRecording:
             close_db()
             db.init(None)
 
+    @pytest.mark.skipif(sys.platform == 'win32', reason="Glob patterns use fnmatch (Unix only)")
     def test_include_glob_star(self, tmp_path):
         """Glob pattern 'process_*' matches 'process_data' but not 'my_process'."""
         db_path, run_id, _ = _record_with_include(tmp_path, '''
@@ -173,6 +176,7 @@ class TestSelectiveRecording:
             close_db()
             db.init(None)
 
+    @pytest.mark.skipif(sys.platform == 'win32', reason="Glob patterns use fnmatch (Unix only)")
     def test_include_glob_question(self, tmp_path):
         """Glob pattern 'test_?' matches 'test_a' but not 'test_ab'."""
         db_path, run_id, _ = _record_with_include(tmp_path, '''

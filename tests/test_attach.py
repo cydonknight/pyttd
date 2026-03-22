@@ -2,6 +2,7 @@
 
 import json
 import os
+import signal
 import sys
 import textwrap
 
@@ -360,7 +361,7 @@ def test_events_after_arm(db_path):
 
 # ---- Signal handler (Unix only) ----
 
-@pytest.mark.skipif(not hasattr(os, 'kill'), reason="Unix only")
+@pytest.mark.skipif(not hasattr(signal, 'SIGUSR1'), reason="Unix only (no SIGUSR1)")
 def test_signal_handler_toggle(db_path):
     """SIGUSR1 should toggle recording on/off."""
     import signal
@@ -392,7 +393,7 @@ def test_signal_handler_toggle(db_path):
         db.init(None)
 
 
-@pytest.mark.skipif(not hasattr(os, 'kill'), reason="Unix only")
+@pytest.mark.skipif(not hasattr(signal, 'SIGUSR1'), reason="Unix only (no SIGUSR1)")
 def test_arm_signal_env(tmp_path, monkeypatch):
     """PYTTD_ARM_SIGNAL env var should auto-install handler."""
     import signal

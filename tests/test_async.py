@@ -5,6 +5,7 @@ recorded with the is_coroutine flag, and that navigation handles
 suspension/resume patterns correctly.
 """
 import json
+import sys
 import pytest
 from pyttd.session import Session
 from pyttd.models.frames import ExecutionFrames
@@ -25,6 +26,8 @@ def _enter_replay(session, run_id):
 class TestCoroutineFlag:
     """Verify is_coroutine flag is recorded correctly."""
 
+    @pytest.mark.skipif(sys.platform == 'win32',
+                        reason="Windows asyncio internals prevent coroutine call recording")
     def test_coroutine_flag_on_async_def(self, record_func):
         """async def functions should have is_coroutine=True."""
         db_path, run_id, stats = record_func("""\
