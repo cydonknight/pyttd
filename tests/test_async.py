@@ -120,6 +120,8 @@ class TestCoroutineFlag:
         assert mod_line.is_coroutine is False
 
 
+@pytest.mark.skipif(sys.platform == 'win32',
+                    reason="Windows asyncio internals prevent coroutine frame recording")
 class TestCoroutineRecording:
     """Verify coroutine execution is recorded across suspend/resume."""
 
@@ -187,6 +189,8 @@ class TestCoroutineRecording:
         assert agen_call.is_coroutine is True
 
 
+@pytest.mark.skipif(sys.platform == 'win32',
+                    reason="Windows asyncio internals prevent coroutine frame recording")
 class TestCoroutineStackReconstruction:
     """Stack reconstruction should be correct across suspend/resume."""
 
@@ -275,6 +279,8 @@ class TestCoroutineStackReconstruction:
         assert stack[0]['name'] == 'gen'
 
 
+@pytest.mark.skipif(sys.platform == 'win32',
+                    reason="Windows asyncio internals prevent coroutine frame recording")
 class TestCoroutineNavigation:
     """Navigation commands should handle coroutine patterns correctly."""
 
