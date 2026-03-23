@@ -3,7 +3,7 @@ import pytest
 import pyttd_native
 from pyttd.config import PyttdConfig
 from pyttd.recorder import Recorder
-from pyttd.models.base import db
+from pyttd.models.db import db
 from pyttd.models.storage import delete_db_files, close_db
 
 

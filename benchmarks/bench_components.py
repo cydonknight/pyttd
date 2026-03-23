@@ -7,7 +7,7 @@ import random
 
 import pytest
 
-from pyttd.models.frames import ExecutionFrames
+from pyttd.models.db import db
 from pyttd.models.timeline import get_timeline_summary
 from pyttd.replay import ReplayController
 from pyttd.session import Session
@@ -72,22 +72,23 @@ for i in range(100):
 def _setup_session(db_path, run_id):
     """Create and enter a replay Session."""
     session = Session()
-    first_line = (ExecutionFrames.select(ExecutionFrames.sequence_no)
-                  .where((ExecutionFrames.run_id == run_id) &
-                         (ExecutionFrames.frame_event == 'line'))
-                  .order_by(ExecutionFrames.sequence_no)
-                  .limit(1).first())
+    first_line = db.fetchone(
+        "SELECT sequence_no FROM executionframes"
+        " WHERE run_id = ? AND frame_event = 'line'"
+        " ORDER BY sequence_no LIMIT 1",
+        (str(run_id),))
     session.enter_replay(run_id, first_line.sequence_no)
     return session
 
 
 def _get_line_seqs(run_id):
     """Return list of all line-event sequence numbers."""
-    return [f.sequence_no for f in
-            ExecutionFrames.select(ExecutionFrames.sequence_no)
-            .where((ExecutionFrames.run_id == run_id) &
-                   (ExecutionFrames.frame_event == 'line'))
-            .order_by(ExecutionFrames.sequence_no)]
+    rows = db.fetchall(
+        "SELECT sequence_no FROM executionframes"
+        " WHERE run_id = ? AND frame_event = 'line'"
+        " ORDER BY sequence_no",
+        (str(run_id),))
+    return [r.sequence_no for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -218,12 +219,11 @@ class TestBenchReverse:
         line_seqs = _get_line_seqs(run_id)
         session.goto_frame(line_seqs[-1])
         # Set breakpoint on a line that appears multiple times
-        from pyttd.models.frames import ExecutionFrames
-        sample = (ExecutionFrames.select()
-                  .where((ExecutionFrames.run_id == run_id) &
-                         (ExecutionFrames.frame_event == 'line'))
-                  .order_by(ExecutionFrames.sequence_no)
-                  .offset(10).limit(1).first())
+        sample = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line'"
+            " ORDER BY sequence_no LIMIT 1 OFFSET 10",
+            (str(run_id),))
         if sample:
             session.set_breakpoints([{'file': sample.filename, 'line': sample.line_no}])
 
@@ -241,11 +241,11 @@ class TestBenchStack:
         db_path, run_id, _ = bench_record(WORKLOAD_DEEP)
         session = _setup_session(db_path, run_id)
         # Find a frame at max depth
-        deepest = (ExecutionFrames.select()
-                   .where((ExecutionFrames.run_id == run_id) &
-                          (ExecutionFrames.frame_event == 'line'))
-                   .order_by(ExecutionFrames.call_depth.desc())
-                   .limit(1).first())
+        deepest = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line'"
+            " ORDER BY call_depth DESC LIMIT 1",
+            (str(run_id),))
         target_seq = deepest.sequence_no
 
         def do_build():
@@ -259,12 +259,12 @@ class TestBenchStack:
         db_path, run_id, _ = bench_record(WORKLOAD_CALLS)
         session = _setup_session(db_path, run_id)
         # Find a frame with locals
-        frame = (ExecutionFrames.select()
-                 .where((ExecutionFrames.run_id == run_id) &
-                        (ExecutionFrames.frame_event == 'line') &
-                        (ExecutionFrames.locals_snapshot.is_null(False)))
-                 .order_by(ExecutionFrames.sequence_no)
-                 .limit(1).first())
+        frame = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line'"
+            "   AND locals_snapshot IS NOT NULL"
+            " ORDER BY sequence_no LIMIT 1",
+            (str(run_id),))
         target_seq = frame.sequence_no
 
         def do_get_vars():
