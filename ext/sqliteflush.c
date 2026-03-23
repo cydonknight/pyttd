@@ -8,6 +8,9 @@
 #include <limits.h>
 #else
 #include <windows.h>
+#ifndef PATH_MAX
+#define PATH_MAX MAX_PATH
+#endif
 #endif
 
 #include "sqliteflush.h"
