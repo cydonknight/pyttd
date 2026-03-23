@@ -1,4 +1,4 @@
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 from pyttd.main import ttdbg, start_recording, stop_recording, arm, disarm, install_signal_handler
 
