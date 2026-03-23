@@ -2,7 +2,7 @@
 import json
 
 from pyttd.config import PyttdConfig
-from pyttd.models.frames import ExecutionFrames
+from pyttd.models.db import db
 from pyttd.session import Session
 
 
@@ -13,12 +13,11 @@ class TestSecretsFiltering:
             x = 42
             _ = x
         ''')
-        frame = (ExecutionFrames.select()
-                 .where((ExecutionFrames.run_id == run_id) &
-                        (ExecutionFrames.frame_event == 'line') &
-                        (ExecutionFrames.locals_snapshot.is_null(False)))
-                 .order_by(ExecutionFrames.sequence_no.desc())
-                 .first())
+        frame = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line' AND locals_snapshot IS NOT NULL"
+            " ORDER BY sequence_no DESC LIMIT 1",
+            (str(run_id),))
         assert frame is not None
         locals_data = json.loads(frame.locals_snapshot)
         assert 'password' in locals_data
@@ -32,12 +31,11 @@ class TestSecretsFiltering:
             count = 10
             _ = count
         ''')
-        frame = (ExecutionFrames.select()
-                 .where((ExecutionFrames.run_id == run_id) &
-                        (ExecutionFrames.frame_event == 'line') &
-                        (ExecutionFrames.locals_snapshot.is_null(False)))
-                 .order_by(ExecutionFrames.sequence_no.desc())
-                 .first())
+        frame = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line' AND locals_snapshot IS NOT NULL"
+            " ORDER BY sequence_no DESC LIMIT 1",
+            (str(run_id),))
         assert frame is not None
         locals_data = json.loads(frame.locals_snapshot)
         assert locals_data.get('API_TOKEN') == '<redacted>'
@@ -49,12 +47,11 @@ class TestSecretsFiltering:
             name = "test"
             _ = name
         ''')
-        frame = (ExecutionFrames.select()
-                 .where((ExecutionFrames.run_id == run_id) &
-                        (ExecutionFrames.frame_event == 'line') &
-                        (ExecutionFrames.locals_snapshot.is_null(False)))
-                 .order_by(ExecutionFrames.sequence_no.desc())
-                 .first())
+        frame = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line' AND locals_snapshot IS NOT NULL"
+            " ORDER BY sequence_no DESC LIMIT 1",
+            (str(run_id),))
         assert frame is not None
         locals_data = json.loads(frame.locals_snapshot)
         assert locals_data.get('authorization_header') == '<redacted>'
@@ -65,7 +62,7 @@ class TestSecretsFiltering:
         import textwrap, runpy, sys
         from pyttd.recorder import Recorder
         from pyttd.models.storage import delete_db_files, close_db
-        from pyttd.models.base import db
+        from pyttd.models.db import db
 
         script_file = tmp_path / "test_script.py"
         script_file.write_text(textwrap.dedent('''
@@ -91,12 +88,11 @@ class TestSecretsFiltering:
         run_id = recorder.run_id
 
         try:
-            frame = (ExecutionFrames.select()
-                     .where((ExecutionFrames.run_id == run_id) &
-                            (ExecutionFrames.frame_event == 'line') &
-                            (ExecutionFrames.locals_snapshot.is_null(False)))
-                     .order_by(ExecutionFrames.sequence_no.desc())
-                     .first())
+            frame = db.fetchone(
+                "SELECT * FROM executionframes"
+                " WHERE run_id = ? AND frame_event = 'line' AND locals_snapshot IS NOT NULL"
+                " ORDER BY sequence_no DESC LIMIT 1",
+                (str(run_id),))
             assert frame is not None
             locals_data = json.loads(frame.locals_snapshot)
             assert locals_data.get('password') != '<redacted>'
@@ -109,7 +105,7 @@ class TestSecretsFiltering:
         import textwrap, runpy, sys
         from pyttd.recorder import Recorder
         from pyttd.models.storage import delete_db_files, close_db
-        from pyttd.models.base import db
+        from pyttd.models.db import db
 
         script_file = tmp_path / "test_script.py"
         script_file.write_text(textwrap.dedent('''
@@ -136,12 +132,11 @@ class TestSecretsFiltering:
         run_id = recorder.run_id
 
         try:
-            frame = (ExecutionFrames.select()
-                     .where((ExecutionFrames.run_id == run_id) &
-                            (ExecutionFrames.frame_event == 'line') &
-                            (ExecutionFrames.locals_snapshot.is_null(False)))
-                     .order_by(ExecutionFrames.sequence_no.desc())
-                     .first())
+            frame = db.fetchone(
+                "SELECT * FROM executionframes"
+                " WHERE run_id = ? AND frame_event = 'line' AND locals_snapshot IS NOT NULL"
+                " ORDER BY sequence_no DESC LIMIT 1",
+                (str(run_id),))
             assert frame is not None
             locals_data = json.loads(frame.locals_snapshot)
             assert locals_data.get('my_custom_field') == '<redacted>'
@@ -157,19 +152,18 @@ class TestSecretsFiltering:
             _ = x
         ''')
         session = Session()
-        first_line = (ExecutionFrames.select(ExecutionFrames.sequence_no)
-                      .where((ExecutionFrames.run_id == run_id) &
-                             (ExecutionFrames.frame_event == 'line'))
-                      .order_by(ExecutionFrames.sequence_no)
-                      .first())
+        first_line = db.fetchone(
+            "SELECT sequence_no FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line'"
+            " ORDER BY sequence_no LIMIT 1",
+            (str(run_id),))
         session.enter_replay(run_id, first_line.sequence_no)
         # Find a frame with both vars
-        frame = (ExecutionFrames.select()
-                 .where((ExecutionFrames.run_id == run_id) &
-                        (ExecutionFrames.frame_event == 'line') &
-                        (ExecutionFrames.locals_snapshot.contains('"password"')))
-                 .order_by(ExecutionFrames.sequence_no)
-                 .first())
+        frame = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line' AND locals_snapshot LIKE '%\"password\"%'"
+            " ORDER BY sequence_no LIMIT 1",
+            (str(run_id),))
         assert frame is not None, "Expected frame with 'password' in locals"
         variables = session.get_variables_at(frame.sequence_no)
         names = {v['name'] for v in variables}
@@ -182,7 +176,7 @@ class TestSecretsFiltering:
         import textwrap, runpy, sys
         from pyttd.recorder import Recorder
         from pyttd.models.storage import delete_db_files, close_db
-        from pyttd.models.base import db
+        from pyttd.models.db import db
 
         script_file = tmp_path / "test_script.py"
         script_file.write_text(textwrap.dedent('''
@@ -210,12 +204,11 @@ class TestSecretsFiltering:
         run_id = recorder.run_id
 
         try:
-            frame = (ExecutionFrames.select()
-                     .where((ExecutionFrames.run_id == run_id) &
-                            (ExecutionFrames.frame_event == 'line') &
-                            (ExecutionFrames.locals_snapshot.is_null(False)))
-                     .order_by(ExecutionFrames.sequence_no.desc())
-                     .first())
+            frame = db.fetchone(
+                "SELECT * FROM executionframes"
+                " WHERE run_id = ? AND frame_event = 'line' AND locals_snapshot IS NOT NULL"
+                " ORDER BY sequence_no DESC LIMIT 1",
+                (str(run_id),))
             assert frame is not None
             locals_data = json.loads(frame.locals_snapshot)
             # old_pattern_var should NOT be redacted (not in patterns)

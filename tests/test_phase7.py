@@ -17,11 +17,7 @@ import pyttd_native
 from pyttd.config import PyttdConfig
 from pyttd.protocol import JsonRpcConnection, MAX_HEADER_ACCUMULATION
 from pyttd.models import storage
-from pyttd.models.base import db
-from pyttd.models.frames import ExecutionFrames
-from pyttd.models.runs import Runs
-from pyttd.models.checkpoints import Checkpoint
-from pyttd.models.io_events import IOEvent
+from pyttd.models.db import db
 
 
 # --- CLI Tests ---
@@ -185,10 +181,10 @@ class TestRecordingEnvVar:
         # Locals are captured at the START of each line event, so pyttd_rec
         # only appears in the line event for the line AFTER assignment.
         import json
-        frames = ExecutionFrames.select().where(
-            (ExecutionFrames.run_id == run_id) &
-            (ExecutionFrames.frame_event == 'line')
-        )
+        frames = db.fetchall(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line'",
+            (str(run_id),))
         found = False
         for f in frames:
             if f.locals_snapshot:

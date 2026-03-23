@@ -10,6 +10,10 @@ if platform.system() == "Windows":
     extra_compile_args.append("/std:c11")
     extra_compile_args.append("/experimental:c11atomics")
 
+libraries = []
+if platform.system() != "Windows":
+    libraries.append("sqlite3")
+
 pyttd_native = Extension(
     "pyttd_native",
     sources=[
@@ -20,8 +24,10 @@ pyttd_native = Extension(
         "ext/checkpoint_store.c",
         "ext/replay.c",
         "ext/iohook.c",
+        "ext/sqliteflush.c",
     ],
     include_dirs=["ext"],
+    libraries=libraries,
     extra_compile_args=extra_compile_args,
 )
 

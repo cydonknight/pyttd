@@ -1,16 +1,16 @@
-from pyttd.models.frames import ExecutionFrames
+from pyttd.models.db import db
 
 
 def test_frames_in_db_after_stop(record_func):
     db_path, run_id, stats = record_func("x = 1\ny = 2\nz = x + y\n")
-    count = ExecutionFrames.select().where(ExecutionFrames.run_id == run_id).count()
+    count = db.fetchval("SELECT COUNT(*) FROM executionframes WHERE run_id = ?", (str(run_id),))
     assert count > 0
     assert count == stats['frame_count']
 
 
 def test_flush_dict_keys(record_func):
     db_path, run_id, stats = record_func("x = 1\ny = 2\nz = x + y\n")
-    frame = ExecutionFrames.select().where(ExecutionFrames.run_id == run_id).first()
+    frame = db.fetchone("SELECT * FROM executionframes WHERE run_id = ? LIMIT 1", (str(run_id),))
     assert frame is not None
     assert frame.sequence_no is not None
     assert frame.timestamp is not None

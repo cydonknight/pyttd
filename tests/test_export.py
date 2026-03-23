@@ -5,7 +5,6 @@ import subprocess
 import sys
 
 from pyttd.export import export_perfetto
-from pyttd.models.frames import ExecutionFrames
 
 
 class TestExportPerfetto:

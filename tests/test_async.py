@@ -8,16 +8,16 @@ import json
 import sys
 import pytest
 from pyttd.session import Session
-from pyttd.models.frames import ExecutionFrames
+from pyttd.models.db import db
 
 
 def _enter_replay(session, run_id):
     """Helper: set up session in replay mode."""
-    first_line = (ExecutionFrames.select()
-                  .where((ExecutionFrames.run_id == run_id) &
-                         (ExecutionFrames.frame_event == 'line'))
-                  .order_by(ExecutionFrames.sequence_no)
-                  .limit(1).first())
+    first_line = db.fetchone(
+        "SELECT * FROM executionframes"
+        " WHERE run_id = ? AND frame_event = 'line'"
+        " ORDER BY sequence_no LIMIT 1",
+        (str(run_id),))
     first_line_seq = first_line.sequence_no if first_line else 0
     session.enter_replay(run_id, first_line_seq)
     return first_line_seq
@@ -37,12 +37,12 @@ class TestCoroutineFlag:
                 return x
             asyncio.run(foo())
         """)
-        foo_call = ExecutionFrames.get_or_none(
-            (ExecutionFrames.run_id == run_id) &
-            (ExecutionFrames.function_name == 'foo') &
-            (ExecutionFrames.frame_event == 'call'))
+        foo_call = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND function_name = 'foo' AND frame_event = 'call'",
+            (str(run_id),))
         assert foo_call is not None, "foo call event should be recorded"
-        assert foo_call.is_coroutine is True
+        assert foo_call.is_coroutine
 
     def test_regular_function_not_coroutine(self, record_func):
         """Regular functions should have is_coroutine=False."""
@@ -51,12 +51,12 @@ class TestCoroutineFlag:
                 return 42
             foo()
         """)
-        foo_call = ExecutionFrames.get_or_none(
-            (ExecutionFrames.run_id == run_id) &
-            (ExecutionFrames.function_name == 'foo') &
-            (ExecutionFrames.frame_event == 'call'))
+        foo_call = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND function_name = 'foo' AND frame_event = 'call'",
+            (str(run_id),))
         assert foo_call is not None
-        assert foo_call.is_coroutine is False
+        assert foo_call.is_coroutine == 0
 
     def test_generator_flag_recorded(self, record_func):
         """Generator functions should have is_coroutine=True."""
@@ -67,12 +67,12 @@ class TestCoroutineFlag:
             for item in gen():
                 pass
         """)
-        gen_call = ExecutionFrames.get_or_none(
-            (ExecutionFrames.run_id == run_id) &
-            (ExecutionFrames.function_name == 'gen') &
-            (ExecutionFrames.frame_event == 'call'))
+        gen_call = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND function_name = 'gen' AND frame_event = 'call'",
+            (str(run_id),))
         assert gen_call is not None
-        assert gen_call.is_coroutine is True
+        assert gen_call.is_coroutine
 
     def test_coroutine_flag_on_line_events(self, record_func):
         """Line events inside coroutines should also have is_coroutine=True."""
@@ -83,12 +83,12 @@ class TestCoroutineFlag:
                 return x
             asyncio.run(foo())
         """)
-        foo_line = ExecutionFrames.get_or_none(
-            (ExecutionFrames.run_id == run_id) &
-            (ExecutionFrames.function_name == 'foo') &
-            (ExecutionFrames.frame_event == 'line'))
+        foo_line = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND function_name = 'foo' AND frame_event = 'line'",
+            (str(run_id),))
         assert foo_line is not None
-        assert foo_line.is_coroutine is True
+        assert foo_line.is_coroutine
 
     def test_coroutine_flag_on_return_events(self, record_func):
         """Return events from coroutines should have is_coroutine=True."""
@@ -98,26 +98,26 @@ class TestCoroutineFlag:
                 return 42
             asyncio.run(foo())
         """)
-        foo_returns = list(ExecutionFrames.select()
-                          .where((ExecutionFrames.run_id == run_id) &
-                                 (ExecutionFrames.function_name == 'foo') &
-                                 (ExecutionFrames.frame_event == 'return'))
-                          .order_by(ExecutionFrames.sequence_no))
+        foo_returns = db.fetchall(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND function_name = 'foo' AND frame_event = 'return'"
+            " ORDER BY sequence_no",
+            (str(run_id),))
         assert len(foo_returns) >= 1
         for r in foo_returns:
-            assert r.is_coroutine is True
+            assert r.is_coroutine
 
     def test_module_level_not_coroutine(self, record_func):
         """Module-level <module> events should have is_coroutine=False."""
         db_path, run_id, stats = record_func("""\
             x = 1
         """)
-        mod_line = ExecutionFrames.get_or_none(
-            (ExecutionFrames.run_id == run_id) &
-            (ExecutionFrames.function_name == '<module>') &
-            (ExecutionFrames.frame_event == 'line'))
+        mod_line = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND function_name = '<module>' AND frame_event = 'line'",
+            (str(run_id),))
         assert mod_line is not None
-        assert mod_line.is_coroutine is False
+        assert mod_line.is_coroutine == 0
 
 
 @pytest.mark.skipif(sys.platform == 'win32',
@@ -136,11 +136,11 @@ class TestCoroutineRecording:
                 return x + y
             asyncio.run(foo())
         """)
-        foo_lines = list(ExecutionFrames.select()
-                        .where((ExecutionFrames.run_id == run_id) &
-                               (ExecutionFrames.function_name == 'foo') &
-                               (ExecutionFrames.frame_event == 'line'))
-                        .order_by(ExecutionFrames.sequence_no))
+        foo_lines = db.fetchall(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND function_name = 'foo' AND frame_event = 'line'"
+            " ORDER BY sequence_no",
+            (str(run_id),))
         assert len(foo_lines) >= 2, "Should have line events across await"
         has_x = any(f.locals_snapshot and '"x"' in f.locals_snapshot for f in foo_lines)
         has_y = any(f.locals_snapshot and '"y"' in f.locals_snapshot for f in foo_lines)
@@ -157,11 +157,11 @@ class TestCoroutineRecording:
                 yield y
             result = list(gen())
         """)
-        gen_lines = list(ExecutionFrames.select()
-                        .where((ExecutionFrames.run_id == run_id) &
-                               (ExecutionFrames.function_name == 'gen') &
-                               (ExecutionFrames.frame_event == 'line'))
-                        .order_by(ExecutionFrames.sequence_no))
+        gen_lines = db.fetchall(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND function_name = 'gen' AND frame_event = 'line'"
+            " ORDER BY sequence_no",
+            (str(run_id),))
         assert len(gen_lines) >= 2, "Should have line events across yield"
         has_x = any(f.locals_snapshot and '"x"' in f.locals_snapshot for f in gen_lines)
         has_y = any(f.locals_snapshot and '"y"' in f.locals_snapshot for f in gen_lines)
@@ -181,12 +181,12 @@ class TestCoroutineRecording:
                     result.append(item)
             asyncio.run(main())
         """)
-        agen_call = ExecutionFrames.get_or_none(
-            (ExecutionFrames.run_id == run_id) &
-            (ExecutionFrames.function_name == 'agen') &
-            (ExecutionFrames.frame_event == 'call'))
+        agen_call = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND function_name = 'agen' AND frame_event = 'call'",
+            (str(run_id),))
         assert agen_call is not None
-        assert agen_call.is_coroutine is True
+        assert agen_call.is_coroutine
 
 
 @pytest.mark.skipif(sys.platform == 'win32',
@@ -206,10 +206,10 @@ class TestCoroutineStackReconstruction:
         session = Session()
         _enter_replay(session, run_id)
 
-        foo_line = ExecutionFrames.get_or_none(
-            (ExecutionFrames.run_id == run_id) &
-            (ExecutionFrames.function_name == 'foo') &
-            (ExecutionFrames.frame_event == 'line'))
+        foo_line = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND function_name = 'foo' AND frame_event = 'line'",
+            (str(run_id),))
         assert foo_line is not None
 
         stack = session._build_stack_at(foo_line.sequence_no)
@@ -231,11 +231,11 @@ class TestCoroutineStackReconstruction:
         _enter_replay(session, run_id)
 
         # Find line events inside foo after the await (where y is set)
-        foo_lines = list(ExecutionFrames.select()
-                        .where((ExecutionFrames.run_id == run_id) &
-                               (ExecutionFrames.function_name == 'foo') &
-                               (ExecutionFrames.frame_event == 'line'))
-                        .order_by(ExecutionFrames.sequence_no))
+        foo_lines = db.fetchall(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND function_name = 'foo' AND frame_event = 'line'"
+            " ORDER BY sequence_no",
+            (str(run_id),))
         after_await = None
         for f in foo_lines:
             if f.locals_snapshot and '"y"' in f.locals_snapshot:
@@ -262,11 +262,11 @@ class TestCoroutineStackReconstruction:
         _enter_replay(session, run_id)
 
         # Find line event after second yield (where y is defined)
-        gen_lines = list(ExecutionFrames.select()
-                        .where((ExecutionFrames.run_id == run_id) &
-                               (ExecutionFrames.function_name == 'gen') &
-                               (ExecutionFrames.frame_event == 'line'))
-                        .order_by(ExecutionFrames.sequence_no))
+        gen_lines = db.fetchall(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND function_name = 'gen' AND frame_event = 'line'"
+            " ORDER BY sequence_no",
+            (str(run_id),))
         after_yield = None
         for f in gen_lines:
             if f.locals_snapshot and '"y"' in f.locals_snapshot:
@@ -299,11 +299,11 @@ class TestCoroutineNavigation:
         _enter_replay(session, run_id)
 
         # Find first line inside foo
-        foo_lines = list(ExecutionFrames.select()
-                        .where((ExecutionFrames.run_id == run_id) &
-                               (ExecutionFrames.function_name == 'foo') &
-                               (ExecutionFrames.frame_event == 'line'))
-                        .order_by(ExecutionFrames.sequence_no))
+        foo_lines = db.fetchall(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND function_name = 'foo' AND frame_event = 'line'"
+            " ORDER BY sequence_no",
+            (str(run_id),))
         assert len(foo_lines) >= 1
 
         # Navigate to first line in foo
@@ -339,11 +339,11 @@ class TestCoroutineNavigation:
         _enter_replay(session, run_id)
 
         # Find first line inside gen
-        gen_lines = list(ExecutionFrames.select()
-                        .where((ExecutionFrames.run_id == run_id) &
-                               (ExecutionFrames.function_name == 'gen') &
-                               (ExecutionFrames.frame_event == 'line'))
-                        .order_by(ExecutionFrames.sequence_no))
+        gen_lines = db.fetchall(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND function_name = 'gen' AND frame_event = 'line'"
+            " ORDER BY sequence_no",
+            (str(run_id),))
         assert gen_lines, "Should find line events in gen"
 
         session.current_frame_seq = gen_lines[0].sequence_no
@@ -355,9 +355,9 @@ class TestCoroutineNavigation:
         assert result['reason'] in ('step', 'end')
 
         if result['reason'] == 'step':
-            landed = ExecutionFrames.get_or_none(
-                (ExecutionFrames.run_id == run_id) &
-                (ExecutionFrames.sequence_no == result['seq']))
+            landed = db.fetchone(
+                "SELECT * FROM executionframes WHERE run_id = ? AND sequence_no = ?",
+                (str(run_id), result['seq']))
             assert landed is not None
             assert landed.call_depth < gen_depth
 
@@ -376,11 +376,11 @@ class TestCoroutineNavigation:
         _enter_replay(session, run_id)
 
         # Find line with y (after await)
-        foo_lines = list(ExecutionFrames.select()
-                        .where((ExecutionFrames.run_id == run_id) &
-                               (ExecutionFrames.function_name == 'foo') &
-                               (ExecutionFrames.frame_event == 'line'))
-                        .order_by(ExecutionFrames.sequence_no))
+        foo_lines = db.fetchall(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND function_name = 'foo' AND frame_event = 'line'"
+            " ORDER BY sequence_no",
+            (str(run_id),))
         y_line = None
         for f in foo_lines:
             if f.locals_snapshot and '"y"' in f.locals_snapshot:
@@ -411,9 +411,9 @@ class TestCoroutineNavigation:
             asyncio.run(main())
         """)
         # Should have an exception event inside foo
-        exc_event = ExecutionFrames.get_or_none(
-            (ExecutionFrames.run_id == run_id) &
-            (ExecutionFrames.function_name == 'foo') &
-            (ExecutionFrames.frame_event == 'exception'))
+        exc_event = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND function_name = 'foo' AND frame_event = 'exception'",
+            (str(run_id),))
         assert exc_event is not None, "Exception in coroutine should be recorded"
-        assert exc_event.is_coroutine is True
+        assert exc_event.is_coroutine

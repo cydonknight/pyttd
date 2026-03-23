@@ -20,6 +20,7 @@
 #include "recorder.h"
 #include "ringbuf.h"
 #include "iohook.h"
+#include "sqliteflush.h"
 
 #ifdef PYTTD_HAS_FORK
 #include "checkpoint.h"
@@ -1567,93 +1568,20 @@ static void flush_one_buffer(ThreadRingBuffer *rb) {
         return;
     }
 
+    /* Pool swap must be serialized with producer (which holds GIL during push).
+     * Brief GIL acquisition — just one integer write, not 40K object allocations. */
     PyGILState_STATE gstate = PyGILState_Ensure();
-
-    /* Swap pools inside GIL to serialize with producer (which also holds GIL) */
     ringbuf_pool_swap_for(rb);
+    PyGILState_Release(gstate);
 
-    /* Build Python list of dicts */
-    PyObject *list = PyList_New(count);
-    if (!list) {
-        PyErr_WriteUnraisable(g_flush_callback);
-        PyErr_Clear();
-        ringbuf_pool_reset_consumer_for(rb);
-        PyGILState_Release(gstate);
-        return;
-    }
-
-    for (uint32_t i = 0; i < count; i++) {
-        FrameEvent *e = &batch[i];
-        PyObject *dict = PyDict_New();
-        if (!dict) {
-            Py_DECREF(list);
-            PyErr_WriteUnraisable(g_flush_callback);
-            PyErr_Clear();
-            ringbuf_pool_reset_consumer_for(rb);
-            PyGILState_Release(gstate);
-            return;
-        }
-
-        PyObject *seq = PyLong_FromUnsignedLongLong(e->sequence_no);
-        PyObject *ts = PyFloat_FromDouble(e->timestamp);
-        PyObject *ln = PyLong_FromLong(e->line_no);
-        PyObject *fn = e->filename ? PyUnicode_FromString(e->filename) : PyUnicode_FromString("");
-        PyObject *func = e->function_name ? PyUnicode_FromString(e->function_name) : PyUnicode_FromString("");
-        PyObject *evt = event_type_to_pystr(e->event_type);
-        if (evt) { Py_INCREF(evt); } else { evt = PyUnicode_FromString(e->event_type); }
-        PyObject *depth = PyLong_FromLong(e->call_depth);
-        PyObject *locals_obj = e->locals_json ? PyUnicode_FromString(e->locals_json) : Py_NewRef(Py_None);
-        PyObject *tid = PyLong_FromUnsignedLong(e->thread_id);
-        PyObject *is_coro = PyBool_FromLong(e->is_coroutine);
-
-        if (!seq || !ts || !ln || !fn || !func || !evt || !depth || !locals_obj || !tid || !is_coro) {
-            Py_XDECREF(seq); Py_XDECREF(ts); Py_XDECREF(ln);
-            Py_XDECREF(fn); Py_XDECREF(func); Py_XDECREF(evt);
-            Py_XDECREF(depth); Py_XDECREF(locals_obj); Py_XDECREF(tid);
-            Py_XDECREF(is_coro);
-            Py_DECREF(dict);
-            PyErr_Clear();
-            PyObject *empty = PyDict_New();
-            PyList_SET_ITEM(list, i, empty ? empty : Py_NewRef(Py_None));
-            continue;
-        }
-
-        /* Use pre-interned key objects to avoid per-event string lookups */
-        if (PyDict_SetItem(dict, g_key_sequence_no, seq) < 0 ||
-            PyDict_SetItem(dict, g_key_timestamp, ts) < 0 ||
-            PyDict_SetItem(dict, g_key_line_no, ln) < 0 ||
-            PyDict_SetItem(dict, g_key_filename, fn) < 0 ||
-            PyDict_SetItem(dict, g_key_function_name, func) < 0 ||
-            PyDict_SetItem(dict, g_key_frame_event, evt) < 0 ||
-            PyDict_SetItem(dict, g_key_call_depth, depth) < 0 ||
-            PyDict_SetItem(dict, g_key_locals_snapshot, locals_obj) < 0 ||
-            PyDict_SetItem(dict, g_key_thread_id, tid) < 0 ||
-            PyDict_SetItem(dict, g_key_is_coroutine, is_coro) < 0) {
-            PyErr_Clear();
-        }
-
-        Py_DECREF(seq); Py_DECREF(ts); Py_DECREF(ln);
-        Py_DECREF(fn); Py_DECREF(func); Py_DECREF(evt);
-        Py_DECREF(depth); Py_DECREF(locals_obj); Py_DECREF(tid);
-        Py_DECREF(is_coro);
-
-        PyList_SET_ITEM(list, i, dict);
-    }
-
-    /* Call flush callback */
-    PyObject *result = PyObject_CallOneArg(g_flush_callback, list);
-    if (!result) {
-        PyErr_WriteUnraisable(g_flush_callback);
-        PyErr_Clear();
-    } else {
-        Py_DECREF(result);
-    }
-    Py_DECREF(list);
+    /* INSERT directly via SQLite C API — no GIL needed.
+     * This is the key Phase 1 optimization: the expensive DB operations
+     * run entirely outside the GIL. */
+    sqliteflush_insert_batch(batch, count);
     atomic_fetch_add_explicit(&g_flush_count, 1, memory_order_relaxed);
 
-    /* Reset consumer pool inside GIL to serialize with producer */
+    /* Consumer pool reset — flush thread owns consumer pool exclusively. */
     ringbuf_pool_reset_consumer_for(rb);
-    PyGILState_Release(gstate);
 }
 
 static void flush_batch(void) {
@@ -1675,26 +1603,8 @@ static DWORD WINAPI flush_thread_func(LPVOID arg) {
     /* Final flush */
     flush_batch();
 
-    /* Close flush thread's DB connection (same as Unix path) */
-    if (atomic_load_explicit(&g_interpreter_alive, memory_order_relaxed)) {
-        PyGILState_STATE gstate = PyGILState_Ensure();
-        PyObject *base_mod = PyImport_ImportModule("pyttd.models.base");
-        if (base_mod) {
-            PyObject *db_obj = PyObject_GetAttrString(base_mod, "db");
-            if (db_obj) {
-                PyObject *close_result = PyObject_CallMethod(db_obj, "close", NULL);
-                Py_XDECREF(close_result);
-                if (PyErr_Occurred()) PyErr_Clear();
-                Py_DECREF(db_obj);
-            } else {
-                PyErr_Clear();
-            }
-            Py_DECREF(base_mod);
-        } else {
-            PyErr_Clear();
-        }
-        PyGILState_Release(gstate);
-    }
+    /* Close flush thread's C-level SQLite connection (no GIL needed) */
+    sqliteflush_close();
     return 0;
 }
 #else
@@ -1732,26 +1642,8 @@ static void *flush_thread_func(void *arg) {
     /* Final flush */
     flush_batch();
 
-    /* Close flush thread's DB connection */
-    if (atomic_load_explicit(&g_interpreter_alive, memory_order_relaxed)) {
-        PyGILState_STATE gstate = PyGILState_Ensure();
-        PyObject *base_mod = PyImport_ImportModule("pyttd.models.base");
-        if (base_mod) {
-            PyObject *db_obj = PyObject_GetAttrString(base_mod, "db");
-            if (db_obj) {
-                PyObject *close_result = PyObject_CallMethod(db_obj, "close", NULL);
-                Py_XDECREF(close_result);
-                if (PyErr_Occurred()) PyErr_Clear();
-                Py_DECREF(db_obj);
-            } else {
-                PyErr_Clear();
-            }
-            Py_DECREF(base_mod);
-        } else {
-            PyErr_Clear();
-        }
-        PyGILState_Release(gstate);
-    }
+    /* Close flush thread's C-level SQLite connection (no GIL needed) */
+    sqliteflush_close();
     return NULL;
 }
 #endif
@@ -1842,7 +1734,7 @@ static void synthesize_existing_stack(void) {
     }
 
     Py_DECREF(current);
-    for (int i = 1; i < count; i++) {
+    for (int i = 0; i < count; i++) {
         Py_DECREF(stack[i].frame);
     }
 }

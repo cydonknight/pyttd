@@ -7,7 +7,6 @@ import sys
 import pytest
 import pyttd_native
 from pyttd.config import PyttdConfig
-from pyttd.models.checkpoints import Checkpoint
 
 
 needs_fork = pytest.mark.skipif(
@@ -87,7 +86,7 @@ def test_checkpoint_memory_limit_eviction(record_func):
     """With a very low memory limit, verify checkpoints are evicted."""
     # Use a very low limit (1 byte) — this should cause aggressive eviction
     from pyttd.models.storage import delete_db_files, close_db
-    from pyttd.models.base import db
+    from pyttd.models.db import db
     from pyttd.recorder import Recorder
     import textwrap, runpy
 

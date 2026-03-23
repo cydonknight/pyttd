@@ -1,7 +1,6 @@
 import json
 import pyttd_native
-from pyttd.models.frames import ExecutionFrames
-from pyttd.models.runs import Runs
+from pyttd.models.db import db
 
 
 def test_basic_recording(record_func):
@@ -13,9 +12,9 @@ def test_basic_recording(record_func):
         foo()
     """)
     assert stats['frame_count'] > 0
-    frames = list(ExecutionFrames.select()
-        .where(ExecutionFrames.run_id == run_id)
-        .order_by(ExecutionFrames.sequence_no))
+    frames = db.fetchall(
+        "SELECT * FROM executionframes WHERE run_id = ? ORDER BY sequence_no",
+        (str(run_id),))
     assert len(frames) > 0
 
 
@@ -27,9 +26,9 @@ def test_sequence_no_monotonic(record_func):
             return a + b
         foo()
     """)
-    frames = list(ExecutionFrames.select()
-        .where(ExecutionFrames.run_id == run_id)
-        .order_by(ExecutionFrames.sequence_no))
+    frames = db.fetchall(
+        "SELECT * FROM executionframes WHERE run_id = ? ORDER BY sequence_no",
+        (str(run_id),))
     for i in range(1, len(frames)):
         assert frames[i].sequence_no > frames[i-1].sequence_no
 
@@ -40,9 +39,9 @@ def test_first_event_is_call(record_func):
             return 42
         foo()
     """)
-    frames = list(ExecutionFrames.select()
-        .where(ExecutionFrames.run_id == run_id)
-        .order_by(ExecutionFrames.sequence_no))
+    frames = db.fetchall(
+        "SELECT * FROM executionframes WHERE run_id = ? ORDER BY sequence_no",
+        (str(run_id),))
     # First user frame event should be 'call'
     assert frames[0].frame_event == 'call'
 
@@ -53,9 +52,9 @@ def test_last_event_is_return(record_func):
             return 42
         foo()
     """)
-    frames = list(ExecutionFrames.select()
-        .where(ExecutionFrames.run_id == run_id)
-        .order_by(ExecutionFrames.sequence_no))
+    frames = db.fetchall(
+        "SELECT * FROM executionframes WHERE run_id = ? ORDER BY sequence_no",
+        (str(run_id),))
     # Find events for 'foo' specifically — last should be 'return'
     foo_frames = [f for f in frames if f.function_name == 'foo']
     assert foo_frames[-1].frame_event == 'return'
@@ -69,9 +68,9 @@ def test_call_depth(record_func):
             return inner()
         outer()
     """)
-    frames = list(ExecutionFrames.select()
-        .where(ExecutionFrames.run_id == run_id)
-        .order_by(ExecutionFrames.sequence_no))
+    frames = db.fetchall(
+        "SELECT * FROM executionframes WHERE run_id = ? ORDER BY sequence_no",
+        (str(run_id),))
     # Find outer's call event and inner's call event
     outer_calls = [f for f in frames if f.function_name == 'outer' and f.frame_event == 'call']
     inner_calls = [f for f in frames if f.function_name == 'inner' and f.frame_event == 'call']
@@ -88,10 +87,9 @@ def test_locals_snapshot_is_valid_json(record_func):
             return x
         foo()
     """)
-    frames = list(ExecutionFrames.select()
-        .where((ExecutionFrames.run_id == run_id) &
-               (ExecutionFrames.frame_event == 'line'))
-        .order_by(ExecutionFrames.sequence_no))
+    frames = db.fetchall(
+        "SELECT * FROM executionframes WHERE run_id = ? AND frame_event = 'line' ORDER BY sequence_no",
+        (str(run_id),))
     assert len(frames) > 0
     for f in frames:
         if f.locals_snapshot:
@@ -104,9 +102,9 @@ def test_stdlib_not_recorded(record_func):
         import os
         x = os.path.join("a", "b")
     """)
-    frames = list(ExecutionFrames.select()
-        .where(ExecutionFrames.run_id == run_id)
-        .order_by(ExecutionFrames.sequence_no))
+    frames = db.fetchall(
+        "SELECT * FROM executionframes WHERE run_id = ? ORDER BY sequence_no",
+        (str(run_id),))
     # No frames should have stdlib filenames
     for f in frames:
         assert 'lib/python' not in f.filename
@@ -122,9 +120,9 @@ def test_exception_event(record_func):
         except ValueError:
             pass
     """)
-    frames = list(ExecutionFrames.select()
-        .where(ExecutionFrames.run_id == run_id)
-        .order_by(ExecutionFrames.sequence_no))
+    frames = db.fetchall(
+        "SELECT * FROM executionframes WHERE run_id = ? ORDER BY sequence_no",
+        (str(run_id),))
     exception_frames = [f for f in frames if f.frame_event == 'exception']
     assert len(exception_frames) > 0
 
@@ -136,7 +134,7 @@ def test_total_frames_in_run(record_func):
             return a
         foo()
     """)
-    run = Runs.get(Runs.run_id == run_id)
+    run = db.fetchone("SELECT * FROM runs WHERE run_id = ?", (str(run_id),))
     assert run.total_frames == stats['frame_count']
     assert run.total_frames > 0
 
@@ -152,9 +150,9 @@ def test_repr_reentrancy(record_func):
             return f
         bar()
     """)
-    frames = list(ExecutionFrames.select()
-        .where(ExecutionFrames.run_id == run_id)
-        .order_by(ExecutionFrames.sequence_no))
+    frames = db.fetchall(
+        "SELECT * FROM executionframes WHERE run_id = ? ORDER BY sequence_no",
+        (str(run_id),))
     assert len(frames) > 0
     for f in frames:
         if f.locals_snapshot:

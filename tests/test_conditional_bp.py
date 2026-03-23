@@ -4,17 +4,17 @@ import sys
 
 import pytest
 
-from pyttd.models.frames import ExecutionFrames
+from pyttd.models.db import db
 from pyttd.session import Session
 
 
 def _setup_session(run_id):
     session = Session()
-    first_line = (ExecutionFrames.select(ExecutionFrames.sequence_no)
-                  .where((ExecutionFrames.run_id == run_id) &
-                         (ExecutionFrames.frame_event == 'line'))
-                  .order_by(ExecutionFrames.sequence_no)
-                  .first())
+    first_line = db.fetchone(
+        "SELECT sequence_no FROM executionframes"
+        " WHERE run_id = ? AND frame_event = 'line'"
+        " ORDER BY sequence_no LIMIT 1",
+        (str(run_id),))
     session.enter_replay(run_id, first_line.sequence_no)
     return session
 
@@ -29,12 +29,11 @@ class TestConditionalBreakpoints:
         ''')
         session = _setup_session(run_id)
         # Find the file path for 'x = i * 2' line
-        frame = (ExecutionFrames.select()
-                 .where((ExecutionFrames.run_id == run_id) &
-                        (ExecutionFrames.frame_event == 'line') &
-                        (ExecutionFrames.locals_snapshot.contains('"i"')))
-                 .order_by(ExecutionFrames.sequence_no)
-                 .first())
+        frame = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line' AND locals_snapshot LIKE '%\"i\"%'"
+            " ORDER BY sequence_no LIMIT 1",
+            (str(run_id),))
         assert frame is not None
         session.set_breakpoints([{
             'file': frame.filename,
@@ -45,9 +44,9 @@ class TestConditionalBreakpoints:
         assert result['reason'] == 'breakpoint'
         # Verify that at this frame, i == 5
         import json
-        stopped = ExecutionFrames.get_or_none(
-            (ExecutionFrames.run_id == run_id) &
-            (ExecutionFrames.sequence_no == result['seq']))
+        stopped = db.fetchone(
+            "SELECT * FROM executionframes WHERE run_id = ? AND sequence_no = ?",
+            (str(run_id), result['seq']))
         assert stopped is not None, "Stopped frame should exist"
         assert stopped.locals_snapshot, "Stopped frame should have locals"
         locals_data = json.loads(stopped.locals_snapshot)
@@ -59,12 +58,11 @@ class TestConditionalBreakpoints:
                 x = i * 2
         ''')
         session = _setup_session(run_id)
-        frame = (ExecutionFrames.select()
-                 .where((ExecutionFrames.run_id == run_id) &
-                        (ExecutionFrames.frame_event == 'line') &
-                        (ExecutionFrames.locals_snapshot.contains('"i"')))
-                 .order_by(ExecutionFrames.sequence_no)
-                 .first())
+        frame = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line' AND locals_snapshot LIKE '%\"i\"%'"
+            " ORDER BY sequence_no LIMIT 1",
+            (str(run_id),))
         assert frame is not None
         session.set_breakpoints([{
             'file': frame.filename,
@@ -81,19 +79,18 @@ class TestConditionalBreakpoints:
         ''')
         session = _setup_session(run_id)
         # Go to end
-        last_line = (ExecutionFrames.select(ExecutionFrames.sequence_no)
-                     .where((ExecutionFrames.run_id == run_id) &
-                            (ExecutionFrames.frame_event == 'line'))
-                     .order_by(ExecutionFrames.sequence_no.desc())
-                     .first())
+        last_line = db.fetchone(
+            "SELECT sequence_no FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line'"
+            " ORDER BY sequence_no DESC LIMIT 1",
+            (str(run_id),))
         session.goto_frame(last_line.sequence_no)
         # Find a breakpoint line
-        frame = (ExecutionFrames.select()
-                 .where((ExecutionFrames.run_id == run_id) &
-                        (ExecutionFrames.frame_event == 'line') &
-                        (ExecutionFrames.locals_snapshot.contains('"i"')))
-                 .order_by(ExecutionFrames.sequence_no)
-                 .first())
+        frame = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line' AND locals_snapshot LIKE '%\"i\"%'"
+            " ORDER BY sequence_no LIMIT 1",
+            (str(run_id),))
         assert frame is not None
         session.set_breakpoints([{
             'file': frame.filename,
@@ -109,12 +106,11 @@ class TestConditionalBreakpoints:
                 x = i
         ''')
         session = _setup_session(run_id)
-        frame = (ExecutionFrames.select()
-                 .where((ExecutionFrames.run_id == run_id) &
-                        (ExecutionFrames.frame_event == 'line') &
-                        (ExecutionFrames.locals_snapshot.contains('"i"')))
-                 .order_by(ExecutionFrames.sequence_no)
-                 .first())
+        frame = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line' AND locals_snapshot LIKE '%\"i\"%'"
+            " ORDER BY sequence_no LIMIT 1",
+            (str(run_id),))
         assert frame is not None
         session.set_breakpoints([{
             'file': frame.filename,
@@ -131,12 +127,11 @@ class TestConditionalBreakpoints:
                 x = i
         ''')
         session = _setup_session(run_id)
-        frame = (ExecutionFrames.select()
-                 .where((ExecutionFrames.run_id == run_id) &
-                        (ExecutionFrames.frame_event == 'line') &
-                        (ExecutionFrames.locals_snapshot.contains('"i"')))
-                 .order_by(ExecutionFrames.sequence_no)
-                 .first())
+        frame = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line' AND locals_snapshot LIKE '%\"i\"%'"
+            " ORDER BY sequence_no LIMIT 1",
+            (str(run_id),))
         assert frame is not None
         session.set_breakpoints([{
             'file': frame.filename,
@@ -155,12 +150,11 @@ class TestConditionalBreakpoints:
                 x = i
         ''')
         session = _setup_session(run_id)
-        frame = (ExecutionFrames.select()
-                 .where((ExecutionFrames.run_id == run_id) &
-                        (ExecutionFrames.frame_event == 'line') &
-                        (ExecutionFrames.locals_snapshot.contains('"i"')))
-                 .order_by(ExecutionFrames.sequence_no)
-                 .first())
+        frame = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line' AND locals_snapshot LIKE '%\"i\"%'"
+            " ORDER BY sequence_no LIMIT 1",
+            (str(run_id),))
         assert frame is not None
         session.set_breakpoints([{
             'file': frame.filename,
@@ -177,12 +171,11 @@ class TestConditionalBreakpoints:
                 x = i
         ''')
         session = _setup_session(run_id)
-        frame = (ExecutionFrames.select()
-                 .where((ExecutionFrames.run_id == run_id) &
-                        (ExecutionFrames.frame_event == 'line') &
-                        (ExecutionFrames.locals_snapshot.contains('"i"')))
-                 .order_by(ExecutionFrames.sequence_no)
-                 .first())
+        frame = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line' AND locals_snapshot LIKE '%\"i\"%'"
+            " ORDER BY sequence_no LIMIT 1",
+            (str(run_id),))
         assert frame is not None
         session.set_breakpoints([{
             'file': frame.filename,
@@ -199,12 +192,11 @@ class TestConditionalBreakpoints:
                 greeting = f"Hello {name}"
         ''')
         session = _setup_session(run_id)
-        frame = (ExecutionFrames.select()
-                 .where((ExecutionFrames.run_id == run_id) &
-                        (ExecutionFrames.frame_event == 'line') &
-                        (ExecutionFrames.locals_snapshot.contains('"name"')))
-                 .order_by(ExecutionFrames.sequence_no)
-                 .first())
+        frame = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line' AND locals_snapshot LIKE '%\"name\"%'"
+            " ORDER BY sequence_no LIMIT 1",
+            (str(run_id),))
         assert frame is not None, "Expected frame with 'name' variable in locals"
         session.set_breakpoints([{
             'file': frame.filename,
@@ -221,12 +213,11 @@ class TestConditionalBreakpoints:
                 x = i * 2
         ''')
         session = _setup_session(run_id)
-        frame = (ExecutionFrames.select()
-                 .where((ExecutionFrames.run_id == run_id) &
-                        (ExecutionFrames.frame_event == 'line') &
-                        (ExecutionFrames.locals_snapshot.contains('"i"')))
-                 .order_by(ExecutionFrames.sequence_no)
-                 .first())
+        frame = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line' AND locals_snapshot LIKE '%\"i\"%'"
+            " ORDER BY sequence_no LIMIT 1",
+            (str(run_id),))
         assert frame is not None
         session.set_breakpoints([
             {'file': frame.filename, 'line': frame.line_no, 'condition': 'i == 15'},

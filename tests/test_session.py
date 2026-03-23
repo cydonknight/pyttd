@@ -6,16 +6,16 @@ stack reconstruction, variable queries, and evaluate.
 import json
 import pytest
 from pyttd.session import Session, _infer_type, SAFE_BUILTINS
-from pyttd.models.frames import ExecutionFrames
+from pyttd.models.db import db
 
 
 def _enter_replay(session, run_id):
     """Helper: set up session in replay mode."""
-    first_line = (ExecutionFrames.select()
-                  .where((ExecutionFrames.run_id == run_id) &
-                         (ExecutionFrames.frame_event == 'line'))
-                  .order_by(ExecutionFrames.sequence_no)
-                  .limit(1).first())
+    first_line = db.fetchone(
+        "SELECT * FROM executionframes"
+        " WHERE run_id = ? AND frame_event = 'line'"
+        " ORDER BY sequence_no LIMIT 1",
+        (str(run_id),))
     first_line_seq = first_line.sequence_no if first_line else 0
     session.enter_replay(run_id, first_line_seq)
     return first_line_seq
@@ -49,19 +49,18 @@ class TestSessionStepInto:
 
         # Verify foo exists in the recording (step_into would need hundreds of
         # steps due to internal frames being recorded — known limitation)
-        foo_frame = ExecutionFrames.get_or_none(
-            (ExecutionFrames.run_id == run_id) &
-            (ExecutionFrames.function_name == 'foo') &
-            (ExecutionFrames.frame_event == 'line'))
+        foo_frame = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND function_name = 'foo' AND frame_event = 'line'",
+            (str(run_id),))
         assert foo_frame is not None, "foo should be recorded"
 
         # Jump near foo and verify step_into reaches it
-        pre_foo = (ExecutionFrames.select()
-                   .where((ExecutionFrames.run_id == run_id) &
-                          (ExecutionFrames.frame_event == 'line') &
-                          (ExecutionFrames.sequence_no < foo_frame.sequence_no))
-                   .order_by(ExecutionFrames.sequence_no.desc())
-                   .limit(1).first())
+        pre_foo = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line' AND sequence_no < ?"
+            " ORDER BY sequence_no DESC LIMIT 1",
+            (str(run_id), foo_frame.sequence_no))
         if pre_foo:
             session.current_frame_seq = pre_foo.sequence_no
         result = session.step_into()
@@ -99,12 +98,11 @@ class TestSessionStepOver:
         _enter_replay(session, run_id)
 
         # Find a frame in outer
-        frames = list(ExecutionFrames.select()
-                      .where((ExecutionFrames.run_id == run_id) &
-                             (ExecutionFrames.function_name == 'outer') &
-                             (ExecutionFrames.frame_event == 'line'))
-                      .order_by(ExecutionFrames.sequence_no)
-                      .limit(1))
+        frames = db.fetchall(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND function_name = 'outer' AND frame_event = 'line'"
+            " ORDER BY sequence_no LIMIT 1",
+            (str(run_id),))
         assert frames, "Should find at least one line event in outer"
         session.current_frame_seq = frames[0].sequence_no
         outer_depth = frames[0].call_depth
@@ -113,9 +111,9 @@ class TestSessionStepOver:
         assert result["reason"] in ("step", "end")
         # Should stay at same or shallower depth
         if result["reason"] == "step":
-            stepped_frame = ExecutionFrames.get_or_none(
-                (ExecutionFrames.run_id == run_id) &
-                (ExecutionFrames.sequence_no == result["seq"]))
+            stepped_frame = db.fetchone(
+                "SELECT * FROM executionframes WHERE run_id = ? AND sequence_no = ?",
+                (str(run_id), result["seq"]))
             assert stepped_frame is not None
             assert stepped_frame.call_depth <= outer_depth
 
@@ -136,12 +134,11 @@ class TestSessionStepOut:
         _enter_replay(session, run_id)
 
         # Navigate to inner
-        frames = list(ExecutionFrames.select()
-                      .where((ExecutionFrames.run_id == run_id) &
-                             (ExecutionFrames.function_name == 'inner') &
-                             (ExecutionFrames.frame_event == 'line'))
-                      .order_by(ExecutionFrames.sequence_no)
-                      .limit(1))
+        frames = db.fetchall(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND function_name = 'inner' AND frame_event = 'line'"
+            " ORDER BY sequence_no LIMIT 1",
+            (str(run_id),))
         assert frames, "Should find at least one line event in inner"
         session.current_frame_seq = frames[0].sequence_no
         session.current_stack = session._build_stack_at(frames[0].sequence_no)
@@ -150,9 +147,9 @@ class TestSessionStepOut:
         result = session.step_out()
         assert result["reason"] in ("step", "end")
         if result["reason"] == "step":
-            stepped_frame = ExecutionFrames.get_or_none(
-                (ExecutionFrames.run_id == run_id) &
-                (ExecutionFrames.sequence_no == result["seq"]))
+            stepped_frame = db.fetchone(
+                "SELECT * FROM executionframes WHERE run_id = ? AND sequence_no = ?",
+                (str(run_id), result["seq"]))
             assert stepped_frame is not None
             assert stepped_frame.call_depth < inner_depth
 
@@ -165,10 +162,10 @@ class TestSessionStepOut:
         _enter_replay(session, run_id)
 
         # Find a depth-0 frame
-        frame = ExecutionFrames.get_or_none(
-            (ExecutionFrames.run_id == run_id) &
-            (ExecutionFrames.call_depth == 0) &
-            (ExecutionFrames.frame_event == 'line'))
+        frame = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND call_depth = 0 AND frame_event = 'line'",
+            (str(run_id),))
         assert frame is not None, "Should find a depth-0 line event"
         session.current_frame_seq = frame.sequence_no
         session.current_stack = session._build_stack_at(frame.sequence_no)
@@ -202,11 +199,11 @@ class TestSessionContinue:
         first_seq = _enter_replay(session, run_id)
 
         # Find a line in foo to set as breakpoint
-        foo_lines = list(ExecutionFrames.select()
-                         .where((ExecutionFrames.run_id == run_id) &
-                                (ExecutionFrames.function_name == 'foo') &
-                                (ExecutionFrames.frame_event == 'line'))
-                         .order_by(ExecutionFrames.sequence_no))
+        foo_lines = db.fetchall(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND function_name = 'foo' AND frame_event = 'line'"
+            " ORDER BY sequence_no",
+            (str(run_id),))
         assert len(foo_lines) >= 2, "Should find at least 2 line events in foo"
         target = foo_lines[1]  # second line in foo
         session.set_breakpoints([{"file": target.filename, "line": target.line_no}])
@@ -229,9 +226,9 @@ class TestSessionContinue:
 
         result = session.continue_forward()
         assert result["reason"] == "exception", "Should hit exception with 'raised' filter"
-        frame = ExecutionFrames.get_or_none(
-            (ExecutionFrames.run_id == run_id) &
-            (ExecutionFrames.sequence_no == result["seq"]))
+        frame = db.fetchone(
+            "SELECT * FROM executionframes WHERE run_id = ? AND sequence_no = ?",
+            (str(run_id), result["seq"]))
         assert frame is not None
         # continue_forward snaps exception events to the nearest line event
         assert frame.frame_event == 'line'
@@ -265,12 +262,11 @@ class TestSessionStack:
         _enter_replay(session, run_id)
 
         # Navigate to inside inner
-        frames = list(ExecutionFrames.select()
-                      .where((ExecutionFrames.run_id == run_id) &
-                             (ExecutionFrames.function_name == 'inner') &
-                             (ExecutionFrames.frame_event == 'line'))
-                      .order_by(ExecutionFrames.sequence_no)
-                      .limit(1))
+        frames = db.fetchall(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND function_name = 'inner' AND frame_event = 'line'"
+            " ORDER BY sequence_no LIMIT 1",
+            (str(run_id),))
         assert frames, "Should find at least one line event in inner"
         session.current_frame_seq = frames[0].sequence_no
         session.current_stack = session._build_stack_at(frames[0].sequence_no)
@@ -293,11 +289,11 @@ class TestSessionVariables:
         _enter_replay(session, run_id)
 
         # Find a line in foo where x is set
-        frames = list(ExecutionFrames.select()
-                      .where((ExecutionFrames.run_id == run_id) &
-                             (ExecutionFrames.function_name == 'foo') &
-                             (ExecutionFrames.frame_event == 'line'))
-                      .order_by(ExecutionFrames.sequence_no))
+        frames = db.fetchall(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND function_name = 'foo' AND frame_event = 'line'"
+            " ORDER BY sequence_no",
+            (str(run_id),))
         # Find a frame where locals_snapshot has 'x'
         found = False
         for f in frames:
@@ -331,11 +327,11 @@ class TestSessionEvaluate:
         session = Session()
         _enter_replay(session, run_id)
 
-        frames = list(ExecutionFrames.select()
-                      .where((ExecutionFrames.run_id == run_id) &
-                             (ExecutionFrames.function_name == 'foo') &
-                             (ExecutionFrames.frame_event == 'line'))
-                      .order_by(ExecutionFrames.sequence_no))
+        frames = db.fetchall(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND function_name = 'foo' AND frame_event = 'line'"
+            " ORDER BY sequence_no",
+            (str(run_id),))
         found = False
         for f in frames:
             if f.locals_snapshot and '"x"' in f.locals_snapshot:
@@ -356,11 +352,11 @@ class TestSessionEvaluate:
         session = Session()
         _enter_replay(session, run_id)
         # Find a frame where x is set
-        frames = list(ExecutionFrames.select()
-                      .where((ExecutionFrames.run_id == run_id) &
-                             (ExecutionFrames.function_name == 'foo') &
-                             (ExecutionFrames.frame_event == 'line'))
-                      .order_by(ExecutionFrames.sequence_no))
+        frames = db.fetchall(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND function_name = 'foo' AND frame_event = 'line'"
+            " ORDER BY sequence_no",
+            (str(run_id),))
         found = False
         for f in frames:
             if f.locals_snapshot and '"x"' in f.locals_snapshot:
@@ -381,11 +377,11 @@ class TestSessionEvaluate:
         """)
         session = Session()
         _enter_replay(session, run_id)
-        frames = list(ExecutionFrames.select()
-                      .where((ExecutionFrames.run_id == run_id) &
-                             (ExecutionFrames.function_name == 'foo') &
-                             (ExecutionFrames.frame_event == 'line'))
-                      .order_by(ExecutionFrames.sequence_no))
+        frames = db.fetchall(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND function_name = 'foo' AND frame_event = 'line'"
+            " ORDER BY sequence_no",
+            (str(run_id),))
         found = False
         for f in frames:
             if f.locals_snapshot and '"x"' in f.locals_snapshot and '"y"' in f.locals_snapshot:
@@ -401,9 +397,9 @@ class TestSessionEvaluate:
         session = Session()
         _enter_replay(session, run_id)
         # Eval at a frame that exists but expression fails
-        first_line = ExecutionFrames.get_or_none(
-            (ExecutionFrames.run_id == run_id) &
-            (ExecutionFrames.frame_event == 'line'))
+        first_line = db.fetchone(
+            "SELECT * FROM executionframes WHERE run_id = ? AND frame_event = 'line'",
+            (str(run_id),))
         if first_line:
             result = session.evaluate_at(first_line.sequence_no, "__import__('os')", "repl")
             assert "Error" in result["result"] or "<not available>" in result["result"]
@@ -419,11 +415,11 @@ class TestSessionEvaluate:
         """)
         session = Session()
         _enter_replay(session, run_id)
-        frames = list(ExecutionFrames.select()
-                      .where((ExecutionFrames.run_id == run_id) &
-                             (ExecutionFrames.function_name == 'foo') &
-                             (ExecutionFrames.frame_event == 'line'))
-                      .order_by(ExecutionFrames.sequence_no))
+        frames = db.fetchall(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND function_name = 'foo' AND frame_event = 'line'"
+            " ORDER BY sequence_no",
+            (str(run_id),))
         found = False
         for f in frames:
             if f.locals_snapshot and '"x"' in f.locals_snapshot and '"y"' in f.locals_snapshot:
@@ -443,11 +439,11 @@ class TestSessionEvaluate:
         """)
         session = Session()
         _enter_replay(session, run_id)
-        frames = list(ExecutionFrames.select()
-                      .where((ExecutionFrames.run_id == run_id) &
-                             (ExecutionFrames.function_name == 'foo') &
-                             (ExecutionFrames.frame_event == 'line'))
-                      .order_by(ExecutionFrames.sequence_no))
+        frames = db.fetchall(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND function_name = 'foo' AND frame_event = 'line'"
+            " ORDER BY sequence_no",
+            (str(run_id),))
         found = False
         for f in frames:
             if f.locals_snapshot and '"msg"' in f.locals_snapshot:
@@ -467,11 +463,11 @@ class TestSessionEvaluate:
         """)
         session = Session()
         _enter_replay(session, run_id)
-        frames = list(ExecutionFrames.select()
-                      .where((ExecutionFrames.run_id == run_id) &
-                             (ExecutionFrames.function_name == 'foo') &
-                             (ExecutionFrames.frame_event == 'line'))
-                      .order_by(ExecutionFrames.sequence_no))
+        frames = db.fetchall(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND function_name = 'foo' AND frame_event = 'line'"
+            " ORDER BY sequence_no",
+            (str(run_id),))
         found = False
         for f in frames:
             if f.locals_snapshot and '"x"' in f.locals_snapshot:
@@ -486,9 +482,9 @@ class TestSessionEvaluate:
         db_path, run_id, stats = record_func("x = 1\n")
         session = Session()
         _enter_replay(session, run_id)
-        first_line = ExecutionFrames.get_or_none(
-            (ExecutionFrames.run_id == run_id) &
-            (ExecutionFrames.frame_event == 'line'))
+        first_line = db.fetchone(
+            "SELECT * FROM executionframes WHERE run_id = ? AND frame_event = 'line'",
+            (str(run_id),))
         if first_line:
             result = session.evaluate_at(first_line.sequence_no, "__import__('os')", "hover")
             assert result["result"] == "<not available>"
@@ -540,11 +536,11 @@ class TestEvaluateRepl:
         """)
         session = Session()
         _enter_replay(session, run_id)
-        frames = list(ExecutionFrames.select()
-                      .where((ExecutionFrames.run_id == run_id) &
-                             (ExecutionFrames.function_name == 'foo') &
-                             (ExecutionFrames.frame_event == 'line'))
-                      .order_by(ExecutionFrames.sequence_no))
+        frames = db.fetchall(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND function_name = 'foo' AND frame_event = 'line'"
+            " ORDER BY sequence_no",
+            (str(run_id),))
         found = False
         for f in frames:
             if f.locals_snapshot and '"x"' in f.locals_snapshot:

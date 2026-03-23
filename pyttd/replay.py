@@ -1,6 +1,16 @@
 import json
+import logging
+
 import pyttd_native
-from pyttd.models.frames import ExecutionFrames
+from pyttd.models.db import db
+
+logger = logging.getLogger(__name__)
+
+_FRAME_BY_SEQ_SQL = """
+    SELECT filename, line_no, function_name, call_depth, locals_snapshot
+    FROM executionframes
+    WHERE run_id = ? AND sequence_no = ?
+"""
 
 
 class ReplayController:
@@ -17,9 +27,7 @@ class ReplayController:
             return self.warm_goto_frame(run_id, target_seq)
 
         # Merge: metadata from DB (canonical), locals from child (live objects)
-        db_frame = ExecutionFrames.get_or_none(
-            (ExecutionFrames.run_id == run_id) &
-            (ExecutionFrames.sequence_no == target_seq))
+        db_frame = db.fetchone(_FRAME_BY_SEQ_SQL, (run_id, target_seq))
         if db_frame:
             return {
                 "seq": target_seq,
@@ -35,16 +43,13 @@ class ReplayController:
     def warm_goto_frame(self, run_id, target_seq) -> dict:
         """Warm-only navigation: read frame data directly from SQLite
         (repr snapshots only, no live objects)."""
-        frame = ExecutionFrames.get_or_none(
-            (ExecutionFrames.run_id == run_id) &
-            (ExecutionFrames.sequence_no == target_seq))
+        frame = db.fetchone(_FRAME_BY_SEQ_SQL, (run_id, target_seq))
         if frame is None:
             return {"error": "frame_not_found", "target_seq": target_seq}
         try:
             locals_data = json.loads(frame.locals_snapshot) if frame.locals_snapshot else {}
         except (json.JSONDecodeError, TypeError) as e:
-            import logging
-            logging.getLogger(__name__).warning(
+            logger.warning(
                 "Failed to parse locals at seq %d: %s", target_seq, e)
             locals_data = {}
         return {

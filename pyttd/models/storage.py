@@ -1,13 +1,26 @@
 import logging
 import os
-from typing import List, Type
 
-from peewee import Model
-
-from pyttd.models.base import db
-from pyttd.models.constants import DB_NAME_SUFFIX, PRAGMAS
+from pyttd.models.db import db
+from pyttd.models import schema
+from pyttd.models.constants import DB_NAME_SUFFIX
 
 logger = logging.getLogger(__name__)
+
+# Column order for ExecutionFrames batch inserts.
+_EF_COLUMNS = (
+    'run_id', 'sequence_no', 'timestamp', 'line_no', 'filename',
+    'function_name', 'frame_event', 'call_depth', 'locals_snapshot',
+    'thread_id', 'is_coroutine',
+)
+
+_EF_INSERT_SQL = (
+    "INSERT INTO executionframes"
+    " (run_id, sequence_no, timestamp, line_no, filename,"
+    "  function_name, frame_event, call_depth, locals_snapshot,"
+    "  thread_id, is_coroutine)"
+    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+)
 
 
 def compute_db_path(script: str | None = None, is_module: bool = False,
@@ -30,37 +43,40 @@ def compute_db_path(script: str | None = None, is_module: bool = False,
 
 def connect_to_db(db_path: str):
     """Initialize the deferred database with the given path."""
-    if not db.is_closed():
-        db.close()
-    db.init(db_path, pragmas=PRAGMAS)
-    db.connect(reuse_if_open=True)
+    db.init(db_path)
     logger.info("Connected to database: %s", db_path)
 
-def initialize_schema(models: List[Type[Model]]):
-    """Create tables for the given models (safe=True for idempotency)."""
-    db.create_tables(models, safe=True)
-    # Migrate: add columns that may not exist in older databases
-    for sql in [
-        'ALTER TABLE runs ADD COLUMN is_attach INTEGER DEFAULT 0',
-    ]:
+def initialize_schema():
+    """Create tables and indexes via DDL, then run migrations."""
+    db.get_connection().executescript(schema.SCHEMA_DDL)
+    for sql in schema.MIGRATION_SQL:
         try:
-            db.execute_sql(sql)
+            db.execute(sql)
         except Exception:
             pass  # Column already exists
 
 def delete_db_files(db_path: str):
     """Delete a SQLite database and its WAL/SHM companion files."""
-    import os
     for suffix in ("", "-wal", "-shm"):
         path = db_path + suffix
         if os.path.exists(path):
             os.remove(path)
 
-def batch_insert(model_class: Type[Model], rows: list[dict], batch_size: int = 500):
-    """Batch-insert rows into the given model's table."""
+def batch_insert(model_class, rows: list[dict], batch_size: int = 500):
+    """Batch-insert rows into the ExecutionFrames table.
+
+    The model_class parameter is accepted for backward compatibility but
+    ignored; all inserts target the executionframes table.
+    """
     with db.atomic():
         for i in range(0, len(rows), batch_size):
-            model_class.insert_many(rows[i:i + batch_size]).execute()
+            batch = rows[i:i + batch_size]
+            params = [
+                tuple(row.get(col, 0 if col in ('thread_id', 'is_coroutine') else None)
+                      for col in _EF_COLUMNS)
+                for row in batch
+            ]
+            db.executemany(_EF_INSERT_SQL, params)
 
 def close_db():
     """Close the database connection."""
@@ -74,15 +90,11 @@ def evict_old_runs(db_path: str, keep: int, dry_run: bool = False) -> list:
     Returns list of evicted run_ids.
     """
     connect_to_db(db_path)
-    from pyttd.models.runs import Runs
-    from pyttd.models.frames import ExecutionFrames
-    from pyttd.models.checkpoints import Checkpoint
-    from pyttd.models.io_events import IOEvent
-    initialize_schema([Runs, ExecutionFrames, Checkpoint, IOEvent])
+    initialize_schema()
     try:
         result = _evict_old_runs_internal(keep, dry_run)
         if not dry_run and result:
-            db.execute_sql('VACUUM')
+            db.execute('VACUUM')
         return result
     finally:
         close_db()
@@ -90,12 +102,9 @@ def evict_old_runs(db_path: str, keep: int, dry_run: bool = False) -> list:
 
 def _evict_old_runs_internal(keep: int, dry_run: bool = False) -> list:
     """Evict old runs assuming DB is already connected. Returns list of evicted run_ids."""
-    from pyttd.models.runs import Runs
-    from pyttd.models.frames import ExecutionFrames
-    from pyttd.models.checkpoints import Checkpoint
-    from pyttd.models.io_events import IOEvent
-
-    all_runs = list(Runs.select().order_by(Runs.timestamp_start.desc()))
+    all_runs = db.fetchall(
+        "SELECT run_id FROM runs ORDER BY timestamp_start DESC"
+    )
     if len(all_runs) <= keep:
         return []
 
@@ -107,9 +116,9 @@ def _evict_old_runs_internal(keep: int, dry_run: bool = False) -> list:
 
     with db.atomic():
         for run_id in evicted_ids:
-            IOEvent.delete().where(IOEvent.run_id == run_id).execute()
-            Checkpoint.delete().where(Checkpoint.run_id == run_id).execute()
-            ExecutionFrames.delete().where(ExecutionFrames.run_id == run_id).execute()
-            Runs.delete().where(Runs.run_id == run_id).execute()
+            db.execute("DELETE FROM ioevent WHERE run_id = ?", (run_id,))
+            db.execute("DELETE FROM checkpoint WHERE run_id = ?", (run_id,))
+            db.execute("DELETE FROM executionframes WHERE run_id = ?", (run_id,))
+            db.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
 
     return evicted_ids

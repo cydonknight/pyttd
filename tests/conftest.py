@@ -5,11 +5,7 @@ import pyttd_native
 from pyttd.config import PyttdConfig
 from pyttd.recorder import Recorder
 from pyttd.models import storage
-from pyttd.models.base import db
-from pyttd.models.frames import ExecutionFrames
-from pyttd.models.runs import Runs
-from pyttd.models.checkpoints import Checkpoint
-from pyttd.models.io_events import IOEvent
+from pyttd.models.db import db
 from pyttd.models.storage import delete_db_files, close_db
 
 
@@ -36,10 +32,9 @@ def db_path(tmp_path):
 def db_setup(db_path):
     """Connect to a temp DB, create tables, and close after test."""
     storage.connect_to_db(db_path)
-    storage.initialize_schema([Runs, ExecutionFrames, Checkpoint, IOEvent])
+    storage.initialize_schema()
     yield db_path
     storage.close_db()
-    db.init(None)
 
 @pytest.fixture
 def record_func(tmp_path):
@@ -85,4 +80,3 @@ def record_func(tmp_path):
         except Exception:
             pass
     close_db()
-    db.init(None)

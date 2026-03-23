@@ -4,15 +4,15 @@ import json
 import os
 import pytest
 from pyttd.session import Session, SAFE_BUILTINS
-from pyttd.models.frames import ExecutionFrames
+from pyttd.models.db import db
 
 
 def _enter_replay(session, run_id):
-    first_line = (ExecutionFrames.select()
-                  .where((ExecutionFrames.run_id == run_id) &
-                         (ExecutionFrames.frame_event == 'line'))
-                  .order_by(ExecutionFrames.sequence_no)
-                  .limit(1).first())
+    first_line = db.fetchone(
+        "SELECT * FROM executionframes"
+        " WHERE run_id = ? AND frame_event = 'line'"
+        " ORDER BY sequence_no LIMIT 1",
+        (str(run_id),))
     first_line_seq = first_line.sequence_no if first_line else 0
     session.enter_replay(run_id, first_line_seq)
     return first_line_seq
@@ -66,10 +66,10 @@ class TestBreakpointVerification:
         session = Session()
         _enter_replay(session, run_id)
 
-        foo_line = ExecutionFrames.get_or_none(
-            (ExecutionFrames.run_id == run_id) &
-            (ExecutionFrames.function_name == 'foo') &
-            (ExecutionFrames.frame_event == 'line'))
+        foo_line = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND function_name = 'foo' AND frame_event = 'line'",
+            (str(run_id),))
         assert foo_line is not None
 
         results = session.verify_breakpoints([
@@ -100,10 +100,10 @@ class TestBreakpointVerification:
         session = Session()
         _enter_replay(session, run_id)
 
-        foo_call = ExecutionFrames.get_or_none(
-            (ExecutionFrames.run_id == run_id) &
-            (ExecutionFrames.function_name == 'foo') &
-            (ExecutionFrames.frame_event == 'call'))
+        foo_call = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND function_name = 'foo' AND frame_event = 'call'",
+            (str(run_id),))
         assert foo_call is not None
 
         results = session.verify_breakpoints([
@@ -118,9 +118,10 @@ class TestBreakpointVerification:
         session = Session()
         _enter_replay(session, run_id)
 
-        first = ExecutionFrames.get_or_none(
-            (ExecutionFrames.run_id == run_id) &
-            (ExecutionFrames.frame_event == 'line'))
+        first = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line'",
+            (str(run_id),))
 
         results = session.verify_breakpoints([
             {'file': first.filename, 'line': first.line_no, 'condition': '!!!invalid!!!'}
@@ -134,9 +135,10 @@ class TestBreakpointVerification:
         session = Session()
         _enter_replay(session, run_id)
 
-        first = ExecutionFrames.get_or_none(
-            (ExecutionFrames.run_id == run_id) &
-            (ExecutionFrames.frame_event == 'line'))
+        first = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line'",
+            (str(run_id),))
 
         results = session.verify_breakpoints([
             {'file': first.filename, 'line': first.line_no, 'condition': 'x > 0'}
@@ -163,7 +165,7 @@ class TestMaxFrames:
         from pyttd.config import PyttdConfig
         from pyttd.recorder import Recorder
         from pyttd.models.storage import delete_db_files, close_db
-        from pyttd.models.base import db
+        from pyttd.models.db import db
         import pyttd_native
 
         script_file = tmp_path / "test_script.py"
@@ -203,7 +205,7 @@ class TestPublicAPI:
     def test_start_stop_basic(self, tmp_path):
         from pyttd.main import start_recording, stop_recording
         from pyttd.models.storage import close_db
-        from pyttd.models.base import db
+        from pyttd.models.db import db
 
         db_path = str(tmp_path / "api_test.pyttd.db")
         start_recording(db_path=db_path, checkpoint_interval=0)
@@ -218,7 +220,7 @@ class TestPublicAPI:
     def test_double_start_raises(self, tmp_path):
         from pyttd.main import start_recording, stop_recording
         from pyttd.models.storage import close_db
-        from pyttd.models.base import db
+        from pyttd.models.db import db
 
         db_path = str(tmp_path / "api_test.pyttd.db")
         start_recording(db_path=db_path, checkpoint_interval=0)
@@ -245,7 +247,7 @@ class TestSelectiveRecordingEnhancements:
         from pyttd.config import PyttdConfig
         from pyttd.recorder import Recorder
         from pyttd.models.storage import delete_db_files, close_db
-        from pyttd.models.base import db
+        from pyttd.models.db import db
         import pyttd_native
 
         tmp_path = record_func.__wrapped__(None) if hasattr(record_func, '__wrapped__') else None
@@ -259,7 +261,7 @@ class TestSelectiveRecordingEnhancements:
         from pyttd.config import PyttdConfig
         from pyttd.recorder import Recorder
         from pyttd.models.storage import delete_db_files, close_db
-        from pyttd.models.base import db
+        from pyttd.models.db import db
 
         script_file = tmp_path / "test_script.py"
         script_file.write_text(textwrap.dedent("""\
@@ -284,16 +286,18 @@ class TestSelectiveRecordingEnhancements:
         recorder.stop()
 
         # <module> should be recorded
-        module_events = ExecutionFrames.select().where(
-            (ExecutionFrames.run_id == recorder.run_id) &
-            (ExecutionFrames.function_name == '<module>'))
-        assert module_events.count() > 0, "<module> should always be recorded"
+        module_count = db.fetchval(
+            "SELECT COUNT(*) FROM executionframes"
+            " WHERE run_id = ? AND function_name = '<module>'",
+            (str(recorder.run_id),))
+        assert module_count > 0, "<module> should always be recorded"
 
         # excluded_func should NOT be recorded
-        excluded = ExecutionFrames.select().where(
-            (ExecutionFrames.run_id == recorder.run_id) &
-            (ExecutionFrames.function_name == 'excluded_func'))
-        assert excluded.count() == 0, "excluded_func should not be recorded"
+        excluded_count = db.fetchval(
+            "SELECT COUNT(*) FROM executionframes"
+            " WHERE run_id = ? AND function_name = 'excluded_func'",
+            (str(recorder.run_id),))
+        assert excluded_count == 0, "excluded_func should not be recorded"
 
         recorder.cleanup()
         close_db()
@@ -346,11 +350,11 @@ class TestConditionEvalWithExpandedBuiltins:
         _enter_replay(session, run_id)
 
         # Find a frame where items is set
-        frames = list(ExecutionFrames.select()
-                      .where((ExecutionFrames.run_id == run_id) &
-                             (ExecutionFrames.function_name == 'foo') &
-                             (ExecutionFrames.frame_event == 'line'))
-                      .order_by(ExecutionFrames.sequence_no))
+        frames = db.fetchall(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND function_name = 'foo' AND frame_event = 'line'"
+            " ORDER BY sequence_no",
+            (str(run_id),))
         found = False
         for f in frames:
             if f.locals_snapshot and '"items"' in f.locals_snapshot:
@@ -370,11 +374,11 @@ class TestConditionEvalWithExpandedBuiltins:
         session = Session()
         _enter_replay(session, run_id)
 
-        frames = list(ExecutionFrames.select()
-                      .where((ExecutionFrames.run_id == run_id) &
-                             (ExecutionFrames.function_name == 'foo') &
-                             (ExecutionFrames.frame_event == 'line'))
-                      .order_by(ExecutionFrames.sequence_no))
+        frames = db.fetchall(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND function_name = 'foo' AND frame_event = 'line'"
+            " ORDER BY sequence_no",
+            (str(run_id),))
         found = False
         for f in frames:
             if f.locals_snapshot and '"msg"' in f.locals_snapshot:

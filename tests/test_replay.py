@@ -6,7 +6,7 @@ Cold navigation tests require live checkpoint children (server mode only).
 import json
 import pytest
 from pyttd.replay import ReplayController
-from pyttd.models.frames import ExecutionFrames
+from pyttd.models.db import db
 
 
 def test_warm_goto_frame_basic(record_func):
@@ -22,12 +22,11 @@ def test_warm_goto_frame_basic(record_func):
     controller = ReplayController()
 
     # Get a line event for foo
-    frames = list(ExecutionFrames.select()
-        .where((ExecutionFrames.run_id == run_id) &
-               (ExecutionFrames.function_name == 'foo') &
-               (ExecutionFrames.frame_event == 'line'))
-        .order_by(ExecutionFrames.sequence_no)
-        .limit(1))
+    frames = db.fetchall(
+        "SELECT * FROM executionframes"
+        " WHERE run_id = ? AND function_name = 'foo' AND frame_event = 'line'"
+        " ORDER BY sequence_no LIMIT 1",
+        (str(run_id),))
     assert len(frames) > 0
 
     result = controller.warm_goto_frame(run_id, frames[0].sequence_no)
@@ -59,12 +58,11 @@ def test_warm_goto_frame_return_event(record_func):
 
     controller = ReplayController()
 
-    frames = list(ExecutionFrames.select()
-        .where((ExecutionFrames.run_id == run_id) &
-               (ExecutionFrames.function_name == 'foo') &
-               (ExecutionFrames.frame_event == 'return'))
-        .order_by(ExecutionFrames.sequence_no)
-        .limit(1))
+    frames = db.fetchall(
+        "SELECT * FROM executionframes"
+        " WHERE run_id = ? AND function_name = 'foo' AND frame_event = 'return'"
+        " ORDER BY sequence_no LIMIT 1",
+        (str(run_id),))
     assert len(frames) > 0
 
     result = controller.warm_goto_frame(run_id, frames[0].sequence_no)
@@ -85,12 +83,11 @@ def test_warm_goto_frame_exception_event(record_func):
 
     controller = ReplayController()
 
-    frames = list(ExecutionFrames.select()
-        .where((ExecutionFrames.run_id == run_id) &
-               (ExecutionFrames.function_name == 'foo') &
-               (ExecutionFrames.frame_event == 'exception'))
-        .order_by(ExecutionFrames.sequence_no)
-        .limit(1))
+    frames = db.fetchall(
+        "SELECT * FROM executionframes"
+        " WHERE run_id = ? AND function_name = 'foo' AND frame_event = 'exception'"
+        " ORDER BY sequence_no LIMIT 1",
+        (str(run_id),))
     assert len(frames) > 0
 
     result = controller.warm_goto_frame(run_id, frames[0].sequence_no)
@@ -110,9 +107,9 @@ def test_warm_goto_frame_all_sequences(record_func):
 
     controller = ReplayController()
 
-    frames = list(ExecutionFrames.select()
-        .where(ExecutionFrames.run_id == run_id)
-        .order_by(ExecutionFrames.sequence_no))
+    frames = db.fetchall(
+        "SELECT * FROM executionframes WHERE run_id = ? ORDER BY sequence_no",
+        (str(run_id),))
 
     for f in frames:
         result = controller.warm_goto_frame(run_id, f.sequence_no)
@@ -135,10 +132,9 @@ def test_warm_goto_frame_locals_valid_json(record_func):
 
     controller = ReplayController()
 
-    frames = list(ExecutionFrames.select()
-        .where((ExecutionFrames.run_id == run_id) &
-               (ExecutionFrames.frame_event == 'line'))
-        .order_by(ExecutionFrames.sequence_no))
+    frames = db.fetchall(
+        "SELECT * FROM executionframes WHERE run_id = ? AND frame_event = 'line' ORDER BY sequence_no",
+        (str(run_id),))
 
     for f in frames:
         result = controller.warm_goto_frame(run_id, f.sequence_no)

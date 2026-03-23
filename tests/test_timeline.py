@@ -1,11 +1,8 @@
 """Tests for timeline summary queries."""
+import uuid
 import pytest
 from pyttd.models import storage
-from pyttd.models.base import db
-from pyttd.models.frames import ExecutionFrames
-from pyttd.models.runs import Runs
-from pyttd.models.checkpoints import Checkpoint
-from pyttd.models.io_events import IOEvent
+from pyttd.models.db import db
 from pyttd.models.timeline import get_timeline_summary
 
 
@@ -13,7 +10,7 @@ from pyttd.models.timeline import get_timeline_summary
 def db_setup(tmp_path):
     db_path = str(tmp_path / "test.pyttd.db")
     storage.connect_to_db(db_path)
-    storage.initialize_schema([Runs, ExecutionFrames, Checkpoint, IOEvent])
+    storage.initialize_schema()
     yield db_path
     storage.close_db()
     db.init(None)
@@ -22,31 +19,43 @@ def db_setup(tmp_path):
 @pytest.fixture
 def run_with_frames(db_setup):
     """Create a run with known frame data for testing."""
-    run = Runs.create(
-        script_name="test.py",
-        timestamp_start=1000.0,
-        timestamp_end=1001.0,
-        total_frames=0,
+    run_id = uuid.uuid4().hex
+    db.execute(
+        "INSERT INTO runs (run_id, script_path, timestamp_start, timestamp_end, total_frames)"
+        " VALUES (?, ?, ?, ?, ?)",
+        (run_id, "test.py", 1000.0, 1001.0, 0),
     )
-    return run.run_id
+    db.commit()
+    return run_id
 
 
 def _insert_frames(run_id, frames):
     """Insert frames as dicts with keys: seq, line, file, func, event, depth."""
-    rows = []
+    rid = str(run_id)
+    sql = (
+        "INSERT INTO executionframes"
+        " (run_id, sequence_no, timestamp, line_no, filename,"
+        "  function_name, frame_event, call_depth, locals_snapshot,"
+        "  thread_id, is_coroutine)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+    params = []
     for f in frames:
-        rows.append({
-            'run_id': run_id,
-            'sequence_no': f['seq'],
-            'timestamp': f['seq'] * 0.001,
-            'line_no': f.get('line', 1),
-            'filename': f.get('file', 'test.py'),
-            'function_name': f.get('func', 'main'),
-            'frame_event': f.get('event', 'line'),
-            'call_depth': f.get('depth', 0),
-            'locals_snapshot': '{}',
-        })
-    ExecutionFrames.insert_many(rows).execute()
+        params.append((
+            rid,
+            f['seq'],
+            f['seq'] * 0.001,
+            f.get('line', 1),
+            f.get('file', 'test.py'),
+            f.get('func', 'main'),
+            f.get('event', 'line'),
+            f.get('depth', 0),
+            '{}',
+            0,
+            0,
+        ))
+    db.executemany(sql, params)
+    db.commit()
 
 
 class TestGetTimelineSummary:

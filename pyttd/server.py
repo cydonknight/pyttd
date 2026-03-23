@@ -258,15 +258,13 @@ class PyttdServer:
 
             # Progress notifications during recording
             if self._recording and not self._shutdown and self._rpc and not self._rpc.is_closed:
-                with self._frame_count_lock:
-                    fc = self._frame_count
                 progress_data = {
-                    "frameCount": fc,
                     "elapsedMs": int((time.monotonic() - self._recording_start) * 1000),
                 }
                 try:
                     import pyttd_native
                     stats = pyttd_native.get_recording_stats()
+                    progress_data["frameCount"] = stats.get('frame_count', 0)
                     progress_data["droppedFrames"] = stats.get('dropped_frames', 0)
                     progress_data["poolOverflows"] = stats.get('pool_overflows', 0)
                     progress_data["checkpointCount"] = stats.get('checkpoint_count', 0)
@@ -291,7 +289,7 @@ class PyttdServer:
 
     def _on_recording_complete(self, msg):
         self._recording = False
-        from pyttd.models.frames import ExecutionFrames
+        from pyttd.models.db import db
 
         # If exception, send traceback as stderr output
         error_info = msg.get("error")
@@ -302,11 +300,11 @@ class PyttdServer:
             })
 
         # Find first line event
-        first_line = (ExecutionFrames.select()
-                      .where((ExecutionFrames.run_id == self.recorder.run_id) &
-                             (ExecutionFrames.frame_event == 'line'))
-                      .order_by(ExecutionFrames.sequence_no)
-                      .limit(1).first())
+        first_line = db.fetchone(
+            "SELECT * FROM executionframes "
+            "WHERE run_id = ? AND frame_event = 'line' "
+            "ORDER BY sequence_no LIMIT 1",
+            (str(self.recorder.run_id),))
         first_line_seq = first_line.sequence_no if first_line else 0
 
         self.session.enter_replay(self.recorder.run_id, first_line_seq)
@@ -570,6 +568,10 @@ class PyttdServer:
     def _handle_get_variable_children(self, params: dict) -> dict:
         if self.session.state != "replay":
             return {"error": "not_in_replay"}
+        seq = params.get("seq")
+        var_name = params.get("variableName")
+        if seq is not None and var_name is not None:
+            return {"variables": self.session.get_variable_children_by_name(seq, var_name)}
         ref = params.get("variablesReference", 0)
         return {"variables": self.session.get_variable_children(ref)}
 
@@ -615,10 +617,10 @@ class PyttdServer:
     def _enter_replay_db(self):
         """Enter replay mode from an existing .pyttd.db (no recording)."""
         from pyttd.models import storage
-        from pyttd.models.frames import ExecutionFrames
-        from pyttd.models.runs import Runs
+        from pyttd.models.db import db
 
         storage.connect_to_db(self._db_path)
+        storage.initialize_schema()
 
         if self._target_run_id:
             from pyttd.query import get_run_by_id
@@ -633,9 +635,8 @@ class PyttdServer:
                 self._shutdown = True
                 return
         else:
-            last_run = (Runs.select()
-                        .order_by(Runs.timestamp_start.desc())
-                        .limit(1).first())
+            last_run = db.fetchone(
+                "SELECT * FROM runs ORDER BY timestamp_start DESC LIMIT 1")
         if not last_run:
             if self._rpc and not self._rpc.is_closed:
                 self._rpc.send_notification("output", {
@@ -645,11 +646,11 @@ class PyttdServer:
             self._shutdown = True
             return
 
-        first_line = (ExecutionFrames.select()
-                      .where((ExecutionFrames.run_id == last_run.run_id) &
-                             (ExecutionFrames.frame_event == 'line'))
-                      .order_by(ExecutionFrames.sequence_no)
-                      .limit(1).first())
+        first_line = db.fetchone(
+            "SELECT * FROM executionframes "
+            "WHERE run_id = ? AND frame_event = 'line' "
+            "ORDER BY sequence_no LIMIT 1",
+            (str(last_run.run_id),))
         first_line_seq = first_line.sequence_no if first_line else 0
 
         self.session.enter_replay(last_run.run_id, first_line_seq)

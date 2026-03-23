@@ -1,13 +1,9 @@
 """Timeline summary queries for the scrubber webview.
 
 Aggregates ExecutionFrames data into buckets for canvas rendering.
-This is a query module, not a Peewee model.
+This is a query module, not a model.
 """
-import operator
-from functools import reduce
-
-from peewee import fn, SQL
-from pyttd.models.frames import ExecutionFrames
+from pyttd.models.db import db
 
 
 def get_timeline_summary(run_id, start_seq, end_seq, bucket_count=500,
@@ -22,24 +18,24 @@ def get_timeline_summary(run_id, start_seq, end_seq, bucket_count=500,
         return []
     bucket_size = max(1, total_range // bucket_count)
 
-    bucket_expr = SQL(
-        '(("sequence_no" - ?) / ?)', [start_seq, bucket_size]
-    )
+    # Coerce run_id to str for raw sqlite3 binding (may be UUID)
+    rid = str(run_id)
 
-    rows = (ExecutionFrames.select(
-                fn.MIN(ExecutionFrames.sequence_no).alias('start_seq'),
-                fn.MAX(ExecutionFrames.sequence_no).alias('end_seq'),
-                fn.MAX(ExecutionFrames.call_depth).alias('max_depth'),
-                fn.SUM(SQL("CASE WHEN frame_event IN ('exception', 'exception_unwind') "
-                           "THEN 1 ELSE 0 END")).alias('exc_count'),
-                ExecutionFrames.function_name,
-            )
-            .where((ExecutionFrames.run_id == run_id) &
-                   (ExecutionFrames.sequence_no >= start_seq) &
-                   (ExecutionFrames.sequence_no <= end_seq))
-            .group_by(bucket_expr)
-            .order_by(bucket_expr)
-            .dicts())
+    rows = db.fetchdicts(
+        "SELECT"
+        "  MIN(sequence_no) AS start_seq,"
+        "  MAX(sequence_no) AS end_seq,"
+        "  MAX(call_depth) AS max_depth,"
+        "  SUM(CASE WHEN frame_event IN ('exception', 'exception_unwind')"
+        "       THEN 1 ELSE 0 END) AS exc_count,"
+        "  function_name"
+        " FROM executionframes"
+        " WHERE run_id = ? AND sequence_no >= ? AND sequence_no <= ?"
+        " GROUP BY ((sequence_no - ?) / ?)"
+        " ORDER BY ((sequence_no - ?) / ?)",
+        (rid, start_seq, end_seq, start_seq, bucket_size,
+         start_seq, bucket_size),
+    )
 
     # Build breakpoint lookup set for O(1) matching
     bp_set = set()
@@ -50,20 +46,24 @@ def get_timeline_summary(run_id, start_seq, end_seq, bucket_count=500,
     # Single-query optimization: find all breakpoint-matching seqs in range
     bp_buckets = set()
     if bp_set:
-        conditions = [
-            ((ExecutionFrames.filename == f) & (ExecutionFrames.line_no == l))
-            for f, l in bp_set
-        ]
-        bp_hits = (
-            row.sequence_no for row in
-            ExecutionFrames.select(ExecutionFrames.sequence_no)
-            .where((ExecutionFrames.run_id == run_id) &
-                   (ExecutionFrames.sequence_no >= start_seq) &
-                   (ExecutionFrames.sequence_no <= end_seq) &
-                   (ExecutionFrames.frame_event == 'line') &
-                   reduce(operator.or_, conditions))
+        bp_list = list(bp_set)
+        conditions = " OR ".join(
+            "(filename = ? AND line_no = ?)" for _ in bp_list
         )
-        bp_buckets = {(seq - start_seq) // bucket_size for seq in bp_hits}
+        params = [rid, start_seq, end_seq]
+        for f, l in bp_list:
+            params.append(f)
+            params.append(l)
+
+        bp_hits = db.fetchall(
+            "SELECT sequence_no FROM executionframes"
+            " WHERE run_id = ? AND sequence_no >= ? AND sequence_no <= ?"
+            "   AND frame_event = 'line'"
+            "   AND (" + conditions + ")",
+            params,
+        )
+        bp_buckets = {(row.sequence_no - start_seq) // bucket_size
+                      for row in bp_hits}
 
     buckets = []
     for row in rows:

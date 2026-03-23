@@ -7,6 +7,7 @@
 #include "recorder.h"
 #include "ringbuf.h"
 #include "iohook.h"
+#include "sqliteflush.h"
 
 #ifdef PYTTD_HAS_FORK
 
@@ -270,6 +271,9 @@ static void checkpoint_child_init(int cmd_pipe[2], int result_pipe[2],
 
     /* 7. Free ring buffer memory */
     ringbuf_system_destroy();
+
+    /* 7b. Close inherited flush SQLite connection (parent owns the transaction) */
+    sqliteflush_close_child();
 
     /* 8. Close inherited file descriptors */
     close(cmd_pipe[1]);     /* child doesn't write to cmd */

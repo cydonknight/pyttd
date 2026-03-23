@@ -3,11 +3,8 @@
 Currently supports Perfetto/Chrome Trace Event Format.
 """
 import json
+from pyttd.models.db import db
 from pyttd.models import storage
-from pyttd.models.frames import ExecutionFrames
-from pyttd.models.runs import Runs
-from pyttd.models.checkpoints import Checkpoint
-from pyttd.models.io_events import IOEvent
 
 
 def export_perfetto(db_path: str, output_path: str, run_id: int | None = None):
@@ -18,11 +15,11 @@ def export_perfetto(db_path: str, output_path: str, run_id: int | None = None):
     """
     storage.connect_to_db(db_path)
     try:
-        storage.initialize_schema([Runs, ExecutionFrames, Checkpoint, IOEvent])
+        storage.initialize_schema()
         if run_id is None:
-            last_run = (Runs.select()
-                        .order_by(Runs.timestamp_start.desc())
-                        .limit(1).first())
+            last_run = db.fetchone(
+                "SELECT * FROM runs ORDER BY timestamp_start DESC LIMIT 1"
+            )
             if not last_run:
                 with open(output_path, 'w') as f:
                     json.dump({"traceEvents": []}, f)
@@ -32,9 +29,10 @@ def export_perfetto(db_path: str, output_path: str, run_id: int | None = None):
         with open(output_path, 'w') as f:
             f.write('{"traceEvents": [')
             first = True
-            for frame in ExecutionFrames.select().where(
-                ExecutionFrames.run_id == run_id
-            ).order_by(ExecutionFrames.sequence_no).iterator():
+            for frame in db.iterate(
+                "SELECT * FROM executionframes WHERE run_id = ? ORDER BY sequence_no",
+                (run_id,),
+            ):
                 ts_us = int(frame.timestamp * 1_000_000)
                 tid = frame.thread_id or 0
                 base = {

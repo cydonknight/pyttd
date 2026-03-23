@@ -175,8 +175,8 @@ install_signal_handler()  # First USR1 arms, second disarms
 - Exception breakpoint filters (uncaught, all raised)
 - Function breakpoints, data breakpoints, conditional breakpoints, hit conditions, log points
 - Variable history tracking across the recording
-- Breakpoint verification — validates that breakpoints target executable lines
-- Status bar with recording progress (frame count, dropped frames, DB size)
+- Breakpoint verification — validates that breakpoints target executable lines; condition eval errors shown in Debug Console
+- Status bar with recording progress (frame count, dropped frames, DB size, checkpoint count and memory)
 - Keyboard shortcuts: Ctrl+Shift+F11 (step back), Ctrl+Shift+F5 (reverse continue)
 
 ### Analysis & Export
@@ -189,7 +189,7 @@ install_signal_handler()  # First USR1 arms, second disarms
 - Multi-run storage — multiple recording runs in a single database
 - Run eviction — `--keep-runs N` auto-evicts old runs; `pyttd clean --keep N` for manual cleanup
 - Custom DB paths — `--db-path` overrides the default `<script>.pyttd.db` location
-- Size monitoring — `--max-db-size` warns when the database exceeds a threshold
+- Size monitoring — `--max-db-size` auto-stops recording when the database exceeds a threshold
 - Run selection — `--run-id` to query, replay, or export a specific run by UUID or prefix
 
 ## CLI Reference
@@ -221,9 +221,9 @@ Options:
   --include-file GLOB               Only record functions in files matching this glob (repeatable)
   --exclude FUNC                    Exclude functions matching this pattern (repeatable)
   --exclude-file GLOB               Exclude files matching this glob (repeatable)
-  --max-frames N                    Stop recording after N frames (0 = unlimited)
+  --max-frames N                    Stop recording after approximately N frames (0 = unlimited)
   --db-path PATH                    Custom database path (default: <script>.pyttd.db)
-  --max-db-size MB                  Warn when DB exceeds this size in MB (0 = unlimited)
+  --max-db-size MB                  Auto-stop recording when DB exceeds this size in MB (0 = unlimited)
   --keep-runs N                     Keep only last N runs, evict older (0 = keep all)
   --checkpoint-memory-limit MB      Checkpoint memory limit in MB (0 = unlimited)
 ```
@@ -314,8 +314,10 @@ See [docs/architecture.md](docs/architecture.md) for the full design.
 - `exception_unwind` line number is from function entry, not the exception site
 - Variable repr strings are capped at 256 characters
 - Expandable variable children are capped at 50 entries, 1 level deep
-- Attach mode (`arm()`) disables checkpoints — cold navigation is unavailable for attached recordings
+- Attach mode (`arm()`) disables checkpoints — cold navigation is unavailable for attached recordings; the initial call stack is synthesized from frame inspection at arm time
 - Tight loops with per-line events have high overhead (hundreds of times slower); use `--include` to scope recording for compute-heavy code
+- `--max-frames` is approximate — the actual frame count may slightly exceed the limit because events already in flight complete before the stop signal takes effect
+- Log points capture only the first hit per `continue` — if a log breakpoint's line executes multiple times before the next stopping point, only the first occurrence is logged
 
 ## Testing
 

@@ -6,17 +6,17 @@ data breakpoints, and REPL evaluation.
 import json
 import os
 
-from pyttd.models.frames import ExecutionFrames
+from pyttd.models.db import db
 from pyttd.session import Session
 
 
 def _setup_session(run_id):
     session = Session()
-    first_line = (ExecutionFrames.select(ExecutionFrames.sequence_no)
-                  .where((ExecutionFrames.run_id == run_id) &
-                         (ExecutionFrames.frame_event == 'line'))
-                  .order_by(ExecutionFrames.sequence_no)
-                  .first())
+    first_line = db.fetchone(
+        "SELECT sequence_no FROM executionframes"
+        " WHERE run_id = ? AND frame_event = 'line'"
+        " ORDER BY sequence_no LIMIT 1",
+        (str(run_id),))
     session.enter_replay(run_id, first_line.sequence_no)
     return session
 
@@ -75,9 +75,9 @@ class TestFunctionBreakpoints:
         result = session.continue_forward()
         assert result['reason'] == 'function breakpoint'
         # Verify we stopped at or after bar's call
-        stopped_frame = ExecutionFrames.get_or_none(
-            (ExecutionFrames.run_id == run_id) &
-            (ExecutionFrames.sequence_no == result['seq']))
+        stopped_frame = db.fetchone(
+            "SELECT * FROM executionframes WHERE run_id = ? AND sequence_no = ?",
+            (str(run_id), result['seq']))
         assert stopped_frame is not None
 
     def test_reverse_continue_hits_function_breakpoint(self, record_func):
@@ -108,12 +108,11 @@ class TestHitCountBreakpoints:
         ''')
         session = _setup_session(run_id)
         # Find a line that gets hit multiple times
-        frame = (ExecutionFrames.select()
-                 .where((ExecutionFrames.run_id == run_id) &
-                        (ExecutionFrames.frame_event == 'line') &
-                        (ExecutionFrames.locals_snapshot.contains('"x"')))
-                 .order_by(ExecutionFrames.sequence_no)
-                 .first())
+        frame = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line' AND locals_snapshot LIKE '%\"x\"%'"
+            " ORDER BY sequence_no LIMIT 1",
+            (str(run_id),))
         assert frame is not None
         session.set_breakpoints([{
             'file': frame.filename,
@@ -130,12 +129,11 @@ class TestHitCountBreakpoints:
                 x = i * 2
         ''')
         session = _setup_session(run_id)
-        frame = (ExecutionFrames.select()
-                 .where((ExecutionFrames.run_id == run_id) &
-                        (ExecutionFrames.frame_event == 'line') &
-                        (ExecutionFrames.locals_snapshot.contains('"x"')))
-                 .order_by(ExecutionFrames.sequence_no)
-                 .first())
+        frame = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line' AND locals_snapshot LIKE '%\"x\"%'"
+            " ORDER BY sequence_no LIMIT 1",
+            (str(run_id),))
         assert frame is not None
         session.set_breakpoints([{
             'file': frame.filename,
@@ -170,12 +168,11 @@ class TestLogPoints:
         ''')
         session = _setup_session(run_id)
         # Find frame where x is defined
-        frame = (ExecutionFrames.select()
-                 .where((ExecutionFrames.run_id == run_id) &
-                        (ExecutionFrames.frame_event == 'line') &
-                        (ExecutionFrames.locals_snapshot.contains('"x"')))
-                 .order_by(ExecutionFrames.sequence_no)
-                 .first())
+        frame = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line' AND locals_snapshot LIKE '%\"x\"%'"
+            " ORDER BY sequence_no LIMIT 1",
+            (str(run_id),))
         assert frame is not None
         msg = session._format_log_message("x = {x}", frame.sequence_no)
         assert "42" in msg
@@ -186,12 +183,11 @@ class TestLogPoints:
                 x = i
         ''')
         session = _setup_session(run_id)
-        frame = (ExecutionFrames.select()
-                 .where((ExecutionFrames.run_id == run_id) &
-                        (ExecutionFrames.frame_event == 'line') &
-                        (ExecutionFrames.locals_snapshot.contains('"x"')))
-                 .order_by(ExecutionFrames.sequence_no)
-                 .first())
+        frame = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line' AND locals_snapshot LIKE '%\"x\"%'"
+            " ORDER BY sequence_no LIMIT 1",
+            (str(run_id),))
         assert frame is not None
         # Set a log point (has logMessage) and a regular breakpoint elsewhere
         session.set_breakpoints([{
@@ -226,9 +222,9 @@ class TestDataBreakpoints:
         result = session.continue_forward()
         assert result['reason'] == 'data breakpoint'
         # Verify we stopped at a frame where x changed
-        stopped = ExecutionFrames.get_or_none(
-            (ExecutionFrames.run_id == run_id) &
-            (ExecutionFrames.sequence_no == result['seq']))
+        stopped = db.fetchone(
+            "SELECT * FROM executionframes WHERE run_id = ? AND sequence_no = ?",
+            (str(run_id), result['seq']))
         assert stopped is not None
 
     def test_data_breakpoint_reverse(self, record_func):
@@ -251,12 +247,11 @@ class TestDataBreakpoints:
         ''')
         session = _setup_session(run_id)
         # Find frame with x
-        frame = (ExecutionFrames.select()
-                 .where((ExecutionFrames.run_id == run_id) &
-                        (ExecutionFrames.frame_event == 'line') &
-                        (ExecutionFrames.locals_snapshot.contains('"x"')))
-                 .order_by(ExecutionFrames.sequence_no)
-                 .first())
+        frame = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line' AND locals_snapshot LIKE '%\"x\"%'"
+            " ORDER BY sequence_no LIMIT 1",
+            (str(run_id),))
         assert frame is not None
         val = session._get_variable_value_at(frame.sequence_no, 'x')
         assert val is not None
@@ -272,12 +267,11 @@ class TestReplEvaluation:
         ''')
         session = _setup_session(run_id)
         # Find frame with x
-        frame = (ExecutionFrames.select()
-                 .where((ExecutionFrames.run_id == run_id) &
-                        (ExecutionFrames.frame_event == 'line') &
-                        (ExecutionFrames.locals_snapshot.contains('"x"')))
-                 .order_by(ExecutionFrames.sequence_no)
-                 .first())
+        frame = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line' AND locals_snapshot LIKE '%\"x\"%'"
+            " ORDER BY sequence_no LIMIT 1",
+            (str(run_id),))
         assert frame is not None
         result = session.evaluate_at(frame.sequence_no, 'x', 'repl')
         # Should NOT contain the old blocking message
@@ -291,20 +285,19 @@ class TestReplEvaluation:
         ''')
         session = _setup_session(run_id)
         # Find any line event with locals
-        frame = (ExecutionFrames.select()
-                 .where((ExecutionFrames.run_id == run_id) &
-                        (ExecutionFrames.frame_event == 'line') &
-                        (ExecutionFrames.locals_snapshot.is_null(False)) &
-                        (ExecutionFrames.locals_snapshot != '{}'))
-                 .order_by(ExecutionFrames.sequence_no)
-                 .first())
+        frame = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line'"
+            " AND locals_snapshot IS NOT NULL AND locals_snapshot != '{}'"
+            " ORDER BY sequence_no LIMIT 1",
+            (str(run_id),))
         if frame is None:
             # If no locals captured, just test with the first line event
-            frame = (ExecutionFrames.select()
-                     .where((ExecutionFrames.run_id == run_id) &
-                            (ExecutionFrames.frame_event == 'line'))
-                     .order_by(ExecutionFrames.sequence_no)
-                     .first())
+            frame = db.fetchone(
+                "SELECT * FROM executionframes"
+                " WHERE run_id = ? AND frame_event = 'line'"
+                " ORDER BY sequence_no LIMIT 1",
+                (str(run_id),))
         assert frame is not None
         result = session.evaluate_at(frame.sequence_no, 'nonexistent', 'repl')
         # REPL returns context-aware error message for missing variables

@@ -1,28 +1,27 @@
 """Tests for expandable variable trees (Phase 10A)."""
 import json
 
-from pyttd.models.frames import ExecutionFrames
+from pyttd.models.db import db
 from pyttd.session import Session
 
 
 def _setup_session(run_id):
     session = Session()
-    first_line = (ExecutionFrames.select(ExecutionFrames.sequence_no)
-                  .where((ExecutionFrames.run_id == run_id) &
-                         (ExecutionFrames.frame_event == 'line'))
-                  .order_by(ExecutionFrames.sequence_no)
-                  .first())
+    first_line = db.fetchone(
+        "SELECT sequence_no FROM executionframes"
+        " WHERE run_id = ? AND frame_event = 'line'"
+        " ORDER BY sequence_no LIMIT 1",
+        (str(run_id),))
     session.enter_replay(run_id, first_line.sequence_no)
     return session
 
 
 def _find_frame_with_var(run_id, var_name):
-    return (ExecutionFrames.select()
-            .where((ExecutionFrames.run_id == run_id) &
-                   (ExecutionFrames.frame_event == 'line') &
-                   (ExecutionFrames.locals_snapshot.contains(f'"{var_name}"')))
-            .order_by(ExecutionFrames.sequence_no.desc())
-            .first())
+    return db.fetchone(
+        "SELECT * FROM executionframes"
+        " WHERE run_id = ? AND frame_event = 'line' AND locals_snapshot LIKE ?"
+        " ORDER BY sequence_no DESC LIMIT 1",
+        (str(run_id), f'%"{var_name}"%'))
 
 
 class TestExpandableVariables:
@@ -184,3 +183,61 @@ class TestExpandableVariables:
         if t_var['variablesReference'] > 0:
             children = session.get_variable_children(t_var['variablesReference'])
             assert len(children) == 3
+
+    def test_children_by_name_without_get_variables(self, record_func):
+        """get_variable_children_by_name works without prior get_variables_at."""
+        db_path, run_id, _ = record_func('''
+            d = {"x": 10, "y": 20}
+            _ = d
+        ''')
+        session = _setup_session(run_id)
+        frame = _find_frame_with_var(run_id, 'd')
+        assert frame is not None
+        # Call directly — no get_variables_at, cache is empty
+        assert len(session._var_ref_cache) == 0
+        children = session.get_variable_children_by_name(frame.sequence_no, 'd')
+        assert len(children) == 2
+        child_keys = {c['name'] for c in children}
+        assert "'x'" in child_keys or 'x' in child_keys
+
+    def test_children_by_name_matches_cache_path(self, record_func):
+        """Both access paths return identical results."""
+        db_path, run_id, _ = record_func('''
+            d = {"a": 1, "b": 2, "c": 3}
+            _ = d
+        ''')
+        session = _setup_session(run_id)
+        frame = _find_frame_with_var(run_id, 'd')
+        assert frame is not None
+        # Cache path
+        variables = session.get_variables_at(frame.sequence_no)
+        d_var = next((v for v in variables if v['name'] == 'd'), None)
+        assert d_var is not None and d_var['variablesReference'] > 0
+        via_cache = session.get_variable_children(d_var['variablesReference'])
+        # Direct path
+        via_name = session.get_variable_children_by_name(frame.sequence_no, 'd')
+        assert via_cache == via_name
+
+    def test_children_by_name_nonexistent_variable(self, record_func):
+        """Nonexistent variable returns empty list, no crash."""
+        db_path, run_id, _ = record_func('''
+            x = 42
+            _ = x
+        ''')
+        session = _setup_session(run_id)
+        frame = _find_frame_with_var(run_id, 'x')
+        assert frame is not None
+        children = session.get_variable_children_by_name(frame.sequence_no, 'nonexistent')
+        assert children == []
+
+    def test_children_by_name_primitive_variable(self, record_func):
+        """Primitive variable has no children."""
+        db_path, run_id, _ = record_func('''
+            x = 42
+            _ = x
+        ''')
+        session = _setup_session(run_id)
+        frame = _find_frame_with_var(run_id, 'x')
+        assert frame is not None
+        children = session.get_variable_children_by_name(frame.sequence_no, 'x')
+        assert children == []

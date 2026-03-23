@@ -13,11 +13,7 @@ import pyttd_native
 from pyttd.config import PyttdConfig
 from pyttd.main import arm, disarm, ArmContext, install_signal_handler, _active_recorder
 from pyttd.models import storage
-from pyttd.models.base import db
-from pyttd.models.frames import ExecutionFrames
-from pyttd.models.runs import Runs
-from pyttd.models.checkpoints import Checkpoint
-from pyttd.models.io_events import IOEvent
+from pyttd.models.db import db
 from pyttd.models.storage import delete_db_files, close_db
 from pyttd.recorder import Recorder
 
@@ -69,10 +65,10 @@ def test_arm_from_nested_function(db_path):
     level1()
 
     storage.connect_to_db(db_path)
-    storage.initialize_schema([Runs, ExecutionFrames, Checkpoint, IOEvent])
+    storage.initialize_schema()
     try:
-        frames = list(ExecutionFrames.select()
-                       .order_by(ExecutionFrames.sequence_no))
+        frames = db.fetchall(
+            "SELECT * FROM executionframes ORDER BY sequence_no")
         # First events should be synthetic calls for the existing stack
         call_frames = [f for f in frames if f.frame_event == 'call']
         # There should be synthetic call events for the frames above arm()
@@ -99,11 +95,10 @@ def test_arm_synthetic_locals(db_path):
     disarm()
 
     storage.connect_to_db(db_path)
-    storage.initialize_schema([Runs, ExecutionFrames, Checkpoint, IOEvent])
+    storage.initialize_schema()
     try:
-        frames = list(ExecutionFrames.select()
-                       .where(ExecutionFrames.frame_event == 'call')
-                       .order_by(ExecutionFrames.sequence_no))
+        frames = db.fetchall(
+            "SELECT * FROM executionframes WHERE frame_event = 'call' ORDER BY sequence_no")
         # At least one synthetic call should have locals
         has_locals = any(f.locals_snapshot and f.locals_snapshot != '{}'
                          for f in frames)
@@ -128,11 +123,10 @@ def test_arm_filters_applied(db_path):
     disarm()
 
     storage.connect_to_db(db_path)
-    storage.initialize_schema([Runs, ExecutionFrames, Checkpoint, IOEvent])
+    storage.initialize_schema()
     try:
-        frames = list(ExecutionFrames.select()
-                       .where(ExecutionFrames.frame_event == 'call')
-                       .order_by(ExecutionFrames.sequence_no))
+        frames = db.fetchall(
+            "SELECT * FROM executionframes WHERE frame_event = 'call' ORDER BY sequence_no")
         # Synthetic call events should not include frozen modules
         for f in frames:
             # Raw frozen filenames start with '<frozen ' but get realpath'd
@@ -151,10 +145,10 @@ def test_arm_from_module_level(db_path):
     disarm()
 
     storage.connect_to_db(db_path)
-    storage.initialize_schema([Runs, ExecutionFrames, Checkpoint, IOEvent])
+    storage.initialize_schema()
     try:
-        frames = list(ExecutionFrames.select()
-                       .order_by(ExecutionFrames.sequence_no))
+        frames = db.fetchall(
+            "SELECT * FROM executionframes ORDER BY sequence_no")
         # First synthetic call should be at depth 0
         call_frames = [f for f in frames if f.frame_event == 'call']
         assert len(call_frames) >= 1
@@ -181,15 +175,15 @@ def test_step_back_after_arm(db_path):
     disarm()
 
     storage.connect_to_db(db_path)
-    storage.initialize_schema([Runs, ExecutionFrames, Checkpoint, IOEvent])
+    storage.initialize_schema()
     try:
-        run = Runs.select().order_by(Runs.timestamp_start.desc()).get()
+        run = db.fetchone("SELECT * FROM runs ORDER BY timestamp_start DESC LIMIT 1")
         # Get first line event to init session
-        first_line = (ExecutionFrames.select()
-                      .where((ExecutionFrames.run_id == run.run_id) &
-                             (ExecutionFrames.frame_event == 'line'))
-                      .order_by(ExecutionFrames.sequence_no)
-                      .first())
+        first_line = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line'"
+            " ORDER BY sequence_no LIMIT 1",
+            (str(run.run_id),))
         assert first_line is not None
         session = Session()
         session.enter_replay(run.run_id, first_line.sequence_no)
@@ -224,22 +218,22 @@ def test_stack_reconstruction(db_path):
     disarm()
 
     storage.connect_to_db(db_path)
-    storage.initialize_schema([Runs, ExecutionFrames, Checkpoint, IOEvent])
+    storage.initialize_schema()
     try:
-        run = Runs.select().order_by(Runs.timestamp_start.desc()).get()
+        run = db.fetchone("SELECT * FROM runs ORDER BY timestamp_start DESC LIMIT 1")
         # Find a line event inside inner_work — nested names include scope
-        inner_frames = list(ExecutionFrames.select()
-                            .where((ExecutionFrames.run_id == run.run_id) &
-                                   (ExecutionFrames.function_name.contains('inner_work')) &
-                                   (ExecutionFrames.frame_event == 'line'))
-                            .order_by(ExecutionFrames.sequence_no))
+        inner_frames = db.fetchall(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND function_name LIKE '%inner_work%' AND frame_event = 'line'"
+            " ORDER BY sequence_no",
+            (str(run.run_id),))
         if inner_frames:
             # Need to enter_replay with first line event, not inner_frames[0]
-            first_line = (ExecutionFrames.select()
-                          .where((ExecutionFrames.run_id == run.run_id) &
-                                 (ExecutionFrames.frame_event == 'line'))
-                          .order_by(ExecutionFrames.sequence_no)
-                          .first())
+            first_line = db.fetchone(
+                "SELECT * FROM executionframes"
+                " WHERE run_id = ? AND frame_event = 'line'"
+                " ORDER BY sequence_no LIMIT 1",
+                (str(run.run_id),))
             session = Session()
             session.enter_replay(run.run_id, first_line.sequence_no)
             # Navigate to the inner_work line event
@@ -270,11 +264,11 @@ def test_arm_context_manager(db_path):
 
     # Verify recording stopped
     storage.connect_to_db(db_path)
-    storage.initialize_schema([Runs, ExecutionFrames, Checkpoint, IOEvent])
+    storage.initialize_schema()
     try:
-        runs = list(Runs.select())
+        runs = db.fetchall("SELECT * FROM runs")
         assert len(runs) == 1
-        frames = list(ExecutionFrames.select())
+        frames = db.fetchall("SELECT * FROM executionframes")
         assert len(frames) > 0
     finally:
         close_db()
@@ -308,9 +302,9 @@ def test_no_checkpoints_in_attach(db_path):
     disarm()
 
     storage.connect_to_db(db_path)
-    storage.initialize_schema([Runs, ExecutionFrames, Checkpoint, IOEvent])
+    storage.initialize_schema()
     try:
-        checkpoints = list(Checkpoint.select())
+        checkpoints = db.fetchall("SELECT * FROM checkpoint")
         assert len(checkpoints) == 0
     finally:
         close_db()
@@ -323,10 +317,10 @@ def test_runs_is_attach_flag(db_path):
     disarm()
 
     storage.connect_to_db(db_path)
-    storage.initialize_schema([Runs, ExecutionFrames, Checkpoint, IOEvent])
+    storage.initialize_schema()
     try:
-        run = Runs.select().order_by(Runs.timestamp_start.desc()).get()
-        assert run.is_attach is True
+        run = db.fetchone("SELECT * FROM runs ORDER BY timestamp_start DESC LIMIT 1")
+        assert run.is_attach
     finally:
         close_db()
         db.init(None)
@@ -344,10 +338,10 @@ def test_events_after_arm(db_path):
     disarm()
 
     storage.connect_to_db(db_path)
-    storage.initialize_schema([Runs, ExecutionFrames, Checkpoint, IOEvent])
+    storage.initialize_schema()
     try:
-        frames = list(ExecutionFrames.select()
-                       .order_by(ExecutionFrames.sequence_no))
+        frames = db.fetchall(
+            "SELECT * FROM executionframes ORDER BY sequence_no")
         # Nested function names include enclosing scope (e.g. "test_x.<locals>.work")
         work_frames = [f for f in frames if 'work' in f.function_name]
         assert len(work_frames) >= 3  # call + lines + return
@@ -384,9 +378,9 @@ def test_signal_handler_toggle(db_path):
 
     # Verify recording was saved
     storage.connect_to_db(db_path)
-    storage.initialize_schema([Runs, ExecutionFrames, Checkpoint, IOEvent])
+    storage.initialize_schema()
     try:
-        frames = list(ExecutionFrames.select())
+        frames = db.fetchall("SELECT * FROM executionframes")
         assert len(frames) > 0
     finally:
         close_db()

@@ -9,9 +9,8 @@ import pytest
 import pyttd_native
 from pyttd.config import PyttdConfig
 from pyttd.recorder import Recorder
-from pyttd.models.frames import ExecutionFrames
+from pyttd.models.db import db
 from pyttd.models.storage import delete_db_files, close_db
-from pyttd.models.base import db
 
 
 def _record_with_include(tmp_path, script_content, include_functions):
@@ -51,10 +50,10 @@ class TestSelectiveRecording:
             other_func()
         ''', include_functions=['target_func'])
         try:
-            funcs = set(f.function_name for f in
-                        ExecutionFrames.select(ExecutionFrames.function_name)
-                        .where(ExecutionFrames.run_id == run_id)
-                        .distinct())
+            rows = db.fetchall(
+                "SELECT DISTINCT function_name FROM executionframes WHERE run_id = ?",
+                (str(run_id),))
+            funcs = set(r.function_name for r in rows)
             assert 'target_func' in funcs
             assert 'other_func' not in funcs
             assert '<module>' in funcs  # module-level always recorded
@@ -75,10 +74,10 @@ class TestSelectiveRecording:
             unrelated()
         ''', include_functions=['process'])
         try:
-            funcs = set(f.function_name for f in
-                        ExecutionFrames.select(ExecutionFrames.function_name)
-                        .where(ExecutionFrames.run_id == run_id)
-                        .distinct())
+            rows = db.fetchall(
+                "SELECT DISTINCT function_name FROM executionframes WHERE run_id = ?",
+                (str(run_id),))
+            funcs = set(r.function_name for r in rows)
             assert 'process_data' in funcs
             assert 'unrelated' not in funcs
         finally:
@@ -95,10 +94,10 @@ class TestSelectiveRecording:
             foo()
             bar()
         ''')
-        funcs = set(f.function_name for f in
-                    ExecutionFrames.select(ExecutionFrames.function_name)
-                    .where(ExecutionFrames.run_id == run_id)
-                    .distinct())
+        rows = db.fetchall(
+            "SELECT DISTINCT function_name FROM executionframes WHERE run_id = ?",
+            (str(run_id),))
+        funcs = set(r.function_name for r in rows)
         assert 'foo' in funcs
         assert 'bar' in funcs
 
@@ -111,10 +110,10 @@ class TestSelectiveRecording:
             target()
         ''', include_functions=['target'])
         try:
-            funcs = set(f.function_name for f in
-                        ExecutionFrames.select(ExecutionFrames.function_name)
-                        .where(ExecutionFrames.run_id == run_id)
-                        .distinct())
+            rows = db.fetchall(
+                "SELECT DISTINCT function_name FROM executionframes WHERE run_id = ?",
+                (str(run_id),))
+            funcs = set(r.function_name for r in rows)
             assert '<module>' in funcs
             assert 'target' in funcs
         finally:
@@ -141,10 +140,10 @@ class TestSelectiveRecording:
             target()
         ''', include_functions=['target'])
         try:
-            funcs = set(f.function_name for f in
-                        ExecutionFrames.select(ExecutionFrames.function_name)
-                        .where(ExecutionFrames.run_id == run_id)
-                        .distinct())
+            rows = db.fetchall(
+                "SELECT DISTINCT function_name FROM executionframes WHERE run_id = ?",
+                (str(run_id),))
+            funcs = set(r.function_name for r in rows)
             assert 'target' in funcs
             # stdlib functions should not appear
             assert 'getcwd' not in funcs
@@ -166,10 +165,10 @@ class TestSelectiveRecording:
             my_process()
         ''', include_functions=['process_*'])
         try:
-            funcs = set(f.function_name for f in
-                        ExecutionFrames.select(ExecutionFrames.function_name)
-                        .where(ExecutionFrames.run_id == run_id)
-                        .distinct())
+            rows = db.fetchall(
+                "SELECT DISTINCT function_name FROM executionframes WHERE run_id = ?",
+                (str(run_id),))
+            funcs = set(r.function_name for r in rows)
             assert 'process_data' in funcs
             assert 'my_process' not in funcs
         finally:
@@ -190,10 +189,10 @@ class TestSelectiveRecording:
             test_ab()
         ''', include_functions=['test_?'])
         try:
-            funcs = set(f.function_name for f in
-                        ExecutionFrames.select(ExecutionFrames.function_name)
-                        .where(ExecutionFrames.run_id == run_id)
-                        .distinct())
+            rows = db.fetchall(
+                "SELECT DISTINCT function_name FROM executionframes WHERE run_id = ?",
+                (str(run_id),))
+            funcs = set(r.function_name for r in rows)
             assert 'test_a' in funcs
             assert 'test_ab' not in funcs
         finally:
@@ -213,10 +212,10 @@ class TestSelectiveRecording:
             unrelated()
         ''', include_functions=['process'])
         try:
-            funcs = set(f.function_name for f in
-                        ExecutionFrames.select(ExecutionFrames.function_name)
-                        .where(ExecutionFrames.run_id == run_id)
-                        .distinct())
+            rows = db.fetchall(
+                "SELECT DISTINCT function_name FROM executionframes WHERE run_id = ?",
+                (str(run_id),))
+            funcs = set(r.function_name for r in rows)
             assert 'process_data' in funcs
             assert 'unrelated' not in funcs
         finally:
@@ -235,10 +234,10 @@ class TestSelectiveRecording:
             bar()
         ''', include_functions=['foo'])
         try:
-            funcs1 = set(f.function_name for f in
-                         ExecutionFrames.select(ExecutionFrames.function_name)
-                         .where(ExecutionFrames.run_id == run_id1)
-                         .distinct())
+            rows = db.fetchall(
+                "SELECT DISTINCT function_name FROM executionframes WHERE run_id = ?",
+                (str(run_id1),))
+            funcs1 = set(r.function_name for r in rows)
             assert 'foo' in funcs1
             assert 'bar' not in funcs1
         finally:
@@ -271,10 +270,10 @@ class TestSelectiveRecording:
         recorder.stop()
         run_id2 = recorder.run_id
         try:
-            funcs2 = set(f.function_name for f in
-                         ExecutionFrames.select(ExecutionFrames.function_name)
-                         .where(ExecutionFrames.run_id == run_id2)
-                         .distinct())
+            rows = db.fetchall(
+                "SELECT DISTINCT function_name FROM executionframes WHERE run_id = ?",
+                (str(run_id2),))
+            funcs2 = set(r.function_name for r in rows)
             assert 'foo' in funcs2
             assert 'bar' in funcs2
         finally:

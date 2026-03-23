@@ -1,7 +1,7 @@
 import json
 import logging
 import os
-from pyttd.models.frames import ExecutionFrames
+from pyttd.models.db import db
 from pyttd.replay import ReplayController
 
 logger = logging.getLogger(__name__)
@@ -58,6 +58,34 @@ class Session:
         self.current_thread_id = None
         self.known_threads = {}  # {thread_id: "Thread Name"}
 
+    # --- Private query helpers ---
+
+    def _fetch_frame(self, seq):
+        """Single frame by sequence_no."""
+        return db.fetchone(
+            "SELECT * FROM executionframes WHERE run_id = ? AND sequence_no = ?",
+            (str(self.run_id), seq))
+
+    def _fetch_line_after(self, after_seq, extra_conditions="", extra_params=()):
+        """First line event after after_seq."""
+        return db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line'"
+            " AND sequence_no > ?"
+            + extra_conditions +
+            " ORDER BY sequence_no LIMIT 1",
+            (str(self.run_id), after_seq) + extra_params)
+
+    def _fetch_line_before(self, before_seq, extra_conditions="", extra_params=()):
+        """First line event before before_seq."""
+        return db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line'"
+            " AND sequence_no < ?"
+            + extra_conditions +
+            " ORDER BY sequence_no DESC LIMIT 1",
+            (str(self.run_id), before_seq) + extra_params)
+
     def enter_replay(self, run_id, first_line_seq: int):
         self.run_id = run_id
         self.state = "replay"
@@ -65,23 +93,21 @@ class Session:
 
         # Cache boundary seqs
         self.first_line_seq = first_line_seq
-        last = (ExecutionFrames.select(ExecutionFrames.sequence_no)
-                .where((ExecutionFrames.run_id == run_id) &
-                       (ExecutionFrames.frame_event == 'line'))
-                .order_by(ExecutionFrames.sequence_no.desc())
-                .limit(1).first())
+        last = db.fetchone(
+            "SELECT sequence_no FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line'"
+            " ORDER BY sequence_no DESC LIMIT 1",
+            (str(self.run_id),))
         self.last_line_seq = last.sequence_no if last else first_line_seq
 
         # Identify main thread from the first recorded event (sequence_no 0)
-        first_event = ExecutionFrames.get_or_none(
-            (ExecutionFrames.run_id == run_id) &
-            (ExecutionFrames.sequence_no == 0))
+        first_event = self._fetch_frame(0)
         main_thread_id = first_event.thread_id if first_event else None
 
         # Discover threads, labeling the main thread correctly
-        thread_rows = list(ExecutionFrames.select(ExecutionFrames.thread_id)
-            .where(ExecutionFrames.run_id == run_id)
-            .distinct())
+        thread_rows = db.fetchall(
+            "SELECT DISTINCT thread_id FROM executionframes WHERE run_id = ?",
+            (str(self.run_id),))
         self.known_threads = {}
         for row in thread_rows:
             if row.thread_id == main_thread_id:
@@ -90,9 +116,7 @@ class Session:
                 self.known_threads[row.thread_id] = f"Thread {row.thread_id}"
 
         # Set current thread from first line event
-        first = ExecutionFrames.get_or_none(
-            (ExecutionFrames.run_id == run_id) &
-            (ExecutionFrames.sequence_no == first_line_seq))
+        first = self._fetch_frame(first_line_seq)
         self.current_thread_id = first.thread_id if first else 0
 
         # Build initial stack at first_line_seq
@@ -119,11 +143,12 @@ class Session:
         for bp in breakpoints:
             name = bp.get('name', '')
             if self.state == "replay" and name:
-                exists = ExecutionFrames.select().where(
-                    (ExecutionFrames.run_id == self.run_id) &
-                    (ExecutionFrames.frame_event == 'call') &
-                    (ExecutionFrames.function_name.contains(name))
-                ).limit(1).exists()
+                exists = db.fetchone(
+                    "SELECT 1 FROM executionframes"
+                    " WHERE run_id = ? AND frame_event = 'call'"
+                    " AND function_name LIKE '%' || ? || '%'"
+                    " LIMIT 1",
+                    (str(self.run_id), name)) is not None
                 if not exists:
                     results.append({'verified': False, 'message': f"Function '{name}' not found in recording"})
                 else:
@@ -143,12 +168,7 @@ class Session:
 
     def step_into(self) -> dict:
         self._require_replay()
-        frame = (ExecutionFrames.select()
-                 .where((ExecutionFrames.run_id == self.run_id) &
-                        (ExecutionFrames.frame_event == 'line') &
-                        (ExecutionFrames.sequence_no > self.current_frame_seq))
-                 .order_by(ExecutionFrames.sequence_no)
-                 .limit(1).first())
+        frame = self._fetch_line_after(self.current_frame_seq)
         if frame is None:
             return self._navigate_to(self.last_line_seq, "end")
         return self._navigate_to(frame.sequence_no, "step")
@@ -160,14 +180,10 @@ class Session:
             return self._navigate_to(self.last_line_seq, "end")
         current_depth = current.call_depth
         current_thread = current.thread_id
-        frame = (ExecutionFrames.select()
-                 .where((ExecutionFrames.run_id == self.run_id) &
-                        (ExecutionFrames.frame_event == 'line') &
-                        (ExecutionFrames.call_depth <= current_depth) &
-                        (ExecutionFrames.thread_id == current_thread) &
-                        (ExecutionFrames.sequence_no > self.current_frame_seq))
-                 .order_by(ExecutionFrames.sequence_no)
-                 .limit(1).first())
+        frame = self._fetch_line_after(
+            self.current_frame_seq,
+            " AND call_depth <= ? AND thread_id = ?",
+            (current_depth, current_thread))
         if frame is None:
             return self._navigate_to(self.last_line_seq, "end")
         return self._navigate_to(frame.sequence_no, "step")
@@ -190,29 +206,27 @@ class Session:
         search_after = self.current_frame_seq
         exit_event = None
         for _ in range(100):  # bounded search to avoid infinite loops
-            candidate = (ExecutionFrames.select()
-                         .where((ExecutionFrames.run_id == self.run_id) &
-                                (ExecutionFrames.frame_event.in_(['return', 'exception_unwind'])) &
-                                (ExecutionFrames.call_depth == current_depth) &
-                                (ExecutionFrames.thread_id == current_thread) &
-                                (ExecutionFrames.sequence_no > search_after))
-                         .order_by(ExecutionFrames.sequence_no)
-                         .first())
+            candidate = db.fetchone(
+                "SELECT * FROM executionframes"
+                " WHERE run_id = ? AND frame_event IN ('return', 'exception_unwind')"
+                " AND call_depth = ? AND thread_id = ?"
+                " AND sequence_no > ?"
+                " ORDER BY sequence_no LIMIT 1",
+                (str(self.run_id), current_depth, current_thread, search_after))
             if candidate is None:
                 break
 
             # Check if this is a coroutine suspension (return followed by resume)
             if (candidate.frame_event == 'return' and
                     getattr(candidate, 'is_coroutine', False)):
-                resume = (ExecutionFrames.select()
-                          .where((ExecutionFrames.run_id == self.run_id) &
-                                 (ExecutionFrames.frame_event == 'call') &
-                                 (ExecutionFrames.call_depth == current_depth) &
-                                 (ExecutionFrames.function_name == candidate.function_name) &
-                                 (ExecutionFrames.thread_id == current_thread) &
-                                 (ExecutionFrames.sequence_no > candidate.sequence_no))
-                          .order_by(ExecutionFrames.sequence_no)
-                          .first())
+                resume = db.fetchone(
+                    "SELECT * FROM executionframes"
+                    " WHERE run_id = ? AND frame_event = 'call'"
+                    " AND call_depth = ? AND function_name = ?"
+                    " AND thread_id = ? AND sequence_no > ?"
+                    " ORDER BY sequence_no LIMIT 1",
+                    (str(self.run_id), current_depth, candidate.function_name,
+                     current_thread, candidate.sequence_no))
                 if resume is not None:
                     # Suspension — skip past the resume and keep searching
                     search_after = resume.sequence_no
@@ -224,24 +238,24 @@ class Session:
         if exit_event is None:
             return self._navigate_to(self.last_line_seq, "end")
 
-        parent_line = (ExecutionFrames.select()
-                       .where((ExecutionFrames.run_id == self.run_id) &
-                              (ExecutionFrames.frame_event == 'line') &
-                              (ExecutionFrames.call_depth == current_depth - 1) &
-                              (ExecutionFrames.thread_id == current_thread) &
-                              (ExecutionFrames.sequence_no > exit_event.sequence_no))
-                       .order_by(ExecutionFrames.sequence_no)
-                       .first())
+        parent_line = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line'"
+            " AND call_depth = ? AND thread_id = ?"
+            " AND sequence_no > ?"
+            " ORDER BY sequence_no LIMIT 1",
+            (str(self.run_id), current_depth - 1, current_thread,
+             exit_event.sequence_no))
 
         if parent_line is None and exit_event.frame_event == 'exception_unwind':
-            parent_line = (ExecutionFrames.select()
-                           .where((ExecutionFrames.run_id == self.run_id) &
-                                  (ExecutionFrames.frame_event == 'line') &
-                                  (ExecutionFrames.call_depth < current_depth) &
-                                  (ExecutionFrames.thread_id == current_thread) &
-                                  (ExecutionFrames.sequence_no > exit_event.sequence_no))
-                           .order_by(ExecutionFrames.sequence_no)
-                           .first())
+            parent_line = db.fetchone(
+                "SELECT * FROM executionframes"
+                " WHERE run_id = ? AND frame_event = 'line'"
+                " AND call_depth < ? AND thread_id = ?"
+                " AND sequence_no > ?"
+                " ORDER BY sequence_no LIMIT 1",
+                (str(self.run_id), current_depth, current_thread,
+                 exit_event.sequence_no))
 
         if parent_line is None:
             return self._navigate_to(self.last_line_seq, "end")
@@ -275,15 +289,8 @@ class Session:
             name = fbp.get('name', '')
             if not name:
                 continue
-            hit = (ExecutionFrames.select(ExecutionFrames.sequence_no)
-                   .where((ExecutionFrames.run_id == self.run_id) &
-                          (ExecutionFrames.frame_event == 'call') &
-                          (ExecutionFrames.function_name.contains(name)) &
-                          (ExecutionFrames.sequence_no > self.current_frame_seq))
-                   .order_by(ExecutionFrames.sequence_no)
-                   .limit(1).first())
-            if hit:
-                snap = self._snap_to_line(hit.sequence_no)
+            snap = self._find_next_call_forward(name, self.current_frame_seq)
+            if snap is not None:
                 candidates.append((snap, "function breakpoint"))
 
         # Data breakpoints
@@ -321,12 +328,7 @@ class Session:
         self._require_replay()
         if self.current_frame_seq is None or self.current_frame_seq <= self.first_line_seq:
             return self._navigate_to(self.first_line_seq, "start")
-        frame = (ExecutionFrames.select()
-                 .where((ExecutionFrames.run_id == self.run_id) &
-                        (ExecutionFrames.frame_event == 'line') &
-                        (ExecutionFrames.sequence_no < self.current_frame_seq))
-                 .order_by(ExecutionFrames.sequence_no.desc())
-                 .limit(1).first())
+        frame = self._fetch_line_before(self.current_frame_seq)
         if frame is None:
             return self._navigate_to(self.first_line_seq, "start")
         return self._navigate_to(frame.sequence_no, "step")
@@ -354,15 +356,8 @@ class Session:
             name = fbp.get('name', '')
             if not name:
                 continue
-            hit = (ExecutionFrames.select(ExecutionFrames.sequence_no)
-                   .where((ExecutionFrames.run_id == self.run_id) &
-                          (ExecutionFrames.frame_event == 'call') &
-                          (ExecutionFrames.function_name.contains(name)) &
-                          (ExecutionFrames.sequence_no < self.current_frame_seq))
-                   .order_by(ExecutionFrames.sequence_no.desc())
-                   .limit(1).first())
-            if hit:
-                snap = self._snap_to_line(hit.sequence_no)
+            snap = self._find_next_call_reverse(name, self.current_frame_seq)
+            if snap is not None:
                 candidates.append((snap, "function breakpoint"))
 
         # Data breakpoints (reverse)
@@ -399,24 +394,19 @@ class Session:
     def goto_frame(self, target_seq: int) -> dict:
         self._require_replay()
         # 1. Validate target exists
-        frame = ExecutionFrames.get_or_none(
-            (ExecutionFrames.run_id == self.run_id) &
-            (ExecutionFrames.sequence_no == target_seq))
+        frame = self._fetch_frame(target_seq)
         if frame is None:
             return {"error": "frame_not_found", "target_seq": target_seq}
 
         # 2. Snap to nearest line event if not already one
         if frame.frame_event != 'line':
-            line_fwd = (ExecutionFrames.select()
-                        .where((ExecutionFrames.run_id == self.run_id) &
-                               (ExecutionFrames.frame_event == 'line') &
-                               (ExecutionFrames.sequence_no > target_seq))
-                        .order_by(ExecutionFrames.sequence_no).first())
-            line_bwd = (ExecutionFrames.select()
-                        .where((ExecutionFrames.run_id == self.run_id) &
-                               (ExecutionFrames.frame_event == 'line') &
-                               (ExecutionFrames.sequence_no < target_seq))
-                        .order_by(ExecutionFrames.sequence_no.desc()).first())
+            line_fwd = self._fetch_line_after(target_seq)
+            line_bwd = db.fetchone(
+                "SELECT * FROM executionframes"
+                " WHERE run_id = ? AND frame_event = 'line'"
+                " AND sequence_no < ?"
+                " ORDER BY sequence_no DESC LIMIT 1",
+                (str(self.run_id), target_seq))
             if line_fwd and line_bwd:
                 # Pick the closer one
                 if (target_seq - line_bwd.sequence_no) <= (line_fwd.sequence_no - target_seq):
@@ -440,17 +430,13 @@ class Session:
         self.current_stack = self._build_stack_at(target_seq)
 
         # 5. Identify thread and cache at checkpoint boundaries
-        target_frame = ExecutionFrames.get_or_none(
-            (ExecutionFrames.run_id == self.run_id) &
-            (ExecutionFrames.sequence_no == target_seq))
+        target_frame = self._fetch_frame(target_seq)
         if target_frame:
             self.current_thread_id = target_frame.thread_id
 
-        from pyttd.models.checkpoints import Checkpoint
-        is_checkpoint = Checkpoint.select().where(
-            (Checkpoint.run_id == self.run_id) &
-            (Checkpoint.sequence_no == target_seq)
-        ).exists()
+        is_checkpoint = db.fetchone(
+            "SELECT 1 FROM checkpoint WHERE run_id = ? AND sequence_no = ? LIMIT 1",
+            (str(self.run_id), target_seq)) is not None
         if is_checkpoint:
             cache_thread = target_frame.thread_id if target_frame else (self.current_thread_id or 0)
             self._stack_cache[(target_seq, cache_thread)] = [e.copy() for e in self.current_stack]
@@ -470,41 +456,37 @@ class Session:
     def goto_targets(self, filename: str, line: int) -> list[dict]:
         self._require_replay()
         filename = os.path.realpath(filename)
-        results = list(ExecutionFrames.select(
-            ExecutionFrames.sequence_no, ExecutionFrames.function_name
-        ).where(
-            (ExecutionFrames.run_id == self.run_id) &
-            (ExecutionFrames.filename == filename) &
-            (ExecutionFrames.line_no == line) &
-            (ExecutionFrames.frame_event == 'line')
-        ).order_by(ExecutionFrames.sequence_no).limit(1000).dicts())
-        return [{"seq": r["sequence_no"], "function_name": r["function_name"]} for r in results]
+        rows = db.fetchdicts(
+            "SELECT sequence_no, function_name FROM executionframes"
+            " WHERE run_id = ? AND filename = ? AND line_no = ?"
+            " AND frame_event = 'line'"
+            " ORDER BY sequence_no LIMIT 1000",
+            (str(self.run_id), filename, line))
+        return [{"seq": r["sequence_no"], "function_name": r["function_name"]} for r in rows]
 
     def restart_frame(self, frame_seq: int) -> dict:
         self._require_replay()
-        frame = ExecutionFrames.get_or_none(
-            (ExecutionFrames.run_id == self.run_id) &
-            (ExecutionFrames.sequence_no == frame_seq))
+        frame = self._fetch_frame(frame_seq)
         if frame is None:
             return {"error": "frame_not_found"}
         depth = frame.call_depth
         frame_thread = frame.thread_id
-        call_event = (ExecutionFrames.select()
-                      .where((ExecutionFrames.run_id == self.run_id) &
-                             (ExecutionFrames.frame_event == 'call') &
-                             (ExecutionFrames.call_depth == depth) &
-                             (ExecutionFrames.thread_id == frame_thread) &
-                             (ExecutionFrames.sequence_no <= frame_seq))
-                      .order_by(ExecutionFrames.sequence_no.desc()).first())
+        call_event = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'call'"
+            " AND call_depth = ? AND thread_id = ?"
+            " AND sequence_no <= ?"
+            " ORDER BY sequence_no DESC LIMIT 1",
+            (str(self.run_id), depth, frame_thread, frame_seq))
         if call_event is None:
             return {"error": "call_event_not_found"}
-        first_line = (ExecutionFrames.select()
-                      .where((ExecutionFrames.run_id == self.run_id) &
-                             (ExecutionFrames.frame_event == 'line') &
-                             (ExecutionFrames.call_depth == depth) &
-                             (ExecutionFrames.thread_id == frame_thread) &
-                             (ExecutionFrames.sequence_no > call_event.sequence_no))
-                      .order_by(ExecutionFrames.sequence_no).first())
+        first_line = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line'"
+            " AND call_depth = ? AND thread_id = ?"
+            " AND sequence_no > ?"
+            " ORDER BY sequence_no LIMIT 1",
+            (str(self.run_id), depth, frame_thread, call_event.sequence_no))
         if first_line is None:
             return {"error": "no_line_in_frame"}
         return self.goto_frame(first_line.sequence_no)
@@ -519,9 +501,7 @@ class Session:
 
     def get_variables_at(self, seq: int) -> list[dict]:
         self._require_replay()
-        frame = ExecutionFrames.get_or_none(
-            (ExecutionFrames.run_id == self.run_id) &
-            (ExecutionFrames.sequence_no == seq))
+        frame = self._fetch_frame(seq)
         if frame is None or not frame.locals_snapshot:
             return []
         try:
@@ -548,14 +528,29 @@ class Session:
         return variables
 
     def get_variable_children(self, reference: int) -> list[dict]:
+        """Get children of an expandable variable by cache reference ID.
+
+        Requires a prior get_variables_at() call to populate the cache.
+        For direct access without cache, use get_variable_children_by_name().
+        """
         self._require_replay()
         decoded = self._decode_var_ref(reference)
         if decoded is None:
             return []
         seq, name = decoded
-        frame = ExecutionFrames.get_or_none(
-            (ExecutionFrames.run_id == self.run_id) &
-            (ExecutionFrames.sequence_no == seq))
+        return self._extract_children(seq, name)
+
+    def get_variable_children_by_name(self, seq: int, variable_name: str) -> list[dict]:
+        """Get children of an expandable variable by frame sequence and name.
+
+        Unlike get_variable_children(), this does not require a prior
+        get_variables_at() call — it goes directly to the frame's locals.
+        """
+        self._require_replay()
+        return self._extract_children(seq, variable_name)
+
+    def _extract_children(self, seq: int, name: str) -> list[dict]:
+        frame = self._fetch_frame(seq)
         if frame is None or not frame.locals_snapshot:
             return []
         try:
@@ -585,9 +580,7 @@ class Session:
 
     def evaluate_at(self, seq: int, expression: str, context: str) -> dict:
         self._require_replay()
-        frame = ExecutionFrames.get_or_none(
-            (ExecutionFrames.run_id == self.run_id) &
-            (ExecutionFrames.sequence_no == seq))
+        frame = self._fetch_frame(seq)
         if frame is None or not frame.locals_snapshot:
             if context == "repl":
                 return {"result": "<no locals at current position>"}
@@ -621,33 +614,27 @@ class Session:
 
     def get_traced_files(self) -> list[str]:
         self._require_replay()
-        rows = (ExecutionFrames.select(ExecutionFrames.filename)
-                .where(ExecutionFrames.run_id == self.run_id)
-                .distinct())
+        rows = db.fetchall(
+            "SELECT DISTINCT filename FROM executionframes WHERE run_id = ?",
+            (str(self.run_id),))
         return [row.filename for row in rows]
 
     def get_execution_stats(self, filename: str) -> list[dict]:
         self._require_replay()
-        from peewee import fn, SQL
-        rows = list(ExecutionFrames.select(
-            ExecutionFrames.function_name,
-            fn.SUM(SQL("CASE WHEN frame_event = 'call' THEN 1 ELSE 0 END")).alias('call_count'),
-            fn.SUM(SQL("CASE WHEN frame_event = 'exception_unwind' "
-                       "THEN 1 ELSE 0 END")).alias('exception_count'),
-            fn.MIN(SQL("CASE WHEN frame_event = 'call' THEN sequence_no END")).alias('first_call_seq'),
-            # Use NULLIF to skip line_no=-1 (CPython returns -1 for
-            # metaclass/constructor frames). Fall back to the first line
-            # event's line_no via COALESCE.
-            fn.COALESCE(
-                fn.MIN(SQL("CASE WHEN frame_event = 'call' "
-                           "THEN NULLIF(line_no, -1) END")),
-                fn.MIN(SQL("CASE WHEN frame_event = 'line' "
-                           "THEN line_no END")),
-            ).alias('def_line'),
-        ).where(
-            (ExecutionFrames.run_id == self.run_id) &
-            (ExecutionFrames.filename == filename)
-        ).group_by(ExecutionFrames.function_name).dicts())
+        filename = os.path.realpath(filename)
+        rows = db.fetchdicts(
+            "SELECT function_name,"
+            " SUM(CASE WHEN frame_event = 'call' THEN 1 ELSE 0 END) AS call_count,"
+            " SUM(CASE WHEN frame_event = 'exception_unwind' THEN 1 ELSE 0 END) AS exception_count,"
+            " MIN(CASE WHEN frame_event = 'call' THEN sequence_no END) AS first_call_seq,"
+            " COALESCE("
+            "   MIN(CASE WHEN frame_event = 'call' THEN NULLIF(line_no, -1) END),"
+            "   MIN(CASE WHEN frame_event = 'line' THEN line_no END)"
+            " ) AS def_line"
+            " FROM executionframes"
+            " WHERE run_id = ? AND filename = ?"
+            " GROUP BY function_name",
+            (str(self.run_id), filename))
 
         return [{
             'functionName': r['function_name'],
@@ -659,30 +646,32 @@ class Session:
 
     def get_call_children(self, parent_call_seq=None, parent_return_seq=None) -> list[dict]:
         self._require_replay()
+        run_id = str(self.run_id)
+
         if parent_call_seq is None:
             target_depth = 0
-            range_filter = (ExecutionFrames.sequence_no >= 0)
+            range_sql = " AND sequence_no >= 0"
+            range_params = ()
         else:
-            parent = ExecutionFrames.get_or_none(
-                (ExecutionFrames.run_id == self.run_id) &
-                (ExecutionFrames.sequence_no == parent_call_seq))
+            parent = self._fetch_frame(parent_call_seq)
             if not parent:
                 return []
             target_depth = parent.call_depth + 1
             if parent_return_seq is not None:
-                range_filter = (
-                    (ExecutionFrames.sequence_no > parent_call_seq) &
-                    (ExecutionFrames.sequence_no < parent_return_seq))
+                range_sql = " AND sequence_no > ? AND sequence_no < ?"
+                range_params = (parent_call_seq, parent_return_seq)
             else:
-                range_filter = (ExecutionFrames.sequence_no > parent_call_seq)
+                range_sql = " AND sequence_no > ?"
+                range_params = (parent_call_seq,)
 
-        events = list(ExecutionFrames.select()
-            .where(
-                (ExecutionFrames.run_id == self.run_id) &
-                (ExecutionFrames.frame_event.in_(['call', 'return', 'exception_unwind'])) &
-                (ExecutionFrames.call_depth == target_depth) &
-                range_filter)
-            .order_by(ExecutionFrames.sequence_no))
+        events = db.fetchall(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ?"
+            " AND frame_event IN ('call', 'return', 'exception_unwind')"
+            " AND call_depth = ?"
+            + range_sql +
+            " ORDER BY sequence_no",
+            (run_id, target_depth) + range_params)
 
         # Python 3.12 fires PyTrace_RETURN with Py_None (not NULL) during
         # exception propagation, causing a spurious 'return' event before
@@ -729,19 +718,14 @@ class Session:
     def get_variable_history(self, variable_name: str, start_seq: int, end_seq: int,
                              max_points: int = 500) -> list[dict]:
         self._require_replay()
-        frames = ExecutionFrames.select(
-            ExecutionFrames.sequence_no,
-            ExecutionFrames.line_no,
-            ExecutionFrames.filename,
-            ExecutionFrames.function_name,
-            ExecutionFrames.locals_snapshot,
-        ).where(
-            (ExecutionFrames.run_id == self.run_id) &
-            (ExecutionFrames.frame_event == 'line') &
-            (ExecutionFrames.sequence_no >= start_seq) &
-            (ExecutionFrames.sequence_no <= end_seq) &
-            (ExecutionFrames.locals_snapshot.contains(f'"{variable_name}"'))
-        ).order_by(ExecutionFrames.sequence_no).iterator()
+        frames = db.iterate(
+            "SELECT sequence_no, line_no, filename, function_name, locals_snapshot"
+            " FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line'"
+            " AND sequence_no >= ? AND sequence_no <= ?"
+            " AND locals_snapshot LIKE '%' || ? || '%'"
+            " ORDER BY sequence_no",
+            (str(self.run_id), start_seq, end_seq, f'"{variable_name}"'))
 
         result = []
         last_value = object()
@@ -783,17 +767,16 @@ class Session:
 
             if file and line and self.state == "replay":
                 real_file = os.path.realpath(file)
-                exists = ExecutionFrames.select().where(
-                    (ExecutionFrames.run_id == self.run_id) &
-                    (ExecutionFrames.filename == real_file) &
-                    (ExecutionFrames.line_no == line) &
-                    (ExecutionFrames.frame_event == 'line')
-                ).limit(1).exists()
+                exists = db.fetchone(
+                    "SELECT 1 FROM executionframes"
+                    " WHERE run_id = ? AND filename = ? AND line_no = ?"
+                    " AND frame_event = 'line' LIMIT 1",
+                    (str(self.run_id), real_file, line)) is not None
                 if not exists:
-                    file_exists = ExecutionFrames.select().where(
-                        (ExecutionFrames.run_id == self.run_id) &
-                        (ExecutionFrames.filename == real_file)
-                    ).limit(1).exists()
+                    file_exists = db.fetchone(
+                        "SELECT 1 FROM executionframes"
+                        " WHERE run_id = ? AND filename = ? LIMIT 1",
+                        (str(self.run_id), real_file)) is not None
                     if not file_exists:
                         verified = False
                         message = f"File not in recording: {os.path.basename(file)}"
@@ -826,9 +809,7 @@ class Session:
     def _evaluate_condition(self, condition: str, seq: int) -> bool:
         if not condition or not condition.strip():
             return True
-        frame = ExecutionFrames.get_or_none(
-            (ExecutionFrames.run_id == self.run_id) &
-            (ExecutionFrames.sequence_no == seq))
+        frame = self._fetch_frame(seq)
         if frame is None:
             return True
         if not frame.locals_snapshot:
@@ -860,14 +841,12 @@ class Session:
             # to avoid stack overflow with large hit conditions
             cursor = after_seq
             while True:
-                hit = (ExecutionFrames.select(ExecutionFrames.sequence_no)
-                       .where((ExecutionFrames.run_id == self.run_id) &
-                              (ExecutionFrames.filename == filename) &
-                              (ExecutionFrames.line_no == line) &
-                              (ExecutionFrames.frame_event == 'line') &
-                              (ExecutionFrames.sequence_no > cursor))
-                       .order_by(ExecutionFrames.sequence_no)
-                       .limit(1).first())
+                hit = db.fetchone(
+                    "SELECT sequence_no FROM executionframes"
+                    " WHERE run_id = ? AND filename = ? AND line_no = ?"
+                    " AND frame_event = 'line' AND sequence_no > ?"
+                    " ORDER BY sequence_no LIMIT 1",
+                    (str(self.run_id), filename, line, cursor))
                 if hit is None:
                     return None
                 # Check hit condition
@@ -886,14 +865,12 @@ class Session:
 
         cursor = after_seq
         for _ in range(MAX_CONDITIONAL_SEARCH):
-            hit = (ExecutionFrames.select(ExecutionFrames.sequence_no)
-                   .where((ExecutionFrames.run_id == self.run_id) &
-                          (ExecutionFrames.filename == filename) &
-                          (ExecutionFrames.line_no == line) &
-                          (ExecutionFrames.frame_event == 'line') &
-                          (ExecutionFrames.sequence_no > cursor))
-                   .order_by(ExecutionFrames.sequence_no)
-                   .limit(1).first())
+            hit = db.fetchone(
+                "SELECT sequence_no FROM executionframes"
+                " WHERE run_id = ? AND filename = ? AND line_no = ?"
+                " AND frame_event = 'line' AND sequence_no > ?"
+                " ORDER BY sequence_no LIMIT 1",
+                (str(self.run_id), filename, line, cursor))
             if hit is None:
                 return None
             if self._evaluate_condition(condition, hit.sequence_no):
@@ -917,26 +894,22 @@ class Session:
     def _find_conditional_hit_reverse(self, filename: str, line: int,
                                        condition: str, before_seq: int) -> int | None:
         if not condition or not condition.strip():
-            hit = (ExecutionFrames.select(ExecutionFrames.sequence_no)
-                   .where((ExecutionFrames.run_id == self.run_id) &
-                          (ExecutionFrames.filename == filename) &
-                          (ExecutionFrames.line_no == line) &
-                          (ExecutionFrames.frame_event == 'line') &
-                          (ExecutionFrames.sequence_no < before_seq))
-                   .order_by(ExecutionFrames.sequence_no.desc())
-                   .limit(1).first())
+            hit = db.fetchone(
+                "SELECT sequence_no FROM executionframes"
+                " WHERE run_id = ? AND filename = ? AND line_no = ?"
+                " AND frame_event = 'line' AND sequence_no < ?"
+                " ORDER BY sequence_no DESC LIMIT 1",
+                (str(self.run_id), filename, line, before_seq))
             return hit.sequence_no if hit else None
 
         cursor = before_seq
         for _ in range(MAX_CONDITIONAL_SEARCH):
-            hit = (ExecutionFrames.select(ExecutionFrames.sequence_no)
-                   .where((ExecutionFrames.run_id == self.run_id) &
-                          (ExecutionFrames.filename == filename) &
-                          (ExecutionFrames.line_no == line) &
-                          (ExecutionFrames.frame_event == 'line') &
-                          (ExecutionFrames.sequence_no < cursor))
-                   .order_by(ExecutionFrames.sequence_no.desc())
-                   .limit(1).first())
+            hit = db.fetchone(
+                "SELECT sequence_no FROM executionframes"
+                " WHERE run_id = ? AND filename = ? AND line_no = ?"
+                " AND frame_event = 'line' AND sequence_no < ?"
+                " ORDER BY sequence_no DESC LIMIT 1",
+                (str(self.run_id), filename, line, cursor))
             if hit is None:
                 return None
             if self._evaluate_condition(condition, hit.sequence_no):
@@ -974,9 +947,7 @@ class Session:
     def _format_log_message(self, template: str, seq: int) -> str:
         """Format a DAP log message template using {expression} syntax."""
         import re
-        frame = ExecutionFrames.get_or_none(
-            (ExecutionFrames.run_id == self.run_id) &
-            (ExecutionFrames.sequence_no == seq))
+        frame = self._fetch_frame(seq)
         if frame is None or not frame.locals_snapshot:
             return template
         try:
@@ -994,9 +965,7 @@ class Session:
 
     def _get_variable_value_at(self, seq: int, var_name: str) -> str | None:
         """Get the value of a variable at a specific frame sequence."""
-        frame = ExecutionFrames.get_or_none(
-            (ExecutionFrames.run_id == self.run_id) &
-            (ExecutionFrames.sequence_no == seq))
+        frame = self._fetch_frame(seq)
         if frame is None or not frame.locals_snapshot:
             return None
         try:
@@ -1010,15 +979,13 @@ class Session:
     def _find_data_change_forward(self, var_name: str, current_val: str | None,
                                    after_seq: int) -> int | None:
         """Find the next frame where var_name has a different value than current_val."""
-        frames = ExecutionFrames.select(
-            ExecutionFrames.sequence_no,
-            ExecutionFrames.locals_snapshot,
-        ).where(
-            (ExecutionFrames.run_id == self.run_id) &
-            (ExecutionFrames.frame_event == 'line') &
-            (ExecutionFrames.sequence_no > after_seq) &
-            (ExecutionFrames.locals_snapshot.contains(f'"{var_name}"'))
-        ).order_by(ExecutionFrames.sequence_no).limit(10000).iterator()
+        frames = db.iterate(
+            "SELECT sequence_no, locals_snapshot FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line'"
+            " AND sequence_no > ?"
+            " AND locals_snapshot LIKE '%' || ? || '%'"
+            " ORDER BY sequence_no LIMIT 10000",
+            (str(self.run_id), after_seq, f'"{var_name}"'))
 
         for frame in frames:
             if not frame.locals_snapshot:
@@ -1039,15 +1006,13 @@ class Session:
     def _find_data_change_reverse(self, var_name: str, current_val: str | None,
                                    before_seq: int) -> int | None:
         """Find the previous frame where var_name had a different value than current_val."""
-        frames = ExecutionFrames.select(
-            ExecutionFrames.sequence_no,
-            ExecutionFrames.locals_snapshot,
-        ).where(
-            (ExecutionFrames.run_id == self.run_id) &
-            (ExecutionFrames.frame_event == 'line') &
-            (ExecutionFrames.sequence_no < before_seq) &
-            (ExecutionFrames.locals_snapshot.contains(f'"{var_name}"'))
-        ).order_by(ExecutionFrames.sequence_no.desc()).limit(10000).iterator()
+        frames = db.iterate(
+            "SELECT sequence_no, locals_snapshot FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line'"
+            " AND sequence_no < ?"
+            " AND locals_snapshot LIKE '%' || ? || '%'"
+            " ORDER BY sequence_no DESC LIMIT 10000",
+            (str(self.run_id), before_seq, f'"{var_name}"'))
 
         for frame in frames:
             if not frame.locals_snapshot:
@@ -1068,20 +1033,20 @@ class Session:
     def _snap_to_line(self, seq: int) -> int:
         """Snap an exception/call/return event to the nearest line event.
         Prefers the preceding line event (same line, just before exception)."""
-        line_bwd = (ExecutionFrames.select(ExecutionFrames.sequence_no)
-                    .where((ExecutionFrames.run_id == self.run_id) &
-                           (ExecutionFrames.frame_event == 'line') &
-                           (ExecutionFrames.sequence_no <= seq))
-                    .order_by(ExecutionFrames.sequence_no.desc())
-                    .limit(1).first())
+        line_bwd = db.fetchone(
+            "SELECT sequence_no FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line'"
+            " AND sequence_no <= ?"
+            " ORDER BY sequence_no DESC LIMIT 1",
+            (str(self.run_id), seq))
         if line_bwd:
             return line_bwd.sequence_no
-        line_fwd = (ExecutionFrames.select(ExecutionFrames.sequence_no)
-                    .where((ExecutionFrames.run_id == self.run_id) &
-                           (ExecutionFrames.frame_event == 'line') &
-                           (ExecutionFrames.sequence_no > seq))
-                    .order_by(ExecutionFrames.sequence_no)
-                    .limit(1).first())
+        line_fwd = db.fetchone(
+            "SELECT sequence_no FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line'"
+            " AND sequence_no > ?"
+            " ORDER BY sequence_no LIMIT 1",
+            (str(self.run_id), seq))
         return line_fwd.sequence_no if line_fwd else seq
 
     def _find_next_exception_forward(self, event_type: str,
@@ -1094,17 +1059,18 @@ class Session:
         """
         search_after = current_seq
         while True:
-            conditions = [
-                (ExecutionFrames.run_id == self.run_id),
-                (ExecutionFrames.frame_event == event_type),
-                (ExecutionFrames.sequence_no > search_after),
-            ]
+            depth_sql = ""
+            depth_params = ()
             if depth_filter is not None:
-                conditions.append(ExecutionFrames.call_depth == depth_filter)
-            hit = (ExecutionFrames.select(ExecutionFrames.sequence_no)
-                   .where(*conditions)
-                   .order_by(ExecutionFrames.sequence_no)
-                   .limit(1).first())
+                depth_sql = " AND call_depth = ?"
+                depth_params = (depth_filter,)
+            hit = db.fetchone(
+                "SELECT sequence_no FROM executionframes"
+                " WHERE run_id = ? AND frame_event = ?"
+                " AND sequence_no > ?"
+                + depth_sql +
+                " ORDER BY sequence_no LIMIT 1",
+                (str(self.run_id), event_type, search_after) + depth_params)
             if hit is None:
                 return None
             snap = self._snap_to_line(hit.sequence_no)
@@ -1124,17 +1090,18 @@ class Session:
         """
         search_before = current_seq
         while True:
-            conditions = [
-                (ExecutionFrames.run_id == self.run_id),
-                (ExecutionFrames.frame_event == event_type),
-                (ExecutionFrames.sequence_no < search_before),
-            ]
+            depth_sql = ""
+            depth_params = ()
             if depth_filter is not None:
-                conditions.append(ExecutionFrames.call_depth == depth_filter)
-            hit = (ExecutionFrames.select(ExecutionFrames.sequence_no)
-                   .where(*conditions)
-                   .order_by(ExecutionFrames.sequence_no.desc())
-                   .limit(1).first())
+                depth_sql = " AND call_depth = ?"
+                depth_params = (depth_filter,)
+            hit = db.fetchone(
+                "SELECT sequence_no FROM executionframes"
+                " WHERE run_id = ? AND frame_event = ?"
+                " AND sequence_no < ?"
+                + depth_sql +
+                " ORDER BY sequence_no DESC LIMIT 1",
+                (str(self.run_id), event_type, search_before) + depth_params)
             if hit is None:
                 return None
             snap = self._snap_to_line(hit.sequence_no)
@@ -1144,10 +1111,50 @@ class Session:
             # exception's raw seq and search for the previous one.
             search_before = hit.sequence_no
 
+    def _find_next_call_forward(self, name: str, current_seq: int) -> int | None:
+        """Find the next function call matching name after current_seq, snapped to a line.
+
+        Handles the snap-to-line aliasing problem for call events.
+        """
+        search_after = current_seq
+        while True:
+            hit = db.fetchone(
+                "SELECT sequence_no FROM executionframes"
+                " WHERE run_id = ? AND frame_event = 'call'"
+                " AND function_name LIKE '%' || ? || '%'"
+                " AND sequence_no > ?"
+                " ORDER BY sequence_no LIMIT 1",
+                (str(self.run_id), name, search_after))
+            if not hit:
+                return None
+            snap = self._snap_to_line(hit.sequence_no)
+            if snap > current_seq:
+                return snap
+            search_after = hit.sequence_no
+
+    def _find_next_call_reverse(self, name: str, current_seq: int) -> int | None:
+        """Find the previous function call matching name before current_seq, snapped to a line.
+
+        Handles the snap-to-line aliasing problem for call events.
+        """
+        search_before = current_seq
+        while True:
+            hit = db.fetchone(
+                "SELECT sequence_no FROM executionframes"
+                " WHERE run_id = ? AND frame_event = 'call'"
+                " AND function_name LIKE '%' || ? || '%'"
+                " AND sequence_no < ?"
+                " ORDER BY sequence_no DESC LIMIT 1",
+                (str(self.run_id), name, search_before))
+            if not hit:
+                return None
+            snap = self._snap_to_line(hit.sequence_no)
+            if snap < current_seq:
+                return snap
+            search_before = hit.sequence_no
+
     def _get_current_frame(self):
-        return ExecutionFrames.get_or_none(
-            (ExecutionFrames.run_id == self.run_id) &
-            (ExecutionFrames.sequence_no == self.current_frame_seq))
+        return self._fetch_frame(self.current_frame_seq)
 
     def _navigate_to(self, seq: int, reason: str) -> dict:
         old_seq = self.current_frame_seq
@@ -1156,9 +1163,7 @@ class Session:
         # Resolve target thread before updating stack — cross-thread
         # navigation must rebuild from scratch (incremental update would
         # scan the wrong thread's events).
-        frame = ExecutionFrames.get_or_none(
-            (ExecutionFrames.run_id == self.run_id) &
-            (ExecutionFrames.sequence_no == seq))
+        frame = self._fetch_frame(seq)
         target_thread = frame.thread_id if frame else self.current_thread_id
 
         if target_thread != self.current_thread_id:
@@ -1186,15 +1191,19 @@ class Session:
         if new_seq > old_seq:
             # Forward: scan events between old and new, push/pop
             # Stack is DAP order (deepest-first at index 0)
-            thread_filter = ((ExecutionFrames.thread_id == self.current_thread_id)
-                             if self.current_thread_id is not None
-                             else (ExecutionFrames.sequence_no >= 0))
-            events = list(ExecutionFrames.select()
-                          .where((ExecutionFrames.run_id == self.run_id) &
-                                 thread_filter &
-                                 (ExecutionFrames.sequence_no > old_seq) &
-                                 (ExecutionFrames.sequence_no <= new_seq))
-                          .order_by(ExecutionFrames.sequence_no))
+            if self.current_thread_id is not None:
+                thread_sql = " AND thread_id = ?"
+                thread_params = (self.current_thread_id,)
+            else:
+                thread_sql = " AND sequence_no >= 0"
+                thread_params = ()
+            events = db.fetchall(
+                "SELECT * FROM executionframes"
+                " WHERE run_id = ?"
+                + thread_sql +
+                " AND sequence_no > ? AND sequence_no <= ?"
+                " ORDER BY sequence_no",
+                (str(self.run_id),) + thread_params + (old_seq, new_seq))
             for ev in events:
                 if ev.frame_event == 'call':
                     self.current_stack.insert(0, self._frame_to_stack_entry(ev))
@@ -1216,9 +1225,7 @@ class Session:
 
     def _build_stack_at(self, seq: int) -> list[dict]:
         # Determine target thread for this position
-        target = ExecutionFrames.get_or_none(
-            (ExecutionFrames.run_id == self.run_id) &
-            (ExecutionFrames.sequence_no == seq))
+        target = self._fetch_frame(seq)
         target_thread = target.thread_id if target else (self.current_thread_id or 0)
 
         # Find nearest cached stack <= seq for the same thread
@@ -1228,17 +1235,20 @@ class Session:
             stack = [entry.copy() for entry in self._stack_cache[(start_seq, target_thread)]]
             # Cached stacks are DAP order (deepest-first); scan uses call-stack order
             stack.reverse()
-            lower_bound = (ExecutionFrames.sequence_no > start_seq)
+            lower_sql = " AND sequence_no > ?"
+            lower_params = (start_seq,)
         else:
             stack = []
-            lower_bound = (ExecutionFrames.sequence_no >= 0)
+            lower_sql = " AND sequence_no >= 0"
+            lower_params = ()
 
-        events = list(ExecutionFrames.select()
-                      .where((ExecutionFrames.run_id == self.run_id) &
-                             (ExecutionFrames.thread_id == target_thread) &
-                             lower_bound &
-                             (ExecutionFrames.sequence_no <= seq))
-                      .order_by(ExecutionFrames.sequence_no))
+        events = db.fetchall(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND thread_id = ?"
+            + lower_sql +
+            " AND sequence_no <= ?"
+            " ORDER BY sequence_no",
+            (str(self.run_id), target_thread) + lower_params + (seq,))
         for ev in events:
             if ev.frame_event == 'call':
                 stack.append(self._frame_to_stack_entry(ev))

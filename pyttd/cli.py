@@ -205,8 +205,9 @@ def _cmd_record(args):
     from pyttd.models import storage as _storage
     try:
         _storage.connect_to_db(db_path)
-        from pyttd.models.runs import Runs
-        run_count = Runs.select().count()
+        _storage.initialize_schema()
+        from pyttd.models.db import db as _db
+        run_count = _db.fetchval("SELECT COUNT(*) FROM runs") or 0
         if run_count > 1:
             print(f"Database contains {run_count} runs. Use 'pyttd query --list-runs --db {db_path}' to see all.")
     except Exception:

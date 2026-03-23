@@ -2,15 +2,12 @@
 import os
 import textwrap
 import time
+import uuid
 import pytest
 
 from pyttd.config import PyttdConfig
 from pyttd.models import storage
-from pyttd.models.base import db
-from pyttd.models.frames import ExecutionFrames
-from pyttd.models.runs import Runs
-from pyttd.models.checkpoints import Checkpoint
-from pyttd.models.io_events import IOEvent
+from pyttd.models.db import db
 from pyttd.models.storage import (
     compute_db_path, delete_db_files, evict_old_runs,
     _evict_old_runs_internal,
@@ -80,7 +77,7 @@ class TestMultiRunAppend:
 
         storage.connect_to_db(db_path)
         try:
-            runs = list(Runs.select())
+            runs = db.fetchall("SELECT * FROM runs")
             assert len(runs) == 2
         finally:
             storage.close_db()
@@ -90,12 +87,17 @@ class TestMultiRunAppend:
         """Stale checkpoints from dead PIDs should be cleaned up."""
         db_path = str(tmp_path / "test.pyttd.db")
         storage.connect_to_db(db_path)
-        storage.initialize_schema([Runs, ExecutionFrames, Checkpoint, IOEvent])
+        storage.initialize_schema()
 
-        run = Runs.create(script_path="test.py")
+        run_id = uuid.uuid4().hex
+        db.execute(
+            "INSERT INTO runs (run_id, script_path, timestamp_start, total_frames) VALUES (?, ?, ?, ?)",
+            (run_id, "test.py", time.time(), 0))
         # Create a checkpoint with a definitely-dead PID
-        Checkpoint.create(run_id=run.run_id, sequence_no=100,
-                          child_pid=999999, is_alive=True)
+        db.execute(
+            "INSERT INTO checkpoint (run_id, sequence_no, child_pid, is_alive) VALUES (?, ?, ?, ?)",
+            (run_id, 100, 999999, 1))
+        db.commit()
 
         storage.close_db()
         db.init(None)
@@ -108,8 +110,9 @@ class TestMultiRunAppend:
         rec.start(db_path, script_path=str(script))
 
         # Check the stale checkpoint was cleaned
-        stale = Checkpoint.get_or_none(Checkpoint.child_pid == 999999)
-        assert stale is None or stale.is_alive == False
+        stale = db.fetchone(
+            "SELECT * FROM checkpoint WHERE child_pid = 999999")
+        assert stale is None or stale.is_alive == 0
 
         import runpy, sys
         old_argv = sys.argv[:]
@@ -132,24 +135,26 @@ def multi_run_db(tmp_path):
     """Create a DB with 3 runs."""
     db_path = str(tmp_path / "multi.pyttd.db")
     storage.connect_to_db(db_path)
-    storage.initialize_schema([Runs, ExecutionFrames, Checkpoint, IOEvent])
+    storage.initialize_schema()
 
     run_ids = []
     for i in range(3):
-        run = Runs.create(
-            script_path=f"script{i}.py",
-            total_frames=10 * (i + 1),
-            timestamp_start=time.time() + i,
-        )
+        run_id = uuid.uuid4().hex
+        db.execute(
+            "INSERT INTO runs (run_id, script_path, total_frames, timestamp_start)"
+            " VALUES (?, ?, ?, ?)",
+            (run_id, f"script{i}.py", 10 * (i + 1), time.time() + i))
         # Add a frame so queries work
-        ExecutionFrames.create(
-            run_id=run.run_id, sequence_no=0, timestamp=0.0,
-            line_no=1, filename=f"script{i}.py",
-            function_name="main", frame_event="line",
-            call_depth=0, locals_snapshot="{}",
-        )
-        run_ids.append(run.run_id)
+        db.execute(
+            "INSERT INTO executionframes"
+            " (run_id, sequence_no, timestamp, line_no, filename,"
+            "  function_name, frame_event, call_depth, locals_snapshot,"
+            "  thread_id, is_coroutine)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (run_id, 0, 0.0, 1, f"script{i}.py", "main", "line", 0, "{}", 0, 0))
+        run_ids.append(run_id)
 
+    db.commit()
     storage.close_db()
     db.init(None)
     return db_path, run_ids
@@ -218,7 +223,7 @@ class TestEviction:
         assert run_ids[2] not in evicted
         # Check DB state
         storage.connect_to_db(db_path)
-        remaining = list(Runs.select())
+        remaining = db.fetchall("SELECT * FROM runs")
         assert len(remaining) == 1
         assert remaining[0].run_id == run_ids[2]
         storage.close_db()
@@ -230,7 +235,7 @@ class TestEviction:
         assert len(evicted) == 2
         # DB should be unchanged
         storage.connect_to_db(db_path)
-        remaining = list(Runs.select())
+        remaining = db.fetchall("SELECT * FROM runs")
         assert len(remaining) == 3
         storage.close_db()
         db.init(None)
@@ -240,7 +245,7 @@ class TestEviction:
         evicted = evict_old_runs(db_path, keep=10)
         assert evicted == []
         storage.connect_to_db(db_path)
-        remaining = list(Runs.select())
+        remaining = db.fetchall("SELECT * FROM runs")
         assert len(remaining) == 3
         storage.close_db()
         db.init(None)
@@ -250,7 +255,7 @@ class TestEviction:
         evicted = evict_old_runs(db_path, keep=0)
         assert len(evicted) == 3
         storage.connect_to_db(db_path)
-        remaining = list(Runs.select())
+        remaining = db.fetchall("SELECT * FROM runs")
         assert len(remaining) == 0
         storage.close_db()
         db.init(None)
@@ -259,40 +264,50 @@ class TestEviction:
         """Eviction should delete frames, checkpoints, and IO events."""
         db_path = str(tmp_path / "evict.pyttd.db")
         storage.connect_to_db(db_path)
-        storage.initialize_schema([Runs, ExecutionFrames, Checkpoint, IOEvent])
+        storage.initialize_schema()
 
-        run = Runs.create(script_path="old.py", total_frames=5)
+        run_id = uuid.uuid4().hex
+        db.execute(
+            "INSERT INTO runs (run_id, script_path, timestamp_start, total_frames) VALUES (?, ?, ?, ?)",
+            (run_id, "old.py", time.time(), 5))
         for i in range(5):
-            ExecutionFrames.create(
-                run_id=run.run_id, sequence_no=i, timestamp=float(i),
-                line_no=1, filename="old.py",
-                function_name="f", frame_event="line",
-                call_depth=0, locals_snapshot="{}",
-            )
-        Checkpoint.create(run_id=run.run_id, sequence_no=0,
-                          child_pid=None, is_alive=False)
-        IOEvent.create(run_id=run.run_id, sequence_no=0,
-                       io_sequence=0, function_name="time.time",
-                       return_value="1.0")
+            db.execute(
+                "INSERT INTO executionframes"
+                " (run_id, sequence_no, timestamp, line_no, filename,"
+                "  function_name, frame_event, call_depth, locals_snapshot,"
+                "  thread_id, is_coroutine)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (run_id, i, float(i), 1, "old.py", "f", "line", 0, "{}", 0, 0))
+        db.execute(
+            "INSERT INTO checkpoint (run_id, sequence_no, child_pid, is_alive)"
+            " VALUES (?, ?, ?, ?)",
+            (run_id, 0, None, 0))
+        db.execute(
+            "INSERT INTO ioevent (run_id, sequence_no, io_sequence, function_name, return_value)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (run_id, 0, 0, "time.time", b"1.0"))
 
         # Add a second (newer) run to keep
-        run2 = Runs.create(script_path="new.py",
-                           timestamp_start=time.time() + 100)
+        run_id2 = uuid.uuid4().hex
+        db.execute(
+            "INSERT INTO runs (run_id, script_path, timestamp_start, total_frames) VALUES (?, ?, ?, ?)",
+            (run_id2, "new.py", time.time() + 100, 0))
+        db.commit()
 
         storage.close_db()
         db.init(None)
 
         evicted = evict_old_runs(db_path, keep=1)
         assert len(evicted) == 1
-        assert evicted[0] == run.run_id
+        assert evicted[0] == run_id
 
         storage.connect_to_db(db_path)
-        assert ExecutionFrames.select().where(
-            ExecutionFrames.run_id == run.run_id).count() == 0
-        assert Checkpoint.select().where(
-            Checkpoint.run_id == run.run_id).count() == 0
-        assert IOEvent.select().where(
-            IOEvent.run_id == run.run_id).count() == 0
+        assert db.fetchval(
+            "SELECT COUNT(*) FROM executionframes WHERE run_id = ?", (run_id,)) == 0
+        assert db.fetchval(
+            "SELECT COUNT(*) FROM checkpoint WHERE run_id = ?", (run_id,)) == 0
+        assert db.fetchval(
+            "SELECT COUNT(*) FROM ioevent WHERE run_id = ?", (run_id,)) == 0
         storage.close_db()
         db.init(None)
 
@@ -346,7 +361,7 @@ class TestEviction:
 
         # Should have 2 runs (keep_runs=2 evicts older ones)
         storage.connect_to_db(db_path)
-        runs = list(Runs.select())
+        runs = db.fetchall("SELECT * FROM runs")
         assert len(runs) == 2
         storage.close_db()
         db.init(None)
@@ -412,7 +427,7 @@ class TestCLIIntegration:
         assert "Would evict 2 run(s)" in captured.out
 
         storage.connect_to_db(db_path)
-        assert Runs.select().count() == 3
+        assert db.fetchval("SELECT COUNT(*) FROM runs") == 3
         storage.close_db()
         db.init(None)
 
@@ -456,8 +471,12 @@ class TestMainAPI:
 
         # Create an existing run in the DB
         storage.connect_to_db(db_path)
-        storage.initialize_schema([Runs, ExecutionFrames, Checkpoint, IOEvent])
-        Runs.create(script_path=str(source), total_frames=5)
+        storage.initialize_schema()
+        run_id = uuid.uuid4().hex
+        db.execute(
+            "INSERT INTO runs (run_id, script_path, timestamp_start, total_frames) VALUES (?, ?, ?, ?)",
+            (run_id, str(source), time.time(), 5))
+        db.commit()
         storage.close_db()
         db.init(None)
 
@@ -472,7 +491,7 @@ class TestMainAPI:
         my_func()
 
         storage.connect_to_db(db_path)
-        runs = list(Runs.select())
+        runs = db.fetchall("SELECT * FROM runs")
         assert len(runs) == 2  # Original + new
         storage.close_db()
         db.init(None)

@@ -1,15 +1,16 @@
 """Phase 6 backend tests: get_traced_files, get_execution_stats, get_call_children."""
 import pytest
 from pyttd.session import Session
-from pyttd.models.frames import ExecutionFrames
+from pyttd.models.db import db
 
 
 def _enter_replay(session, run_id):
     """Helper to enter replay mode for a run."""
-    first_line = (ExecutionFrames.select()
-                  .where((ExecutionFrames.run_id == run_id) &
-                         (ExecutionFrames.frame_event == 'line'))
-                  .order_by(ExecutionFrames.sequence_no).first())
+    first_line = db.fetchone(
+        "SELECT * FROM executionframes"
+        " WHERE run_id = ? AND frame_event = 'line'"
+        " ORDER BY sequence_no LIMIT 1",
+        (str(run_id),))
     session.enter_replay(run_id, first_line.sequence_no)
 
 
@@ -18,21 +19,21 @@ def _find_user_module_call(session, script_filename_part):
     The recorder captures all frames including Python internals,
     so the user's <module> is nested several levels deep."""
     # Find the <module> call event for the user script
-    ev = (ExecutionFrames.select()
-          .where((ExecutionFrames.run_id == session.run_id) &
-                 (ExecutionFrames.frame_event == 'call') &
-                 (ExecutionFrames.function_name == '<module>') &
-                 (ExecutionFrames.filename.contains(script_filename_part)))
-          .order_by(ExecutionFrames.sequence_no).first())
+    ev = db.fetchone(
+        "SELECT * FROM executionframes"
+        " WHERE run_id = ? AND frame_event = 'call'"
+        " AND function_name = '<module>' AND filename LIKE ?"
+        " ORDER BY sequence_no LIMIT 1",
+        (str(session.run_id), f'%{script_filename_part}%'))
     if not ev:
         return None
     # Find matching return
-    ret = (ExecutionFrames.select()
-           .where((ExecutionFrames.run_id == session.run_id) &
-                  (ExecutionFrames.frame_event.in_(['return', 'exception_unwind'])) &
-                  (ExecutionFrames.call_depth == ev.call_depth) &
-                  (ExecutionFrames.sequence_no > ev.sequence_no))
-           .order_by(ExecutionFrames.sequence_no).first())
+    ret = db.fetchone(
+        "SELECT * FROM executionframes"
+        " WHERE run_id = ? AND frame_event IN ('return', 'exception_unwind')"
+        " AND call_depth = ? AND sequence_no > ?"
+        " ORDER BY sequence_no LIMIT 1",
+        (str(session.run_id), ev.call_depth, ev.sequence_no))
     return {
         'callSeq': ev.sequence_no,
         'returnSeq': ret.sequence_no if ret else None,

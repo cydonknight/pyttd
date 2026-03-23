@@ -8,12 +8,12 @@ on darwin (arm64).
 | Metric | Target | Status |
 |--------|--------|--------|
 | Recording overhead (I/O-bound) | < 2x slowdown | PASS (1.6x) |
-| Recording overhead (Compute-bound) | < 10x slowdown | FAIL (12.0x) |
-| Recording overhead (Tight loop) | < 15x slowdown | FAIL (91.1x) |
-| Recording overhead (Deep recursion) | < 10x slowdown | PASS (5.0x) |
-| Recording overhead (Many locals) | < 15x slowdown | FAIL (16.2x) |
-| Recording overhead (Multi-thread) | < 20x slowdown | PASS (6.7x) |
-| Peak RSS | < 200 MB | PASS (103 MB) |
+| Recording overhead (Compute-bound) | < 10x slowdown | PASS (4.7x) |
+| Recording overhead (Tight loop) | < 15x slowdown | FAIL (56.2x) |
+| Recording overhead (Deep recursion) | < 10x slowdown | PASS (3.0x) |
+| Recording overhead (Many locals) | < 15x slowdown | PASS (11.7x) |
+| Recording overhead (Multi-thread) | < 20x slowdown | PASS (4.1x) |
+| Peak RSS | < 200 MB | PASS (50 MB) |
 | Warm navigation | < 10ms/step | (run pytest benchmarks) |
 | DB size per frame | < 500 bytes | (run pytest benchmarks) |
 | Timeline summary | < 16ms | (run pytest benchmarks) |
@@ -22,12 +22,12 @@ on darwin (arm64).
 
 | Workload | Baseline | Recorded | Slowdown | Peak RSS | DB Size |
 |----------|----------|----------|----------|----------|---------|
-| I/O-bound | 0.173s | 0.279s | 1.6x | 37.3 MB | 1096 KB |
-| Compute-bound | 0.021s | 0.247s | 12.0x | 49.9 MB | 4908 KB |
-| Tight loop | 0.019s | 1.758s | 91.1x | 103.4 MB | 28320 KB |
-| Deep recursion | 0.020s | 0.101s | 5.0x | 103.4 MB | 1260 KB |
-| Many locals | 0.019s | 0.310s | 16.2x | 103.4 MB | 4184 KB |
-| Multi-thread | 0.027s | 0.183s | 6.7x | 103.4 MB | 2572 KB |
+| I/O-bound | 0.170s | 0.271s | 1.6x | 27.7 MB | 1092 KB |
+| Compute-bound | 0.020s | 0.093s | 4.7x | 32.4 MB | 4904 KB |
+| Tight loop | 0.018s | 0.983s | 56.2x | 50.4 MB | 28316 KB |
+| Deep recursion | 0.016s | 0.049s | 3.0x | 50.4 MB | 1256 KB |
+| Many locals | 0.017s | 0.196s | 11.7x | 50.4 MB | 4180 KB |
+| Multi-thread | 0.018s | 0.073s | 4.1x | 50.4 MB | 2572 KB |
 
 Note: Subprocess startup overhead (~200ms for importing pyttd + compiling C extension)
 inflates ratios for fast workloads. The compute-bound workload baseline is only ~20ms.

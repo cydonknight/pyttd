@@ -6,11 +6,12 @@ These tests only run on platforms with fork() support.
 import sys
 import platform
 import json
+import uuid
+import time
 import pytest
 import pyttd_native
-from pyttd.models.frames import ExecutionFrames
-from pyttd.models.checkpoints import Checkpoint
-from pyttd.models.runs import Runs
+from pyttd.models.db import db
+from pyttd.models import storage
 
 
 needs_fork = pytest.mark.skipif(
@@ -32,7 +33,8 @@ def test_recording_with_checkpoints(record_func):
     """, checkpoint_interval=100)
 
     assert stats['frame_count'] > 0
-    checkpoints = list(Checkpoint.select().where(Checkpoint.run_id == run_id))
+    checkpoints = db.fetchall(
+        "SELECT * FROM checkpoint WHERE run_id = ?", (str(run_id),))
     # With 200 iterations + overhead, we should get at least 1 checkpoint
     assert len(checkpoints) >= 1
     for cp in checkpoints:
@@ -51,11 +53,9 @@ def test_checkpoint_sequence_numbers_increasing(record_func):
         work()
     """, checkpoint_interval=100)
 
-    checkpoints = list(
-        Checkpoint.select()
-        .where(Checkpoint.run_id == run_id)
-        .order_by(Checkpoint.sequence_no)
-    )
+    checkpoints = db.fetchall(
+        "SELECT * FROM checkpoint WHERE run_id = ? ORDER BY sequence_no",
+        (str(run_id),))
     assert len(checkpoints) >= 2, \
         f"Expected at least 2 checkpoints with interval=100 and 200 iterations, got {len(checkpoints)}"
     for i in range(1, len(checkpoints)):
@@ -74,7 +74,8 @@ def test_no_checkpoints_when_disabled(record_func):
         work()
     """, checkpoint_interval=0)
 
-    checkpoints = list(Checkpoint.select().where(Checkpoint.run_id == run_id))
+    checkpoints = db.fetchall(
+        "SELECT * FROM checkpoint WHERE run_id = ?", (str(run_id),))
     assert len(checkpoints) == 0
 
 
@@ -108,9 +109,9 @@ def test_frames_still_recorded_with_checkpoints(record_func):
             foo()
     """, checkpoint_interval=100)
 
-    frames = list(ExecutionFrames.select()
-        .where(ExecutionFrames.run_id == run_id)
-        .order_by(ExecutionFrames.sequence_no))
+    frames = db.fetchall(
+        "SELECT * FROM executionframes WHERE run_id = ? ORDER BY sequence_no",
+        (str(run_id),))
     assert len(frames) > 0
 
     # Verify sequence numbers are contiguous
@@ -136,21 +137,23 @@ def test_checkpoint_callback_records_pid(record_func):
         work()
     """, checkpoint_interval=100)
 
-    checkpoints = list(Checkpoint.select().where(Checkpoint.run_id == run_id))
+    checkpoints = db.fetchall(
+        "SELECT * FROM checkpoint WHERE run_id = ?", (str(run_id),))
     assert len(checkpoints) >= 1
     for cp in checkpoints:
         # Callback records child_pid and marks is_alive=True
         assert cp.child_pid is not None
         assert cp.child_pid > 0
-        assert cp.is_alive == True
+        assert cp.is_alive == 1
 
     # After kill_all + DB update, is_alive should be False
     pyttd_native.kill_all_checkpoints()
-    Checkpoint.update(is_alive=False, child_pid=None).where(
-        Checkpoint.run_id == run_id
-    ).execute()
-    for cp in Checkpoint.select().where(Checkpoint.run_id == run_id):
-        assert cp.is_alive == False
+    db.execute(
+        "UPDATE checkpoint SET is_alive = 0, child_pid = NULL WHERE run_id = ?",
+        (str(run_id),))
+    db.commit()
+    for cp in db.fetchall("SELECT * FROM checkpoint WHERE run_id = ?", (str(run_id),)):
+        assert cp.is_alive == 0
 
 
 @needs_fork
@@ -162,10 +165,16 @@ def test_checkpoint_stale_cleanup(db_setup):
 
     db_path = db_setup
     # Manually insert a stale checkpoint
-    run = Runs.create(script_path="fake.py")
-    Checkpoint.create(run_id=run.run_id, sequence_no=100, child_pid=99999, is_alive=True)
+    run_id = uuid.uuid4().hex
+    db.execute(
+        "INSERT INTO runs (run_id, script_path, timestamp_start, total_frames) VALUES (?, ?, ?, ?)",
+        (run_id, "fake.py", time.time(), 0))
+    db.execute(
+        "INSERT INTO checkpoint (run_id, sequence_no, child_pid, is_alive) VALUES (?, ?, ?, ?)",
+        (run_id, 100, 99999, 1))
+    db.commit()
 
-    stale = Checkpoint.select().where(Checkpoint.is_alive == True).count()
+    stale = db.fetchval("SELECT COUNT(*) FROM checkpoint WHERE is_alive = 1")
     assert stale == 1
 
     # Starting a new recorder should clear stale entries
@@ -179,5 +188,5 @@ def test_checkpoint_stale_cleanup(db_setup):
     recorder.stop()
     recorder.cleanup()
 
-    stale_after = Checkpoint.select().where(Checkpoint.is_alive == True).count()
+    stale_after = db.fetchval("SELECT COUNT(*) FROM checkpoint WHERE is_alive = 1")
     assert stale_after == 0

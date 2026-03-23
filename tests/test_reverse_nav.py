@@ -5,16 +5,16 @@ Tests for step_back, reverse_continue, goto_frame, goto_targets, restart_frame.
 import os
 import pytest
 from pyttd.session import Session
-from pyttd.models.frames import ExecutionFrames
+from pyttd.models.db import db
 
 
 def _enter_replay(session, run_id):
     """Helper: set up session in replay mode."""
-    first_line = (ExecutionFrames.select()
-                  .where((ExecutionFrames.run_id == run_id) &
-                         (ExecutionFrames.frame_event == 'line'))
-                  .order_by(ExecutionFrames.sequence_no)
-                  .limit(1).first())
+    first_line = db.fetchone(
+        "SELECT * FROM executionframes"
+        " WHERE run_id = ? AND frame_event = 'line'"
+        " ORDER BY sequence_no LIMIT 1",
+        (str(run_id),))
     first_line_seq = first_line.sequence_no if first_line else 0
     session.enter_replay(run_id, first_line_seq)
     return first_line_seq
@@ -116,12 +116,11 @@ class TestReverseContinue:
         _navigate_to_end(session)
 
         # Find a line event with the function foo to set breakpoint
-        foo_frames = list(ExecutionFrames.select()
-            .where((ExecutionFrames.run_id == run_id) &
-                   (ExecutionFrames.frame_event == 'line') &
-                   (ExecutionFrames.function_name.contains('foo')))
-            .order_by(ExecutionFrames.sequence_no)
-            .limit(1))
+        foo_frames = db.fetchall(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line' AND function_name LIKE '%foo%'"
+            " ORDER BY sequence_no LIMIT 1",
+            (str(run_id),))
         assert len(foo_frames) >= 1
         bp_file = foo_frames[0].filename
         bp_line = foo_frames[0].line_no
@@ -178,10 +177,11 @@ class TestGotoFrame:
         _enter_replay(session, run_id)
 
         # Find a line event to jump to
-        lines = list(ExecutionFrames.select()
-            .where((ExecutionFrames.run_id == run_id) &
-                   (ExecutionFrames.frame_event == 'line'))
-            .order_by(ExecutionFrames.sequence_no))
+        lines = db.fetchall(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line'"
+            " ORDER BY sequence_no",
+            (str(run_id),))
         assert len(lines) >= 2
         target = lines[-1]
 
@@ -210,19 +210,18 @@ class TestGotoFrame:
         _enter_replay(session, run_id)
 
         # Find a call event (not a line event)
-        call_frame = (ExecutionFrames.select()
-            .where((ExecutionFrames.run_id == run_id) &
-                   (ExecutionFrames.frame_event == 'call') &
-                   (ExecutionFrames.function_name.contains('foo')))
-            .order_by(ExecutionFrames.sequence_no)
-            .first())
+        call_frame = db.fetchone(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'call' AND function_name LIKE '%foo%'"
+            " ORDER BY sequence_no",
+            (str(run_id),))
         assert call_frame is not None, "Should find a call event for foo"
         result = session.goto_frame(call_frame.sequence_no)
         # Should snap to nearest line event
         assert result["reason"] == "goto"
-        snapped_frame = ExecutionFrames.get_or_none(
-            (ExecutionFrames.run_id == run_id) &
-            (ExecutionFrames.sequence_no == result["seq"]))
+        snapped_frame = db.fetchone(
+            "SELECT * FROM executionframes WHERE run_id = ? AND sequence_no = ?",
+            (str(run_id), result["seq"]))
         assert snapped_frame.frame_event == 'line'
 
 
@@ -237,10 +236,11 @@ class TestGotoTargets:
         _enter_replay(session, run_id)
 
         # Find a user-code line event to get file and line
-        user_lines = list(ExecutionFrames.select()
-            .where((ExecutionFrames.run_id == run_id) &
-                   (ExecutionFrames.frame_event == 'line'))
-            .order_by(ExecutionFrames.sequence_no))
+        user_lines = db.fetchall(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line'"
+            " ORDER BY sequence_no",
+            (str(run_id),))
         assert len(user_lines) >= 1
         target = user_lines[0]
 
@@ -273,11 +273,11 @@ class TestRestartFrame:
         _enter_replay(session, run_id)
 
         # Find a line event inside foo
-        foo_lines = list(ExecutionFrames.select()
-            .where((ExecutionFrames.run_id == run_id) &
-                   (ExecutionFrames.frame_event == 'line') &
-                   (ExecutionFrames.function_name.contains('foo')))
-            .order_by(ExecutionFrames.sequence_no))
+        foo_lines = db.fetchall(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line' AND function_name LIKE '%foo%'"
+            " ORDER BY sequence_no",
+            (str(run_id),))
         assert len(foo_lines) >= 2, f"Should find at least 2 line events in foo, got {len(foo_lines)}"
         # Navigate to second line in foo
         session.goto_frame(foo_lines[1].sequence_no)

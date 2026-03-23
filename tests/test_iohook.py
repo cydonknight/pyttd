@@ -6,8 +6,7 @@ and that recorded values are correctly serialized/stored.
 import pickle
 import struct
 import pytest
-from pyttd.models.frames import ExecutionFrames
-from pyttd.models.io_events import IOEvent
+from pyttd.models.db import db
 
 
 class TestIOHookRecording:
@@ -18,9 +17,9 @@ class TestIOHookRecording:
             t1 = time.time()
             t2 = time.time()
         """)
-        events = list(IOEvent.select()
-            .where(IOEvent.run_id == run_id)
-            .order_by(IOEvent.io_sequence))
+        events = db.fetchall(
+            "SELECT * FROM ioevent WHERE run_id = ? ORDER BY io_sequence",
+            (str(run_id),))
         time_events = [e for e in events if e.function_name == "time.time"]
         assert len(time_events) >= 2
 
@@ -37,9 +36,9 @@ class TestIOHookRecording:
             import time
             m = time.monotonic()
         """)
-        events = list(IOEvent.select()
-            .where((IOEvent.run_id == run_id) &
-                   (IOEvent.function_name == "time.monotonic")))
+        events = db.fetchall(
+            "SELECT * FROM ioevent WHERE run_id = ? AND function_name = 'time.monotonic'",
+            (str(run_id),))
         assert len(events) >= 1
 
     def test_random_random_recorded(self, record_func):
@@ -49,9 +48,9 @@ class TestIOHookRecording:
             r1 = random.random()
             r2 = random.random()
         """)
-        events = list(IOEvent.select()
-            .where((IOEvent.run_id == run_id) &
-                   (IOEvent.function_name == "random.random")))
+        events = db.fetchall(
+            "SELECT * FROM ioevent WHERE run_id = ? AND function_name = 'random.random'",
+            (str(run_id),))
         assert len(events) >= 2
 
         # Verify return values are valid floats
@@ -67,9 +66,9 @@ class TestIOHookRecording:
             import random
             r = random.randint(1, 100)
         """)
-        events = list(IOEvent.select()
-            .where((IOEvent.run_id == run_id) &
-                   (IOEvent.function_name == "random.randint")))
+        events = db.fetchall(
+            "SELECT * FROM ioevent WHERE run_id = ? AND function_name = 'random.randint'",
+            (str(run_id),))
         assert len(events) >= 1
 
         # Verify the int can be deserialized from length-prefixed format
@@ -83,9 +82,9 @@ class TestIOHookRecording:
             import os
             b = os.urandom(16)
         """)
-        events = list(IOEvent.select()
-            .where((IOEvent.run_id == run_id) &
-                   (IOEvent.function_name == "os.urandom")))
+        events = db.fetchall(
+            "SELECT * FROM ioevent WHERE run_id = ? AND function_name = 'os.urandom'",
+            (str(run_id),))
         assert len(events) >= 1
 
         # Verify the bytes can be deserialized
@@ -103,9 +102,9 @@ class TestIOHookRecording:
             r = random.random()
             t2 = time.time()
         """)
-        events = list(IOEvent.select()
-            .where(IOEvent.run_id == run_id)
-            .order_by(IOEvent.io_sequence))
+        events = db.fetchall(
+            "SELECT * FROM ioevent WHERE run_id = ? ORDER BY io_sequence",
+            (str(run_id),))
         assert len(events) >= 3
         for i in range(1, len(events)):
             assert events[i].io_sequence > events[i-1].io_sequence
@@ -116,15 +115,15 @@ class TestIOHookRecording:
             import time
             t = time.time()
         """)
-        events = list(IOEvent.select()
-            .where((IOEvent.run_id == run_id) &
-                   (IOEvent.function_name == "time.time")))
+        events = db.fetchall(
+            "SELECT * FROM ioevent WHERE run_id = ? AND function_name = 'time.time'",
+            (str(run_id),))
         assert len(events) >= 1
 
         # The sequence_no should correspond to an existing frame
-        frame = ExecutionFrames.get_or_none(
-            (ExecutionFrames.run_id == run_id) &
-            (ExecutionFrames.sequence_no == events[0].sequence_no))
+        frame = db.fetchone(
+            "SELECT * FROM executionframes WHERE run_id = ? AND sequence_no = ?",
+            (str(run_id), events[0].sequence_no))
         assert frame is not None
 
     def test_hooks_restored_after_stop(self, record_func):
@@ -170,9 +169,9 @@ class TestIOHookExpansion:
             t1 = datetime.datetime.now()
             t2 = datetime.datetime.now()
         """)
-        events = list(IOEvent.select()
-            .where((IOEvent.run_id == run_id) &
-                   (IOEvent.function_name == "datetime.datetime.now")))
+        events = db.fetchall(
+            "SELECT * FROM ioevent WHERE run_id = ? AND function_name = 'datetime.datetime.now'",
+            (str(run_id),))
         assert len(events) >= 2
 
         # Verify return values are valid IEEE 754 doubles (timestamps)
@@ -188,9 +187,9 @@ class TestIOHookExpansion:
             import datetime
             t = datetime.datetime.utcnow()
         """)
-        events = list(IOEvent.select()
-            .where((IOEvent.run_id == run_id) &
-                   (IOEvent.function_name == "datetime.datetime.utcnow")))
+        events = db.fetchall(
+            "SELECT * FROM ioevent WHERE run_id = ? AND function_name = 'datetime.datetime.utcnow'",
+            (str(run_id),))
         assert len(events) >= 1
 
         # Verify stored as float
@@ -217,9 +216,9 @@ class TestIOHookExpansion:
             t = datetime.datetime.now(tz=datetime.timezone.utc)
             assert t.tzinfo is not None
         """)
-        events = list(IOEvent.select()
-            .where((IOEvent.run_id == run_id) &
-                   (IOEvent.function_name == "datetime.datetime.now")))
+        events = db.fetchall(
+            "SELECT * FROM ioevent WHERE run_id = ? AND function_name = 'datetime.datetime.now'",
+            (str(run_id),))
         assert len(events) >= 1
 
     def test_uuid_uuid4_recorded(self, record_func):
@@ -229,9 +228,9 @@ class TestIOHookExpansion:
             u1 = uuid.uuid4()
             u2 = uuid.uuid4()
         """)
-        events = list(IOEvent.select()
-            .where((IOEvent.run_id == run_id) &
-                   (IOEvent.function_name == "uuid.uuid4")))
+        events = db.fetchall(
+            "SELECT * FROM ioevent WHERE run_id = ? AND function_name = 'uuid.uuid4'",
+            (str(run_id),))
         assert len(events) >= 2
 
         # Verify return values are length-prefixed 16-byte UUID data
@@ -247,9 +246,9 @@ class TestIOHookExpansion:
             import uuid
             u = uuid.uuid1()
         """)
-        events = list(IOEvent.select()
-            .where((IOEvent.run_id == run_id) &
-                   (IOEvent.function_name == "uuid.uuid1")))
+        events = db.fetchall(
+            "SELECT * FROM ioevent WHERE run_id = ? AND function_name = 'uuid.uuid1'",
+            (str(run_id),))
         assert len(events) >= 1
 
     def test_uuid_returns_uuid(self, record_func):
@@ -272,9 +271,9 @@ class TestIOHookExpansion:
             time.sleep(0.01)
             time.sleep(0.02)
         """)
-        events = list(IOEvent.select()
-            .where((IOEvent.run_id == run_id) &
-                   (IOEvent.function_name == "time.sleep")))
+        events = db.fetchall(
+            "SELECT * FROM ioevent WHERE run_id = ? AND function_name = 'time.sleep'",
+            (str(run_id),))
         assert len(events) >= 2
 
         # Verify durations are stored as floats
@@ -290,9 +289,9 @@ class TestIOHookExpansion:
             import time
             time.sleep(0)
         """)
-        events = list(IOEvent.select()
-            .where((IOEvent.run_id == run_id) &
-                   (IOEvent.function_name == "time.sleep")))
+        events = db.fetchall(
+            "SELECT * FROM ioevent WHERE run_id = ? AND function_name = 'time.sleep'",
+            (str(run_id),))
         assert len(events) >= 1
 
     def test_random_uniform_recorded(self, record_func):
@@ -301,9 +300,9 @@ class TestIOHookExpansion:
             import random
             r = random.uniform(1.0, 10.0)
         """)
-        events = list(IOEvent.select()
-            .where((IOEvent.run_id == run_id) &
-                   (IOEvent.function_name == "random.uniform")))
+        events = db.fetchall(
+            "SELECT * FROM ioevent WHERE run_id = ? AND function_name = 'random.uniform'",
+            (str(run_id),))
         assert len(events) >= 1
 
         data = bytes(events[0].return_value)
@@ -317,9 +316,9 @@ class TestIOHookExpansion:
             import random
             r = random.gauss(0, 1)
         """)
-        events = list(IOEvent.select()
-            .where((IOEvent.run_id == run_id) &
-                   (IOEvent.function_name == "random.gauss")))
+        events = db.fetchall(
+            "SELECT * FROM ioevent WHERE run_id = ? AND function_name = 'random.gauss'",
+            (str(run_id),))
         assert len(events) >= 1
 
         data = bytes(events[0].return_value)
@@ -331,9 +330,9 @@ class TestIOHookExpansion:
             import random
             c = random.choice([10, 20, 30, 40, 50])
         """)
-        events = list(IOEvent.select()
-            .where((IOEvent.run_id == run_id) &
-                   (IOEvent.function_name == "random.choice")))
+        events = db.fetchall(
+            "SELECT * FROM ioevent WHERE run_id = ? AND function_name = 'random.choice'",
+            (str(run_id),))
         assert len(events) >= 1
 
         # Verify pickled data can be deserialized
@@ -351,9 +350,9 @@ class TestIOHookExpansion:
             import random
             s = random.sample(range(100), 5)
         """)
-        events = list(IOEvent.select()
-            .where((IOEvent.run_id == run_id) &
-                   (IOEvent.function_name == "random.sample")))
+        events = db.fetchall(
+            "SELECT * FROM ioevent WHERE run_id = ? AND function_name = 'random.sample'",
+            (str(run_id),))
         assert len(events) >= 1
 
         # Verify pickled data
@@ -372,9 +371,9 @@ class TestIOHookExpansion:
             lst = [1, 2, 3, 4, 5]
             random.shuffle(lst)
         """)
-        events = list(IOEvent.select()
-            .where((IOEvent.run_id == run_id) &
-                   (IOEvent.function_name == "random.shuffle")))
+        events = db.fetchall(
+            "SELECT * FROM ioevent WHERE run_id = ? AND function_name = 'random.shuffle'",
+            (str(run_id),))
         assert len(events) >= 1
 
         # Verify pickled data is a list with same elements
@@ -416,9 +415,9 @@ class TestIOHookExpansion:
             import random
             c = random.choice(['alpha', 'beta', 'gamma'])
         """)
-        events = list(IOEvent.select()
-            .where((IOEvent.run_id == run_id) &
-                   (IOEvent.function_name == "random.choice")))
+        events = db.fetchall(
+            "SELECT * FROM ioevent WHERE run_id = ? AND function_name = 'random.choice'",
+            (str(run_id),))
         assert len(events) >= 1
 
         data = bytes(events[0].return_value)

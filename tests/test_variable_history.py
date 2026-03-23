@@ -1,15 +1,15 @@
 """Tests for variable history (Phase 10B)."""
-from pyttd.models.frames import ExecutionFrames
+from pyttd.models.db import db
 from pyttd.session import Session
 
 
 def _setup_session(run_id):
     session = Session()
-    first_line = (ExecutionFrames.select(ExecutionFrames.sequence_no)
-                  .where((ExecutionFrames.run_id == run_id) &
-                         (ExecutionFrames.frame_event == 'line'))
-                  .order_by(ExecutionFrames.sequence_no)
-                  .first())
+    first_line = db.fetchone(
+        "SELECT sequence_no FROM executionframes"
+        " WHERE run_id = ? AND frame_event = 'line'"
+        " ORDER BY sequence_no LIMIT 1",
+        (str(run_id),))
     session.enter_replay(run_id, first_line.sequence_no)
     return session
 
