@@ -23,11 +23,11 @@ def _enter_replay(session, run_id):
     return first_line_seq
 
 
+@pytest.mark.skipif(sys.platform == 'win32',
+                    reason="Windows asyncio internals prevent coroutine frame recording")
 class TestCoroutineFlag:
     """Verify is_coroutine flag is recorded correctly."""
 
-    @pytest.mark.skipif(sys.platform == 'win32',
-                        reason="Windows asyncio internals prevent coroutine call recording")
     def test_coroutine_flag_on_async_def(self, record_func):
         """async def functions should have is_coroutine=True."""
         db_path, run_id, stats = record_func("""\
@@ -74,8 +74,6 @@ class TestCoroutineFlag:
         assert gen_call is not None
         assert gen_call.is_coroutine is True
 
-    @pytest.mark.skipif(sys.platform == 'win32',
-                        reason="Windows asyncio internals prevent coroutine call recording")
     def test_coroutine_flag_on_line_events(self, record_func):
         """Line events inside coroutines should also have is_coroutine=True."""
         db_path, run_id, stats = record_func("""\
