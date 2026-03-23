@@ -1,6 +1,6 @@
 # pyttd
 
-[![CI](https://github.com/pyttd/pyttd/actions/workflows/ci.yml/badge.svg)](https://github.com/pyttd/pyttd/actions/workflows/ci.yml)
+[![CI](https://github.com/cydonknight/pyttd/actions/workflows/ci.yml/badge.svg)](https://github.com/cydonknight/pyttd/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 
@@ -33,7 +33,7 @@ pip install py-tt-debug
 Or from source:
 
 ```bash
-git clone https://github.com/pyttd/pyttd.git
+git clone https://github.com/cydonknight/pyttd.git
 cd pyttd
 python3 -m venv .venv
 .venv/bin/pip install -e ".[dev]"
@@ -87,6 +87,17 @@ pyttd clean --all --dry-run
 
 4. Press **F5** — your script records, then you navigate freely
 
+To replay an existing recording without re-running, use an `attach` configuration:
+
+```json
+{
+    "type": "pyttd",
+    "request": "attach",
+    "name": "Replay Trace",
+    "traceDb": "${workspaceFolder}/script.pyttd.db"
+}
+```
+
 ### Python API
 
 ```python
@@ -98,6 +109,16 @@ def my_function():
     return x * 2
 
 my_function()  # Records to <file>.pyttd.db
+```
+
+Or with explicit start/stop control:
+
+```python
+from pyttd import start_recording, stop_recording
+
+start_recording(db_path="trace.pyttd.db")
+# ... your code ...
+stats = stop_recording()
 ```
 
 ### Attach to a Running Process
@@ -127,7 +148,7 @@ install_signal_handler()  # First USR1 arms, second disarms
 - Fork-based checkpointing for fast cold navigation (Linux/macOS)
 - Multi-thread recording with globally ordered sequence numbers
 - Async/await and generator support with coroutine frame tracking
-- I/O hooks for deterministic checkpoint replay — `time.time`, `time.monotonic`, `time.perf_counter`, `time.sleep`, `random.random`, `random.randint`, `random.uniform`, `random.gauss`, `random.choice`, `random.sample`, `random.shuffle`, `os.urandom`, `uuid.uuid4`, `uuid.uuid1`, `datetime.datetime.now`
+- I/O hooks for deterministic checkpoint replay — `time.time`, `time.monotonic`, `time.perf_counter`, `time.sleep`, `random.random`, `random.randint`, `random.uniform`, `random.gauss`, `random.choice`, `random.sample`, `random.shuffle`, `os.urandom`, `uuid.uuid4`, `uuid.uuid1`, `datetime.datetime.now`, `datetime.datetime.utcnow`
 - Secrets filtering — sensitive variable names (`password`, `token`, `secret`, `api_key`, etc.) automatically redacted during recording; configurable patterns with `--secret-patterns`
 - Selective function recording — `--include` / `--exclude` filter by function name, `--include-file` / `--exclude-file` filter by source file (glob patterns)
 - Expandable variable trees — dicts, lists, tuples, sets, and objects with `__dict__` are serialized with structure, not just `repr()`
@@ -138,7 +159,7 @@ install_signal_handler()  # First USR1 arms, second disarms
 - Forward: step into/over/out, continue with breakpoints
 - Reverse: step back, reverse continue with breakpoints and exception filters
 - Conditional breakpoints — expressions evaluated against frame locals
-- Hit-count breakpoints — stop after N hits (e.g., `== 5`, `% 10 == 0`)
+- Hit-count breakpoints — stop after N hits (supports `>=N`, `>N`, `<=N`, `<N`, `==N`, `%N`)
 - Log points — emit structured log messages with variable interpolation without stopping
 - Function breakpoints — break on any call to a named function
 - Data breakpoints — break when a variable's value changes
@@ -249,6 +270,13 @@ Options:
   --keep N       Keep last N runs, evict the rest
   --dry-run      Show what would be deleted without deleting
 ```
+
+### Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `PYTTD_RECORDING` | Set to `1` during active recording; scripts can check `os.environ.get('PYTTD_RECORDING')` |
+| `PYTTD_ARM_SIGNAL` | Auto-install signal handler on import — e.g., `PYTTD_ARM_SIGNAL=USR1` installs a SIGUSR1 toggle handler |
 
 ## Architecture
 
