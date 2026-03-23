@@ -829,8 +829,10 @@ class Session:
         frame = ExecutionFrames.get_or_none(
             (ExecutionFrames.run_id == self.run_id) &
             (ExecutionFrames.sequence_no == seq))
-        if frame is None or not frame.locals_snapshot:
+        if frame is None:
             return True
+        if not frame.locals_snapshot:
+            return False  # can't evaluate — skip (locals may be sampled out)
         try:
             locals_data = json.loads(frame.locals_snapshot)
         except (json.JSONDecodeError, TypeError):

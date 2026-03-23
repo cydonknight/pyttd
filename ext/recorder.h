@@ -30,10 +30,17 @@ extern _Atomic int g_stop_requested;
 extern PYTTD_THREAD_LOCAL int g_inside_repr;
 extern int g_flush_thread_created;
 extern unsigned long g_main_thread_id;
-extern _Atomic uint64_t g_frame_count;
 extern _Atomic uint64_t g_last_checkpoint_seq;
 extern _Atomic uint64_t g_sequence_counter;
 extern PYTTD_THREAD_LOCAL int g_call_depth;
+extern PYTTD_THREAD_LOCAL unsigned long g_my_thread_id;
+
+/* Perf: per-thread code object cache for trace function hot path */
+extern PYTTD_THREAD_LOCAL PyFrameObject *g_cached_frame;
+extern PYTTD_THREAD_LOCAL PyCodeObject *g_cached_code;
+extern PYTTD_THREAD_LOCAL const char *g_cached_filename;
+extern PYTTD_THREAD_LOCAL const char *g_cached_funcname;
+extern PYTTD_THREAD_LOCAL int g_cached_is_coro;
 
 /* Phase 2 child-only globals */
 extern int g_cmd_fd;

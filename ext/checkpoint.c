@@ -250,7 +250,6 @@ static void checkpoint_child_init(int cmd_pipe[2], int result_pipe[2],
     atomic_store(&g_recording, 0);
     g_flush_thread_created = 0;
     g_inside_repr = 0;  /* TLS — child inherits via fork, reset */
-    atomic_store_explicit(&g_frame_count, 0, memory_order_relaxed);
     atomic_store_explicit(&g_last_checkpoint_seq, 0, memory_order_relaxed);
     atomic_store(&g_stop_requested, 0);
 

@@ -70,6 +70,31 @@ static double g_start_time = 0.0;
 static double g_stop_time = 0.0;
 PYTTD_THREAD_LOCAL int g_inside_repr = 0;
 
+/* Perf: per-thread code object cache — avoids PyFrame_GetCode + UTF-8 extraction on cache hit */
+PYTTD_THREAD_LOCAL PyFrameObject *g_cached_frame = NULL;
+PYTTD_THREAD_LOCAL PyCodeObject *g_cached_code = NULL;
+PYTTD_THREAD_LOCAL const char *g_cached_filename = NULL;
+PYTTD_THREAD_LOCAL const char *g_cached_funcname = NULL;
+PYTTD_THREAD_LOCAL int g_cached_is_coro = 0;
+
+/* Perf: TLS thread ID cache — avoids PyThread_get_thread_ident() calls per event */
+PYTTD_THREAD_LOCAL unsigned long g_my_thread_id = 0;
+
+/* Perf: TLS cached timestamp — re-read every N LINE events within a frame */
+PYTTD_THREAD_LOCAL double g_cached_timestamp = 0.0;
+PYTTD_THREAD_LOCAL int g_timestamp_counter = 0;
+
+/* Perf: per-thread locals sampling state */
+PYTTD_THREAD_LOCAL int g_line_sample_counter = 0;
+
+/* Seen-lines cache: direct-mapped, detects first occurrence of a new line number.
+ * Forces locals serialization on first visit to a new source line (handles
+ * inlined comprehensions where 100+ events fire on the same line, then code
+ * resumes on a different line with variables that must be captured). */
+#define SEEN_LINES_SIZE 64
+#define SEEN_LINES_MASK (SEEN_LINES_SIZE - 1)
+PYTTD_THREAD_LOCAL int g_seen_lines[SEEN_LINES_SIZE];
+
 static uint64_t g_max_frames = 0;  /* 0 = unlimited */
 static int g_trace_installed_externally = 0;  /* set by trace_current_frame */
 
@@ -87,7 +112,6 @@ int g_result_fd = -1;
 PyThreadState *g_saved_tstate = NULL;
 
 /* ---- Stats ---- */
-_Atomic uint64_t g_frame_count = 0;
 static _Atomic uint64_t g_flush_count = 0;
 
 /* ---- Ignore Filter ---- */
@@ -119,6 +143,93 @@ static int g_file_include_mode = 0;
 static SubstringFilter g_exclude_func_filter = {.count = 0};
 static SubstringFilter g_exclude_file_filter = {.count = 0};
 static int g_exclude_mode = 0;
+
+/* ---- Pre-interned Strings (perf: avoid per-event PyUnicode_FromString) ---- */
+static PyObject *g_str_dunder_return = NULL;
+static PyObject *g_str_dunder_exception = NULL;
+static PyObject *g_key_sequence_no = NULL;
+static PyObject *g_key_timestamp = NULL;
+static PyObject *g_key_line_no = NULL;
+static PyObject *g_key_filename = NULL;
+static PyObject *g_key_function_name = NULL;
+static PyObject *g_key_frame_event = NULL;
+static PyObject *g_key_call_depth = NULL;
+static PyObject *g_key_locals_snapshot = NULL;
+static PyObject *g_key_thread_id = NULL;
+static PyObject *g_key_is_coroutine = NULL;
+/* Event type strings indexed by: c=0, l=1, r=2, e=3, E=4 (exception_unwind) */
+static PyObject *g_evt_call = NULL;
+static PyObject *g_evt_line = NULL;
+static PyObject *g_evt_return = NULL;
+static PyObject *g_evt_exception = NULL;
+static PyObject *g_evt_exception_unwind = NULL;
+
+static void intern_strings(void) {
+    g_str_dunder_return = PyUnicode_InternFromString("__return__");
+    g_str_dunder_exception = PyUnicode_InternFromString("__exception__");
+    g_key_sequence_no = PyUnicode_InternFromString("sequence_no");
+    g_key_timestamp = PyUnicode_InternFromString("timestamp");
+    g_key_line_no = PyUnicode_InternFromString("line_no");
+    g_key_filename = PyUnicode_InternFromString("filename");
+    g_key_function_name = PyUnicode_InternFromString("function_name");
+    g_key_frame_event = PyUnicode_InternFromString("frame_event");
+    g_key_call_depth = PyUnicode_InternFromString("call_depth");
+    g_key_locals_snapshot = PyUnicode_InternFromString("locals_snapshot");
+    g_key_thread_id = PyUnicode_InternFromString("thread_id");
+    g_key_is_coroutine = PyUnicode_InternFromString("is_coroutine");
+    g_evt_call = PyUnicode_InternFromString("call");
+    g_evt_line = PyUnicode_InternFromString("line");
+    g_evt_return = PyUnicode_InternFromString("return");
+    g_evt_exception = PyUnicode_InternFromString("exception");
+    g_evt_exception_unwind = PyUnicode_InternFromString("exception_unwind");
+}
+
+static void release_interned_strings(void) {
+    Py_XDECREF(g_str_dunder_return); g_str_dunder_return = NULL;
+    Py_XDECREF(g_str_dunder_exception); g_str_dunder_exception = NULL;
+    Py_XDECREF(g_key_sequence_no); g_key_sequence_no = NULL;
+    Py_XDECREF(g_key_timestamp); g_key_timestamp = NULL;
+    Py_XDECREF(g_key_line_no); g_key_line_no = NULL;
+    Py_XDECREF(g_key_filename); g_key_filename = NULL;
+    Py_XDECREF(g_key_function_name); g_key_function_name = NULL;
+    Py_XDECREF(g_key_frame_event); g_key_frame_event = NULL;
+    Py_XDECREF(g_key_call_depth); g_key_call_depth = NULL;
+    Py_XDECREF(g_key_locals_snapshot); g_key_locals_snapshot = NULL;
+    Py_XDECREF(g_key_thread_id); g_key_thread_id = NULL;
+    Py_XDECREF(g_key_is_coroutine); g_key_is_coroutine = NULL;
+    Py_XDECREF(g_evt_call); g_evt_call = NULL;
+    Py_XDECREF(g_evt_line); g_evt_line = NULL;
+    Py_XDECREF(g_evt_return); g_evt_return = NULL;
+    Py_XDECREF(g_evt_exception); g_evt_exception = NULL;
+    Py_XDECREF(g_evt_exception_unwind); g_evt_exception_unwind = NULL;
+}
+
+/* Map event_type C string to pre-interned PyObject (returns borrowed ref) */
+static inline PyObject *event_type_to_pystr(const char *event_type) {
+    switch (event_type[0]) {
+    case 'c': return g_evt_call;
+    case 'l': return g_evt_line;
+    case 'r': return g_evt_return;
+    case 'e':
+        return (event_type[1] == 'x' && event_type[9] == '_')
+            ? g_evt_exception_unwind : g_evt_exception;
+    default: return NULL;
+    }
+}
+
+/* ---- Filter Result Cache (perf: avoid repeated O(n) filter checks) ---- */
+#define FILTER_CACHE_SIZE 128
+#define FILTER_CACHE_MASK (FILTER_CACHE_SIZE - 1)
+
+static struct {
+    const char *filename;
+    const char *funcname;
+    int result;   /* 0=record, 1=skip, -1=invalid */
+} g_filter_cache[FILTER_CACHE_SIZE];
+
+static inline unsigned filter_cache_hash(const char *fn, const char *func) {
+    return (unsigned)(((uintptr_t)fn ^ ((uintptr_t)func * 2654435761u)) >> 4) & FILTER_CACHE_MASK;
+}
 
 /* ---- Flush Thread ---- */
 #ifdef _WIN32
@@ -838,7 +949,7 @@ static int pyttd_trace_func(PyObject *obj, PyFrameObject *frame, int what, PyObj
      * Use atomic exchange to clear the flag — fire only once, so the
      * KeyboardInterrupt doesn't repeat in except/finally handlers. */
     if (what == PyTrace_LINE &&
-        PyThread_get_thread_ident() == g_main_thread_id &&
+        g_my_thread_id == g_main_thread_id &&
         atomic_exchange_explicit(&g_stop_requested, 0, memory_order_relaxed)) {
         PyErr_SetNone(PyExc_KeyboardInterrupt);
         return -1;
@@ -851,34 +962,81 @@ static int pyttd_trace_func(PyObject *obj, PyFrameObject *frame, int what, PyObj
 
     case PyTrace_LINE: {
         int line_no = PyFrame_GetLineNumber(frame);
-        PyCodeObject *code = PyFrame_GetCode(frame);
-        const char *filename = PyUnicode_AsUTF8(code->co_filename);
-        const char *funcname = PyUnicode_AsUTF8(code->co_qualname);
-        if (!filename || !funcname) { PyErr_Clear(); Py_DECREF(code); return 0; }
 
-        const char *locals_json = serialize_locals((PyObject *)frame, g_locals_buf, sizeof(g_locals_buf), NULL, NULL);
+        /* Code object cache: avoid PyFrame_GetCode + UTF-8 extraction on cache hit */
+        const char *filename;
+        const char *funcname;
+        int is_coro;
+        int cache_hit = (frame == g_cached_frame);
+        if (cache_hit) {
+            filename = g_cached_filename;
+            funcname = g_cached_funcname;
+            is_coro = g_cached_is_coro;
+        } else {
+            PyCodeObject *code = PyFrame_GetCode(frame);
+            filename = PyUnicode_AsUTF8(code->co_filename);
+            funcname = PyUnicode_AsUTF8(code->co_qualname);
+            if (!filename || !funcname) { PyErr_Clear(); Py_DECREF(code); return 0; }
+            is_coro = (code->co_flags & PYTTD_CORO_FLAGS) ? 1 : 0;
+            /* Update cache: release old code ref, hold new one */
+            Py_XDECREF(g_cached_code);
+            g_cached_frame = frame;
+            g_cached_code = code;  /* transfer ownership of new ref */
+            g_cached_filename = filename;
+            g_cached_funcname = funcname;
+            g_cached_is_coro = is_coro;
+            g_line_sample_counter = 0;  /* new frame → reset sampling */
+            memset(g_seen_lines, 0, sizeof(g_seen_lines));
+        }
+
+        /* Locals sampling: serialize first WARMUP lines per frame, then every Nth.
+         * Also force-serialize first occurrence of a new source line (handles
+         * inlined comprehensions on 3.12+ where 100+ events fire on the same
+         * line, followed by code on a new line that must capture variables). */
+        const char *locals_json;
+        #define LOCALS_WARMUP          16
+        #define LOCALS_SAMPLE_INTERVAL 8
+        g_line_sample_counter++;
+        int first_visit = 0;
+        if (g_line_sample_counter > LOCALS_WARMUP) {
+            unsigned sl_idx = (unsigned)line_no & SEEN_LINES_MASK;
+            if (g_seen_lines[sl_idx] != line_no) {
+                g_seen_lines[sl_idx] = line_no;
+                first_visit = 1;
+            }
+        }
+        if (g_line_sample_counter <= LOCALS_WARMUP
+            || first_visit
+            || (g_line_sample_counter % LOCALS_SAMPLE_INTERVAL) == 0) {
+            locals_json = serialize_locals((PyObject *)frame, g_locals_buf, sizeof(g_locals_buf), NULL, NULL);
+        } else {
+            locals_json = NULL;
+        }
+
+        /* Item 5: Batch timestamp reads — re-read every 8th LINE event within a frame */
+        if (!cache_hit || ++g_timestamp_counter >= 8) {
+            g_cached_timestamp = get_monotonic_time() - g_start_time;
+            g_timestamp_counter = 0;
+        }
 
         FrameEvent event;
         event.sequence_no = atomic_fetch_add_explicit(&g_sequence_counter, 1, memory_order_relaxed);
         event.line_no = line_no;
         event.call_depth = g_call_depth;
-        event.thread_id = PyThread_get_thread_ident();
-        event.timestamp = get_monotonic_time() - g_start_time;
+        event.thread_id = g_my_thread_id;
+        event.timestamp = g_cached_timestamp;
         event.event_type = "line";
         event.filename = filename;
         event.function_name = funcname;
         event.locals_json = locals_json;
-        event.is_coroutine = (code->co_flags & PYTTD_CORO_FLAGS) ? 1 : 0;
+        event.is_coroutine = is_coro;
 
         ringbuf_push(&event);
-        atomic_fetch_add_explicit(&g_frame_count, 1, memory_order_relaxed);
 
         /* P1-4: Auto-stop when max_frames reached (line events are most frequent) */
         if (g_max_frames > 0 && event.sequence_no >= g_max_frames) {
             atomic_store_explicit(&g_stop_requested, 1, memory_order_relaxed);
         }
-
-        Py_DECREF(code);
 
         /* Checkpoint trigger on line events (not just call events in eval hook).
          * With internal frames filtered, call events are too infrequent. */
@@ -899,8 +1057,8 @@ static int pyttd_trace_func(PyObject *obj, PyFrameObject *frame, int what, PyObj
         }
 #endif
 
-        /* Signal flush thread if buffer is 75% full */
-        if (ringbuf_fill_percent() >= 75) {
+        /* Item 3: Throttle fill% check to every 64th event */
+        if ((event.sequence_no & 63) == 0 && ringbuf_fill_percent() >= 75) {
 #ifndef _WIN32
             pthread_cond_signal(&g_flush_cond);
 #endif
@@ -914,31 +1072,44 @@ static int pyttd_trace_func(PyObject *obj, PyFrameObject *frame, int what, PyObj
             return 0;
         }
 
-        PyCodeObject *code = PyFrame_GetCode(frame);
+        /* Use cache if available, otherwise get fresh code object */
+        const char *ret_filename;
+        const char *ret_funcname;
+        int ret_is_coro;
+        int ret_cache_hit = (frame == g_cached_frame);
+        PyCodeObject *ret_code = NULL;
+        if (ret_cache_hit) {
+            ret_filename = g_cached_filename;
+            ret_funcname = g_cached_funcname;
+            ret_is_coro = g_cached_is_coro;
+        } else {
+            ret_code = PyFrame_GetCode(frame);
+            ret_filename = PyUnicode_AsUTF8(ret_code->co_filename);
+            ret_funcname = PyUnicode_AsUTF8(ret_code->co_qualname);
+            if (!ret_filename || !ret_funcname) { PyErr_Clear(); Py_DECREF(ret_code); return 0; }
+            ret_is_coro = (ret_code->co_flags & PYTTD_CORO_FLAGS) ? 1 : 0;
+        }
         int line_no = PyFrame_GetLineNumber(frame);
-        const char *filename = PyUnicode_AsUTF8(code->co_filename);
-        const char *funcname = PyUnicode_AsUTF8(code->co_qualname);
-        if (!filename || !funcname) { PyErr_Clear(); Py_DECREF(code); return 0; }
 
-        PyObject *return_key = PyUnicode_FromString("__return__");
-        const char *locals_json = serialize_locals((PyObject *)frame, g_locals_buf, sizeof(g_locals_buf), return_key, arg);
-        Py_XDECREF(return_key);
+        const char *locals_json = serialize_locals((PyObject *)frame, g_locals_buf, sizeof(g_locals_buf), g_str_dunder_return, arg);
 
         FrameEvent event;
         event.sequence_no = atomic_fetch_add_explicit(&g_sequence_counter, 1, memory_order_relaxed);
         event.line_no = line_no;
         event.call_depth = g_call_depth;
-        event.thread_id = PyThread_get_thread_ident();
-        event.timestamp = get_monotonic_time() - g_start_time;
+        event.thread_id = g_my_thread_id;
+        event.timestamp = get_monotonic_time() - g_start_time;  /* always fresh on RETURN */
         event.event_type = "return";
-        event.filename = filename;
-        event.function_name = funcname;
+        event.filename = ret_filename;
+        event.function_name = ret_funcname;
         event.locals_json = locals_json;
-        event.is_coroutine = (code->co_flags & PYTTD_CORO_FLAGS) ? 1 : 0;
+        event.is_coroutine = ret_is_coro;
 
         ringbuf_push(&event);
-        atomic_fetch_add_explicit(&g_frame_count, 1, memory_order_relaxed);
-        Py_DECREF(code);
+        if (ret_code) Py_DECREF(ret_code);
+
+        /* Invalidate cache — frame is being returned, CPython may recycle it */
+        g_cached_frame = NULL;
         return 0;
     }
 
@@ -949,39 +1120,48 @@ static int pyttd_trace_func(PyObject *obj, PyFrameObject *frame, int what, PyObj
         PyObject *save_type, *save_value, *save_tb;
         PyErr_Fetch(&save_type, &save_value, &save_tb);
 
-        PyCodeObject *code = PyFrame_GetCode(frame);
-        int line_no = PyFrame_GetLineNumber(frame);
-        const char *filename = PyUnicode_AsUTF8(code->co_filename);
-        const char *funcname = PyUnicode_AsUTF8(code->co_qualname);
-        if (!filename || !funcname) {
-            if (PyErr_Occurred()) PyErr_Clear();
-            Py_DECREF(code);
-            goto exc_restore;
+        /* Use cache if available */
+        const char *exc_filename;
+        const char *exc_funcname;
+        int exc_is_coro;
+        PyCodeObject *exc_code = NULL;
+        if (frame == g_cached_frame) {
+            exc_filename = g_cached_filename;
+            exc_funcname = g_cached_funcname;
+            exc_is_coro = g_cached_is_coro;
+        } else {
+            exc_code = PyFrame_GetCode(frame);
+            exc_filename = PyUnicode_AsUTF8(exc_code->co_filename);
+            exc_funcname = PyUnicode_AsUTF8(exc_code->co_qualname);
+            if (!exc_filename || !exc_funcname) {
+                if (PyErr_Occurred()) PyErr_Clear();
+                Py_DECREF(exc_code);
+                goto exc_restore;
+            }
+            exc_is_coro = (exc_code->co_flags & PYTTD_CORO_FLAGS) ? 1 : 0;
         }
+        int line_no = PyFrame_GetLineNumber(frame);
 
-        PyObject *exc_key = PyUnicode_FromString("__exception__");
         PyObject *exc_value = NULL;
         if (arg && PyTuple_Check(arg) && PyTuple_GET_SIZE(arg) >= 2) {
             exc_value = PyTuple_GET_ITEM(arg, 1);
         }
-        const char *locals_json = serialize_locals((PyObject *)frame, g_locals_buf, sizeof(g_locals_buf), exc_key, exc_value);
-        Py_XDECREF(exc_key);
+        const char *locals_json = serialize_locals((PyObject *)frame, g_locals_buf, sizeof(g_locals_buf), g_str_dunder_exception, exc_value);
 
         FrameEvent event;
         event.sequence_no = atomic_fetch_add_explicit(&g_sequence_counter, 1, memory_order_relaxed);
         event.line_no = line_no;
         event.call_depth = g_call_depth;
-        event.thread_id = PyThread_get_thread_ident();
-        event.timestamp = get_monotonic_time() - g_start_time;
+        event.thread_id = g_my_thread_id;
+        event.timestamp = get_monotonic_time() - g_start_time;  /* always fresh on EXCEPTION */
         event.event_type = "exception";
-        event.filename = filename;
-        event.function_name = funcname;
+        event.filename = exc_filename;
+        event.function_name = exc_funcname;
         event.locals_json = locals_json;
-        event.is_coroutine = (code->co_flags & PYTTD_CORO_FLAGS) ? 1 : 0;
+        event.is_coroutine = exc_is_coro;
 
         ringbuf_push(&event);
-        atomic_fetch_add_explicit(&g_frame_count, 1, memory_order_relaxed);
-        Py_DECREF(code);
+        if (exc_code) Py_DECREF(exc_code);
 
 exc_restore:
         /* Discard any errors from recording, restore original exception */
@@ -1088,8 +1268,10 @@ static PyObject *pyttd_eval_hook(PyThreadState *tstate,
     }
 
     /* Check stop request — only interrupt the main thread, not the flush thread.
-     * Use atomic exchange to clear the flag — fire only once. */
-    if (PyThread_get_thread_ident() == g_main_thread_id &&
+     * Use atomic exchange to clear the flag — fire only once.
+     * Note: g_my_thread_id may be 0 for the first eval hook call before
+     * ringbuf init; that's fine because g_main_thread_id is never 0. */
+    if (g_my_thread_id == g_main_thread_id &&
         atomic_exchange_explicit(&g_stop_requested, 0, memory_order_relaxed)) {
         PyErr_SetNone(PyExc_KeyboardInterrupt);
         return NULL;
@@ -1107,84 +1289,47 @@ static PyObject *pyttd_eval_hook(PyThreadState *tstate,
         return g_original_eval(tstate, iframe, throwflag);
     }
 
-    /* Check ignore filter */
-    if (should_ignore(filename, funcname)) {
-        /* Save current trace, remove it, eval, restore.
-         * Only call PyEval_SetTrace if trace is actually set
-         * to avoid events counter overflow (Python 3.13+). */
-        Py_tracefunc saved_trace = tstate->c_tracefunc;
-        PyObject *saved_traceobj = tstate->c_traceobj;
-        Py_XINCREF(saved_traceobj);
-
-        if (saved_trace) {
-            PyEval_SetTrace(NULL, NULL);
+    /* Unified filter check with cache (replaces 4 separate filter blocks) */
+    {
+        unsigned fc_idx = filter_cache_hash(filename, funcname);
+        int skip;
+        if (g_filter_cache[fc_idx].filename == filename &&
+            g_filter_cache[fc_idx].funcname == funcname &&
+            g_filter_cache[fc_idx].result >= 0) {
+            skip = g_filter_cache[fc_idx].result;
+        } else {
+            skip = should_ignore(filename, funcname)
+                || should_exclude(filename, funcname)
+                || !should_include_file(filename)
+                || !should_include(funcname);
+            g_filter_cache[fc_idx].filename = filename;
+            g_filter_cache[fc_idx].funcname = funcname;
+            g_filter_cache[fc_idx].result = skip ? 1 : 0;
         }
-
-        PyObject *result = g_original_eval(tstate, iframe, throwflag);
-
-        /* Restore previous trace (only if we removed it) */
-        if (saved_trace) {
-            PyEval_SetTrace(saved_trace, saved_traceobj);
+        if (skip) {
+            /* Save current trace, remove it, eval, restore.
+             * Only call PyEval_SetTrace if trace is actually set
+             * to avoid events counter overflow (Python 3.13+). */
+            Py_tracefunc saved_trace = tstate->c_tracefunc;
+            PyObject *saved_traceobj = tstate->c_traceobj;
+            Py_XINCREF(saved_traceobj);
+            if (saved_trace) {
+                PyEval_SetTrace(NULL, NULL);
+            }
+            PyObject *result = g_original_eval(tstate, iframe, throwflag);
+            if (saved_trace) {
+                PyEval_SetTrace(saved_trace, saved_traceobj);
+            }
+            Py_XDECREF(saved_traceobj);
+            Py_DECREF(code);
+            return result;
         }
-        Py_XDECREF(saved_traceobj);
-        Py_DECREF(code);
-        return result;
-    }
-
-    /* P1-6: Exclude filter — skip if excluded (takes precedence over includes) */
-    if (should_exclude(filename, funcname)) {
-        Py_tracefunc saved_trace = tstate->c_tracefunc;
-        PyObject *saved_traceobj = tstate->c_traceobj;
-        Py_XINCREF(saved_traceobj);
-        if (saved_trace) {
-            PyEval_SetTrace(NULL, NULL);
-        }
-        PyObject *result = g_original_eval(tstate, iframe, throwflag);
-        if (saved_trace) {
-            PyEval_SetTrace(saved_trace, saved_traceobj);
-        }
-        Py_XDECREF(saved_traceobj);
-        Py_DECREF(code);
-        return result;
-    }
-
-    /* P1-6: File include filter */
-    if (!should_include_file(filename)) {
-        Py_tracefunc saved_trace = tstate->c_tracefunc;
-        PyObject *saved_traceobj = tstate->c_traceobj;
-        Py_XINCREF(saved_traceobj);
-        if (saved_trace) {
-            PyEval_SetTrace(NULL, NULL);
-        }
-        PyObject *result = g_original_eval(tstate, iframe, throwflag);
-        if (saved_trace) {
-            PyEval_SetTrace(saved_trace, saved_traceobj);
-        }
-        Py_XDECREF(saved_traceobj);
-        Py_DECREF(code);
-        return result;
-    }
-
-    /* Phase 9B: Include filter — skip non-matching functions (same pattern as ignore) */
-    if (!should_include(funcname)) {
-        Py_tracefunc saved_trace = tstate->c_tracefunc;
-        PyObject *saved_traceobj = tstate->c_traceobj;
-        Py_XINCREF(saved_traceobj);
-        if (saved_trace) {
-            PyEval_SetTrace(NULL, NULL);
-        }
-        PyObject *result = g_original_eval(tstate, iframe, throwflag);
-        if (saved_trace) {
-            PyEval_SetTrace(saved_trace, saved_traceobj);
-        }
-        Py_XDECREF(saved_traceobj);
-        Py_DECREF(code);
-        return result;
     }
 
     /* Ensure per-thread ring buffer exists (lazy allocation on first frame) */
     if (!ringbuf_get_thread_buffer()) {
-        ringbuf_get_or_create(PyThread_get_thread_ident());
+        g_my_thread_id = PyThread_get_thread_ident();
+        ringbuf_get_or_create(g_my_thread_id);
     }
 
     /* Record call event */
@@ -1192,12 +1337,16 @@ static PyObject *pyttd_eval_hook(PyThreadState *tstate,
     int line_no = PyUnstable_InterpreterFrame_GetLine(iframe);
     int is_coro = (code->co_flags & PYTTD_CORO_FLAGS) ? 1 : 0;
 
+    /* Item 5: Always fresh timestamp on CALL (new frame) */
+    g_cached_timestamp = get_monotonic_time() - g_start_time;
+    g_timestamp_counter = 0;
+
     FrameEvent call_event;
     call_event.sequence_no = atomic_fetch_add_explicit(&g_sequence_counter, 1, memory_order_relaxed);
     call_event.line_no = line_no;
     call_event.call_depth = g_call_depth;
-    call_event.thread_id = PyThread_get_thread_ident();
-    call_event.timestamp = get_monotonic_time() - g_start_time;
+    call_event.thread_id = g_my_thread_id;
+    call_event.timestamp = g_cached_timestamp;
     call_event.event_type = "call";
     call_event.filename = filename;
     call_event.function_name = funcname;
@@ -1205,7 +1354,6 @@ static PyObject *pyttd_eval_hook(PyThreadState *tstate,
     call_event.is_coroutine = is_coro;
 
     ringbuf_push(&call_event);
-    atomic_fetch_add_explicit(&g_frame_count, 1, memory_order_relaxed);
 
     /* P1-4: Auto-stop when max_frames reached */
     if (g_max_frames > 0 && call_event.sequence_no >= g_max_frames) {
@@ -1251,8 +1399,8 @@ static PyObject *pyttd_eval_hook(PyThreadState *tstate,
         unwind_event.sequence_no = atomic_fetch_add_explicit(&g_sequence_counter, 1, memory_order_relaxed);
         unwind_event.line_no = line_no;
         unwind_event.call_depth = g_call_depth;
-        unwind_event.thread_id = PyThread_get_thread_ident();
-        unwind_event.timestamp = get_monotonic_time() - g_start_time;
+        unwind_event.thread_id = g_my_thread_id;
+        unwind_event.timestamp = get_monotonic_time() - g_start_time;  /* always fresh on exception_unwind */
         unwind_event.event_type = "exception_unwind";
         unwind_event.filename = filename;
         unwind_event.function_name = funcname;
@@ -1260,7 +1408,6 @@ static PyObject *pyttd_eval_hook(PyThreadState *tstate,
         unwind_event.is_coroutine = is_coro;
 
         ringbuf_push(&unwind_event);
-        atomic_fetch_add_explicit(&g_frame_count, 1, memory_order_relaxed);
     }
 
     /* Decrement call_depth */
@@ -1300,24 +1447,35 @@ static PyObject *pyttd_eval_hook_fast_forward(PyThreadState *tstate,
         return g_original_eval(tstate, iframe, throwflag);
     }
 
-    /* Check ignore filter */
-    if (should_ignore(filename, funcname)) {
-        Py_tracefunc saved_trace = tstate->c_tracefunc;
-        PyObject *saved_traceobj = tstate->c_traceobj;
-        Py_XINCREF(saved_traceobj);
-
-        if (saved_trace) {
-            PyEval_SetTrace(NULL, NULL);
+    /* Cache-backed filter check (same cache as main eval hook) */
+    {
+        unsigned fc_idx = filter_cache_hash(filename, funcname);
+        int skip;
+        if (g_filter_cache[fc_idx].filename == filename &&
+            g_filter_cache[fc_idx].funcname == funcname &&
+            g_filter_cache[fc_idx].result >= 0) {
+            skip = g_filter_cache[fc_idx].result;
+        } else {
+            skip = should_ignore(filename, funcname);
+            g_filter_cache[fc_idx].filename = filename;
+            g_filter_cache[fc_idx].funcname = funcname;
+            g_filter_cache[fc_idx].result = skip ? 1 : 0;
         }
-
-        PyObject *result = g_original_eval(tstate, iframe, throwflag);
-
-        if (saved_trace) {
-            PyEval_SetTrace(saved_trace, saved_traceobj);
+        if (skip) {
+            Py_tracefunc saved_trace = tstate->c_tracefunc;
+            PyObject *saved_traceobj = tstate->c_traceobj;
+            Py_XINCREF(saved_traceobj);
+            if (saved_trace) {
+                PyEval_SetTrace(NULL, NULL);
+            }
+            PyObject *result = g_original_eval(tstate, iframe, throwflag);
+            if (saved_trace) {
+                PyEval_SetTrace(saved_trace, saved_traceobj);
+            }
+            Py_XDECREF(saved_traceobj);
+            Py_DECREF(code);
+            return result;
         }
-        Py_XDECREF(saved_traceobj);
-        Py_DECREF(code);
-        return result;
     }
 
     /* Check thread */
@@ -1441,7 +1599,8 @@ static void flush_one_buffer(ThreadRingBuffer *rb) {
         PyObject *ln = PyLong_FromLong(e->line_no);
         PyObject *fn = e->filename ? PyUnicode_FromString(e->filename) : PyUnicode_FromString("");
         PyObject *func = e->function_name ? PyUnicode_FromString(e->function_name) : PyUnicode_FromString("");
-        PyObject *evt = PyUnicode_FromString(e->event_type);
+        PyObject *evt = event_type_to_pystr(e->event_type);
+        if (evt) { Py_INCREF(evt); } else { evt = PyUnicode_FromString(e->event_type); }
         PyObject *depth = PyLong_FromLong(e->call_depth);
         PyObject *locals_obj = e->locals_json ? PyUnicode_FromString(e->locals_json) : Py_NewRef(Py_None);
         PyObject *tid = PyLong_FromUnsignedLong(e->thread_id);
@@ -1459,16 +1618,17 @@ static void flush_one_buffer(ThreadRingBuffer *rb) {
             continue;
         }
 
-        if (PyDict_SetItemString(dict, "sequence_no", seq) < 0 ||
-            PyDict_SetItemString(dict, "timestamp", ts) < 0 ||
-            PyDict_SetItemString(dict, "line_no", ln) < 0 ||
-            PyDict_SetItemString(dict, "filename", fn) < 0 ||
-            PyDict_SetItemString(dict, "function_name", func) < 0 ||
-            PyDict_SetItemString(dict, "frame_event", evt) < 0 ||
-            PyDict_SetItemString(dict, "call_depth", depth) < 0 ||
-            PyDict_SetItemString(dict, "locals_snapshot", locals_obj) < 0 ||
-            PyDict_SetItemString(dict, "thread_id", tid) < 0 ||
-            PyDict_SetItemString(dict, "is_coroutine", is_coro) < 0) {
+        /* Use pre-interned key objects to avoid per-event string lookups */
+        if (PyDict_SetItem(dict, g_key_sequence_no, seq) < 0 ||
+            PyDict_SetItem(dict, g_key_timestamp, ts) < 0 ||
+            PyDict_SetItem(dict, g_key_line_no, ln) < 0 ||
+            PyDict_SetItem(dict, g_key_filename, fn) < 0 ||
+            PyDict_SetItem(dict, g_key_function_name, func) < 0 ||
+            PyDict_SetItem(dict, g_key_frame_event, evt) < 0 ||
+            PyDict_SetItem(dict, g_key_call_depth, depth) < 0 ||
+            PyDict_SetItem(dict, g_key_locals_snapshot, locals_obj) < 0 ||
+            PyDict_SetItem(dict, g_key_thread_id, tid) < 0 ||
+            PyDict_SetItem(dict, g_key_is_coroutine, is_coro) < 0) {
             PyErr_Clear();
         }
 
@@ -1677,7 +1837,6 @@ static void synthesize_existing_stack(void) {
         event.is_coroutine = is_coro;
 
         ringbuf_push(&event);
-        atomic_fetch_add_explicit(&g_frame_count, 1, memory_order_relaxed);
 
         Py_DECREF(stack[i].code);
     }
@@ -1748,10 +1907,18 @@ PyObject *pyttd_start_recording(PyObject *self, PyObject *args, PyObject *kwargs
     /* Reset counters */
     atomic_store_explicit(&g_sequence_counter, 0, memory_order_relaxed);
     g_call_depth = -1;  /* TLS — main thread */
-    atomic_store_explicit(&g_frame_count, 0, memory_order_relaxed);
     atomic_store_explicit(&g_flush_count, 0, memory_order_relaxed);
     g_stop_time = 0.0;
     g_inside_repr = 0;
+    g_cached_frame = NULL;
+    Py_XDECREF(g_cached_code); g_cached_code = NULL;
+    g_cached_filename = NULL;
+    g_cached_funcname = NULL;
+    g_cached_is_coro = 0;
+    g_line_sample_counter = 0;
+    memset(g_seen_lines, 0, sizeof(g_seen_lines));
+    g_cached_timestamp = 0.0;
+    g_timestamp_counter = 0;
     g_fast_forward = 0;
     g_fast_forward_target = 0;
     g_max_frames = 0;
@@ -1768,6 +1935,12 @@ PyObject *pyttd_start_recording(PyObject *self, PyObject *args, PyObject *kwargs
     atomic_store(&g_pause_requested, 0);
     atomic_store(&g_pause_acked, 0);
 #endif
+
+    /* Pre-intern constant strings for flush and trace hot paths */
+    intern_strings();
+
+    /* Initialize filter cache */
+    memset(g_filter_cache, 0xFF, sizeof(g_filter_cache));
 
     /* Save flush callback */
     g_flush_callback = callback;
@@ -1795,6 +1968,7 @@ PyObject *pyttd_start_recording(PyObject *self, PyObject *args, PyObject *kwargs
 
     /* Record main thread ID and start time */
     g_main_thread_id = PyThread_get_thread_ident();
+    g_my_thread_id = g_main_thread_id;
     g_start_time = get_monotonic_time();
 
     /* Pre-create main thread's ring buffer */
@@ -1875,6 +2049,12 @@ PyObject *pyttd_stop_recording(PyObject *self, PyObject *Py_UNUSED(args)) {
 
     g_stop_time = get_monotonic_time();
     atomic_store_explicit(&g_recording, 0, memory_order_relaxed);
+
+    /* Release code object cache */
+    g_cached_frame = NULL;
+    Py_XDECREF(g_cached_code); g_cached_code = NULL;
+    g_cached_filename = NULL;
+    g_cached_funcname = NULL;
     atomic_store_explicit(&g_stop_requested, 0, memory_order_relaxed);
 
     /* Clear recording environment variable */
@@ -1932,6 +2112,9 @@ PyObject *pyttd_stop_recording(PyObject *self, PyObject *Py_UNUSED(args)) {
     /* Destroy ring buffer system */
     ringbuf_system_destroy();
 
+    /* Release pre-interned strings */
+    release_interned_strings();
+
     /* Release callbacks — NOTE: do NOT kill checkpoint children here,
      * they're needed for replay */
     Py_XDECREF(g_flush_callback);
@@ -1952,7 +2135,7 @@ PyObject *pyttd_get_recording_stats(PyObject *self, PyObject *Py_UNUSED(args)) {
     PyObject *dict = PyDict_New();
     if (!dict) return NULL;
 
-    PyObject *fc = PyLong_FromUnsignedLongLong(atomic_load_explicit(&g_frame_count, memory_order_relaxed));
+    PyObject *fc = PyLong_FromUnsignedLongLong(atomic_load_explicit(&g_sequence_counter, memory_order_relaxed));
     PyObject *df = PyLong_FromUnsignedLongLong(rb_stats.dropped_frames);
     PyObject *et = PyFloat_FromDouble(elapsed);
     PyObject *flc = PyLong_FromUnsignedLongLong(atomic_load_explicit(&g_flush_count, memory_order_relaxed));

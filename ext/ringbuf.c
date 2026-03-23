@@ -16,6 +16,18 @@ static pthread_key_t g_rb_key;
 static int g_rb_key_created = 0;
 #endif
 static PYTTD_THREAD_LOCAL ThreadRingBuffer *g_my_rb = NULL;
+
+/* Item 1: TLS string pool pointer cache — avoids redundant pool_copy_string
+ * when filename/funcname are the same as the previous push (common in tight loops).
+ * g_last_pool_idx tracks which pool was active when cache was populated.
+ * When the flush thread swaps pools (changing producer_idx), the mismatch
+ * invalidates the cache on the producer thread's next push. */
+static PYTTD_THREAD_LOCAL const char *g_last_fn_src = NULL;
+static PYTTD_THREAD_LOCAL char *g_last_fn_dst = NULL;
+static PYTTD_THREAD_LOCAL const char *g_last_func_src = NULL;
+static PYTTD_THREAD_LOCAL char *g_last_func_dst = NULL;
+static PYTTD_THREAD_LOCAL int g_last_pool_idx = -1;
+
 static uint32_t g_per_thread_capacity = PYTTD_PER_THREAD_CAPACITY;
 static size_t g_per_thread_pool_size = PYTTD_PER_THREAD_POOL_SIZE;
 static int g_system_initialized = 0;
@@ -166,6 +178,12 @@ void ringbuf_system_destroy(void) {
     pthread_mutex_unlock(&g_registry_mutex);
 #endif
     g_my_rb = NULL;
+    /* Reset TLS string cache */
+    g_last_fn_src = NULL;
+    g_last_fn_dst = NULL;
+    g_last_func_src = NULL;
+    g_last_func_dst = NULL;
+    g_last_pool_idx = -1;
     g_system_initialized = 0;
 }
 
@@ -229,11 +247,27 @@ int ringbuf_push_to(ThreadRingBuffer *rb, const FrameEvent *event) {
     slot->event_type = event->event_type;
     slot->is_coroutine = event->is_coroutine;
 
-    slot->filename = pool_copy_string(pool, event->filename);
-    if (event->filename && !slot->filename) pool_overflow = 1;
+    /* Item 1: TLS pointer cache — reuse pool destination if source pointer unchanged
+     * AND pool hasn't been swapped by the flush thread since cache was populated. */
+    int cache_valid = (rb->producer_idx == g_last_pool_idx);
 
-    slot->function_name = pool_copy_string(pool, event->function_name);
-    if (event->function_name && !slot->function_name) pool_overflow = 1;
+    if (cache_valid && event->filename == g_last_fn_src && g_last_fn_dst) {
+        slot->filename = g_last_fn_dst;
+    } else {
+        slot->filename = pool_copy_string(pool, event->filename);
+        if (event->filename && !slot->filename) { pool_overflow = 1; }
+        else { g_last_fn_src = event->filename; g_last_fn_dst = (char *)slot->filename; }
+    }
+
+    if (cache_valid && event->function_name == g_last_func_src && g_last_func_dst) {
+        slot->function_name = g_last_func_dst;
+    } else {
+        slot->function_name = pool_copy_string(pool, event->function_name);
+        if (event->function_name && !slot->function_name) { pool_overflow = 1; }
+        else { g_last_func_src = event->function_name; g_last_func_dst = (char *)slot->function_name; }
+    }
+
+    g_last_pool_idx = rb->producer_idx;
 
     if (pool_overflow) {
         slot->locals_json = NULL;
@@ -280,7 +314,12 @@ int ringbuf_pop_batch_from(ThreadRingBuffer *rb, FrameEvent *out,
 /* ---- Pool Management ---- */
 
 void ringbuf_pool_swap_for(ThreadRingBuffer *rb) {
-    if (rb) rb->producer_idx = 1 - rb->producer_idx;
+    if (rb) {
+        rb->producer_idx = 1 - rb->producer_idx;
+        /* Cache invalidation is handled in ringbuf_push_to() by checking
+         * rb->producer_idx vs g_last_pool_idx. No TLS reset needed here
+         * because this runs on the flush thread, not the producer thread. */
+    }
 }
 
 void ringbuf_pool_reset_consumer_for(ThreadRingBuffer *rb) {

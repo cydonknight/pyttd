@@ -4,6 +4,7 @@ import os
 import pyttd_native
 from pyttd.config import PyttdConfig
 from pyttd.models import storage
+from pyttd.models.base import db
 from pyttd.models.frames import ExecutionFrames
 from pyttd.models.runs import Runs
 from pyttd.models.checkpoints import Checkpoint
@@ -28,6 +29,23 @@ class Recorder:
         self._db_path = db_path
         storage.connect_to_db(db_path)
         storage.initialize_schema([Runs, ExecutionFrames, Checkpoint, IOEvent])
+
+        # Item 6: Drop secondary indexes during recording to speed up inserts.
+        # The unique (run_id, sequence_no) index is kept for correctness.
+        # Indexes are rebuilt in stop().
+        _drop_sql = [
+            'DROP INDEX IF EXISTS "executionframes_run_id_filename_line_no"',
+            'DROP INDEX IF EXISTS "executionframes_run_id_function_name"',
+            'DROP INDEX IF EXISTS "executionframes_run_id_frame_event_sequence_no"',
+            'DROP INDEX IF EXISTS "executionframes_run_id_call_depth_sequence_no"',
+            'DROP INDEX IF EXISTS "executionframes_run_id_thread_id_sequence_no"',
+        ]
+        for sql in _drop_sql:
+            try:
+                db.execute_sql(sql)
+            except Exception:
+                pass
+
         # Clear stale checkpoint state from crashed sessions (pid-liveness check).
         # Wrapped in try/except because orphaned WAL files from a prior killed
         # recording can cause "database is locked" on the UPDATE.
@@ -107,6 +125,21 @@ class Recorder:
         pyttd_native.stop_recording()
         self._recording = False
         os.environ.pop('PYTTD_RECORDING', None)
+
+        # Item 6: Rebuild secondary indexes now that recording is done.
+        _create_sql = [
+            'CREATE INDEX IF NOT EXISTS "executionframes_run_id_filename_line_no" ON "executionframes" ("run_id", "filename", "line_no")',
+            'CREATE INDEX IF NOT EXISTS "executionframes_run_id_function_name" ON "executionframes" ("run_id", "function_name")',
+            'CREATE INDEX IF NOT EXISTS "executionframes_run_id_frame_event_sequence_no" ON "executionframes" ("run_id", "frame_event", "sequence_no")',
+            'CREATE INDEX IF NOT EXISTS "executionframes_run_id_call_depth_sequence_no" ON "executionframes" ("run_id", "call_depth", "sequence_no")',
+            'CREATE INDEX IF NOT EXISTS "executionframes_run_id_thread_id_sequence_no" ON "executionframes" ("run_id", "thread_id", "sequence_no")',
+        ]
+        for sql in _create_sql:
+            try:
+                db.execute_sql(sql)
+            except Exception:
+                logger.debug("Failed to rebuild index: %s", sql)
+
         stats = pyttd_native.get_recording_stats()
         if self._run:
             self._run.timestamp_end = datetime.now().timestamp()
