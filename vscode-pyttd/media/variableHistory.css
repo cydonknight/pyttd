@@ -1,0 +1,106 @@
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    background: var(--vscode-editor-background);
+    color: var(--vscode-editor-foreground);
+    font-family: var(--vscode-font-family);
+    font-size: var(--vscode-font-size);
+    overflow-x: hidden;
+    overflow-y: auto;
+}
+
+#container {
+    width: 100%;
+    padding: 4px;
+}
+
+#placeholder {
+    padding: 16px 8px;
+    text-align: center;
+    opacity: 0.6;
+    font-style: italic;
+}
+
+#header {
+    padding: 4px 8px;
+    border-bottom: 1px solid var(--vscode-editorWidget-border, #454545);
+    margin-bottom: 4px;
+}
+
+#var-name {
+    font-weight: bold;
+}
+
+#var-count {
+    opacity: 0.7;
+    margin-left: 8px;
+    font-size: 0.9em;
+}
+
+#chart-canvas {
+    display: block;
+    width: 100%;
+    height: 120px;
+    cursor: crosshair;
+}
+
+#table-container {
+    max-height: 400px;
+    overflow-y: auto;
+}
+
+#history-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+}
+
+#history-table th {
+    text-align: left;
+    padding: 4px 6px;
+    border-bottom: 1px solid var(--vscode-editorWidget-border, #454545);
+    background: var(--vscode-editorWidget-background, #252526);
+    position: sticky;
+    top: 0;
+    z-index: 1;
+}
+
+#history-table td {
+    padding: 3px 6px;
+    border-bottom: 1px solid var(--vscode-editorWidget-border, #333);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 200px;
+}
+
+#history-table tr {
+    cursor: pointer;
+}
+
+#history-table tr:hover {
+    background: var(--vscode-list-hoverBackground, #2a2d2e);
+}
+
+#history-table tr.selected {
+    background: var(--vscode-list-activeSelectionBackground, #094771);
+    color: var(--vscode-list-activeSelectionForeground, #fff);
+}
+
+.tooltip {
+    position: absolute;
+    display: none;
+    background: var(--vscode-editorHoverWidget-background, #252526);
+    border: 1px solid var(--vscode-editorHoverWidget-border, #454545);
+    color: var(--vscode-editorHoverWidget-foreground, #cccccc);
+    padding: 4px 8px;
+    font-size: 11px;
+    pointer-events: none;
+    white-space: nowrap;
+    z-index: 10;
+    border-radius: 2px;
+}

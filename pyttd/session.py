@@ -638,6 +638,7 @@ class Session:
 
         return [{
             'functionName': r['function_name'],
+            'shortName': r['function_name'].rsplit('.', 1)[-1] if '.' in r['function_name'] else r['function_name'],
             'callCount': r['call_count'] or 0,
             'exceptionCount': r['exception_count'] or 0,
             'firstCallSeq': r['first_call_seq'],
@@ -710,8 +711,69 @@ class Session:
                 'hasException': (return_ev.frame_event == 'exception_unwind'
                                  if return_ev else False),
                 'isComplete': return_ev is not None,
+                'isCoroutine': bool(getattr(ev, 'is_coroutine', False)),
             })
+        results = self._merge_coroutine_entries(results)
         return results
+
+    def _merge_coroutine_entries(self, results: list[dict]) -> list[dict]:
+        """Merge consecutive call/return pairs for the same coroutine function.
+
+        When a coroutine suspends, it produces a return event followed by a call
+        event for the same function at the same depth. This looks like separate
+        invocations but is logically one execution with N suspensions.
+        """
+        if not results:
+            return results
+
+        merged = []
+        i = 0
+        while i < len(results):
+            entry = dict(results[i])  # copy
+            suspend_count = 0
+
+            while (i + 1 < len(results) and
+                   entry.get('isCoroutine') and
+                   results[i + 1].get('isCoroutine') and
+                   results[i + 1]['functionName'] == entry['functionName'] and
+                   entry.get('returnSeq') is not None):
+                next_call_seq = results[i + 1]['callSeq']
+                curr_return_seq = entry['returnSeq']
+                if next_call_seq > curr_return_seq and next_call_seq - curr_return_seq <= 5:
+                    suspend_count += 1
+                    entry['returnSeq'] = results[i + 1].get('returnSeq')
+                    entry['isComplete'] = results[i + 1].get('isComplete', False)
+                    i += 1
+                else:
+                    break
+
+            if suspend_count > 0:
+                entry['suspendCount'] = suspend_count
+            merged.append(entry)
+            i += 1
+
+        return merged
+
+    def get_coroutine_suspensions(self, call_seq: int, return_seq: int) -> list[dict]:
+        """Return suspend/resume points within a merged coroutine call."""
+        self._require_replay()
+        events = db.fetchall(
+            "SELECT * FROM executionframes"
+            " WHERE run_id = ? AND sequence_no >= ? AND sequence_no <= ?"
+            " AND frame_event IN ('call', 'return')"
+            " ORDER BY sequence_no",
+            (str(self.run_id), call_seq, return_seq))
+
+        suspensions = []
+        for i in range(len(events) - 1):
+            if (events[i].frame_event == 'return' and
+                    events[i + 1].frame_event == 'call' and
+                    events[i].function_name == events[i + 1].function_name):
+                suspensions.append({
+                    'suspendSeq': events[i].sequence_no,
+                    'resumeSeq': events[i + 1].sequence_no,
+                })
+        return suspensions
 
     # --- Phase 10B: Variable History ---
 

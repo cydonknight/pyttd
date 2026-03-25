@@ -94,3 +94,24 @@ def get_line_code(filename: str, line_no: int) -> str:
     """Lazily fetch source line via linecache (not stored in DB)."""
     import linecache
     return linecache.getline(filename, line_no).strip()
+
+
+def search_frames(run_id, pattern: str, limit: int = 50) -> list:
+    """Search frames by substring match on function_name or filename."""
+    return db.fetchall(
+        "SELECT * FROM executionframes"
+        " WHERE run_id = ? AND"
+        " (function_name LIKE '%' || ? || '%' OR filename LIKE '%' || ? || '%')"
+        " ORDER BY sequence_no LIMIT ?",
+        (str(run_id), pattern, pattern, limit)
+    )
+
+
+def get_frames_by_thread(run_id, thread_id: int, limit: int = 50) -> list:
+    """Return frames for a specific thread, ordered by sequence_no."""
+    return db.fetchall(
+        "SELECT * FROM executionframes"
+        " WHERE run_id = ? AND thread_id = ?"
+        " ORDER BY sequence_no LIMIT ?",
+        (str(run_id), thread_id, limit)
+    )

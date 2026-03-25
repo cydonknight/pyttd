@@ -374,13 +374,25 @@ static int has_glob_chars(const char *s) {
     return 0;
 }
 
+/* Extract bare function name from a qualified name.
+ * "main.<locals>.failing" -> "failing"
+ * "OuterClass.method"     -> "method"
+ * "simple"                -> "simple"
+ */
+static const char *bare_name(const char *qualname) {
+    const char *last_dot = strrchr(qualname, '.');
+    return last_dot ? last_dot + 1 : qualname;
+}
+
 static int should_include(const char *funcname) {
     if (!g_include_mode) return 1;
     /* <module> always included — top-level code must record */
     if (strcmp(funcname, "<module>") == 0) return 1;
+    const char *bname = bare_name(funcname);
     for (int i = 0; i < g_include_filter.count; i++) {
 #ifndef _WIN32
-        if (fnmatch(g_include_filter.patterns[i], funcname, 0) == 0) {
+        if (fnmatch(g_include_filter.patterns[i], funcname, 0) == 0 ||
+            fnmatch(g_include_filter.patterns[i], bname, 0) == 0) {
             return 1;
         }
 #else
@@ -423,9 +435,11 @@ static int should_exclude(const char *filename, const char *funcname) {
     if (!g_exclude_mode) return 0;
     /* Never exclude <module> — script entry must always record */
     if (strcmp(funcname, "<module>") == 0) return 0;
+    const char *bname = bare_name(funcname);
     for (int i = 0; i < g_exclude_func_filter.count; i++) {
 #ifndef _WIN32
-        if (fnmatch(g_exclude_func_filter.patterns[i], funcname, 0) == 0) return 1;
+        if (fnmatch(g_exclude_func_filter.patterns[i], funcname, 0) == 0 ||
+            fnmatch(g_exclude_func_filter.patterns[i], bname, 0) == 0) return 1;
 #else
         if (strstr(funcname, g_exclude_func_filter.patterns[i]) != NULL) return 1;
 #endif
@@ -511,6 +525,14 @@ static int is_expandable(PyObject *value) {
         PyObject *tp = (PyObject *)Py_TYPE(value);
         /* Skip types defined in C (builtins, extensions) — only expand Python classes */
         if (((PyTypeObject *)tp)->tp_flags & Py_TPFLAGS_HEAPTYPE) {
+            return 1;
+        }
+    }
+    /* User objects with __slots__ but no __dict__ (slots-only classes) */
+    {
+        PyObject *cls = (PyObject *)Py_TYPE(value);
+        if (((PyTypeObject *)cls)->tp_flags & Py_TPFLAGS_HEAPTYPE &&
+            PyObject_HasAttrString(cls, "__slots__")) {
             return 1;
         }
     }
@@ -627,6 +649,19 @@ static int serialize_expandable_value(PyObject *value, char *buf, size_t buf_siz
             child_count++;
         }
     } else if (PyList_Check(value) || PyTuple_Check(value)) {
+        /* Check for NamedTuple: tuple subclass with a _fields attribute */
+        PyObject *fields = NULL;
+        int is_namedtuple = 0;
+        if (PyTuple_Check(value) && PyObject_HasAttrString(value, "_fields")) {
+            fields = PyObject_GetAttrString(value, "_fields");
+            if (fields && PyTuple_Check(fields)) {
+                is_namedtuple = 1;
+            } else {
+                Py_XDECREF(fields);
+                fields = NULL;
+                PyErr_Clear();
+            }
+        }
         Py_ssize_t len = PyList_Check(value) ? PyList_GET_SIZE(value) : PyTuple_GET_SIZE(value);
         Py_ssize_t limit = len < MAX_CHILDREN ? len : MAX_CHILDREN;
         for (Py_ssize_t i = 0; i < limit; i++) {
@@ -644,9 +679,28 @@ static int serialize_expandable_value(PyObject *value, char *buf, size_t buf_siz
             }
             child_first = 0;
             const char *itype = item->ob_type->tp_name;
-            n = snprintf(buf + *pos, buf_size - *pos, "{\"key\": \"%zd\", \"value\": \"", i);
-            if (n < 0 || (size_t)n >= buf_size - *pos) { Py_DECREF(irepr); break; }
-            *pos += n;
+            /* Use field name for NamedTuples, numeric index otherwise */
+            if (is_namedtuple && i < PyTuple_GET_SIZE(fields)) {
+                const char *fname = PyUnicode_AsUTF8(PyTuple_GET_ITEM(fields, i));
+                if (fname) {
+                    if (*pos + 50 >= buf_size) { Py_DECREF(irepr); break; }
+                    memcpy(buf + *pos, "{\"key\": \"", 9); *pos += 9;
+                    esc_len = json_escape_string(fname, buf + *pos, buf_size - *pos - 40);
+                    if (esc_len < 0) { Py_DECREF(irepr); break; }
+                    *pos += esc_len;
+                    if (*pos + 16 >= buf_size) { Py_DECREF(irepr); break; }
+                    memcpy(buf + *pos, "\", \"value\": \"", 13); *pos += 13;
+                } else {
+                    PyErr_Clear();
+                    n = snprintf(buf + *pos, buf_size - *pos, "{\"key\": \"%zd\", \"value\": \"", i);
+                    if (n < 0 || (size_t)n >= buf_size - *pos) { Py_DECREF(irepr); break; }
+                    *pos += n;
+                }
+            } else {
+                n = snprintf(buf + *pos, buf_size - *pos, "{\"key\": \"%zd\", \"value\": \"", i);
+                if (n < 0 || (size_t)n >= buf_size - *pos) { Py_DECREF(irepr); break; }
+                *pos += n;
+            }
             if (*pos + 30 >= buf_size) { Py_DECREF(irepr); break; }
             esc_len = json_escape_string(is, buf + *pos, buf_size - *pos - 30);
             Py_DECREF(irepr);
@@ -657,6 +711,7 @@ static int serialize_expandable_value(PyObject *value, char *buf, size_t buf_siz
             *pos += n;
             child_count++;
         }
+        Py_XDECREF(fields);
     } else if (PySet_Check(value)) {
         PyObject *iter = PyObject_GetIter(value);
         if (iter) {
@@ -697,7 +752,7 @@ static int serialize_expandable_value(PyObject *value, char *buf, size_t buf_siz
             PyErr_Clear();
         }
     } else {
-        /* Object with __dict__ */
+        /* Object: iterate __dict__ first, then __slots__ */
         PyObject *obj_dict = PyObject_GetAttrString(value, "__dict__");
         if (obj_dict && PyDict_Check(obj_dict)) {
             PyObject *key, *val;
@@ -737,6 +792,52 @@ static int serialize_expandable_value(PyObject *value, char *buf, size_t buf_siz
             }
         }
         Py_XDECREF(obj_dict);
+        if (PyErr_Occurred()) PyErr_Clear();
+
+        /* Also iterate __slots__ (handles slots-only classes and mixed dict+slots) */
+        PyObject *cls = (PyObject *)Py_TYPE(value);
+        PyObject *slots = PyObject_GetAttrString(cls, "__slots__");
+        if (slots && (PyTuple_Check(slots) || PyList_Check(slots))) {
+            Py_ssize_t nslots = PyTuple_Check(slots) ? PyTuple_GET_SIZE(slots) : PyList_GET_SIZE(slots);
+            for (Py_ssize_t i = 0; i < nslots && child_count < MAX_CHILDREN; i++) {
+                PyObject *slot_name = PyTuple_Check(slots) ? PyTuple_GET_ITEM(slots, i) : PyList_GET_ITEM(slots, i);
+                const char *name_str = PyUnicode_AsUTF8(slot_name);
+                if (!name_str) { PyErr_Clear(); continue; }
+                PyObject *slot_val = PyObject_GetAttr(value, slot_name);
+                if (!slot_val) { PyErr_Clear(); continue; }  /* unset slot */
+                g_inside_repr = 1;
+                PyObject *vrepr = PyObject_Repr(slot_val);
+                g_inside_repr = 0;
+                if (!vrepr) { Py_DECREF(slot_val); PyErr_Clear(); continue; }
+                const char *vs = PyUnicode_AsUTF8(vrepr);
+                if (!vs) { Py_DECREF(vrepr); Py_DECREF(slot_val); PyErr_Clear(); continue; }
+                if (!child_first) {
+                    if (*pos + 2 >= buf_size) { Py_DECREF(vrepr); Py_DECREF(slot_val); break; }
+                    buf[(*pos)++] = ',';
+                    buf[(*pos)++] = ' ';
+                }
+                child_first = 0;
+                const char *vtype = slot_val->ob_type->tp_name;
+                if (*pos + 50 >= buf_size) { Py_DECREF(vrepr); Py_DECREF(slot_val); break; }
+                memcpy(buf + *pos, "{\"key\": \"", 9); *pos += 9;
+                esc_len = json_escape_string(name_str, buf + *pos, buf_size - *pos - 40);
+                if (esc_len < 0) { Py_DECREF(vrepr); Py_DECREF(slot_val); break; }
+                *pos += esc_len;
+                if (*pos + 44 >= buf_size) { Py_DECREF(vrepr); Py_DECREF(slot_val); break; }
+                memcpy(buf + *pos, "\", \"value\": \"", 13); *pos += 13;
+                if (*pos + 30 >= buf_size) { Py_DECREF(vrepr); Py_DECREF(slot_val); break; }
+                esc_len = json_escape_string(vs, buf + *pos, buf_size - *pos - 30);
+                Py_DECREF(vrepr);
+                Py_DECREF(slot_val);
+                if (esc_len < 0) break;
+                *pos += esc_len;
+                n = snprintf(buf + *pos, buf_size - *pos, "\", \"type\": \"%s\"}", vtype);
+                if (n < 0 || (size_t)n >= buf_size - *pos) break;
+                *pos += n;
+                child_count++;
+            }
+        }
+        Py_XDECREF(slots);
         if (PyErr_Occurred()) PyErr_Clear();
     }
 

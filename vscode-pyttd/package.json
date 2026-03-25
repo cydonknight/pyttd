@@ -102,6 +102,12 @@
           "group": "debug@1"
         }
       ],
+      "debug/variables/context": [
+        {
+          "command": "pyttd.showVariableHistory",
+          "when": "debugType == 'pyttd'"
+        }
+      ],
       "commandPalette": [
         {
           "command": "pyttd.exportPerfetto",
@@ -136,6 +142,12 @@
         {
           "id": "pyttd.callHistory",
           "name": "Call History",
+          "when": "debugType == 'pyttd'"
+        },
+        {
+          "type": "webview",
+          "id": "pyttd.variableHistory",
+          "name": "Variable History",
           "when": "debugType == 'pyttd'"
         }
       ]

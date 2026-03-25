@@ -6,6 +6,7 @@ import { PyttdCodeLensProvider } from './providers/codeLensProvider';
 import { PyttdInlineValuesProvider } from './providers/inlineValuesProvider';
 import { PyttdCallHistoryProvider } from './providers/callHistoryProvider';
 import { PyttdStatusBarProvider } from './providers/statusBarProvider';
+import { VariableHistoryProvider } from './providers/variableHistoryProvider';
 
 export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(
@@ -41,6 +42,12 @@ export function activate(context: vscode.ExtensionContext) {
     const timelineProvider = new TimelineScrubberProvider(context.extensionUri);
     context.subscriptions.push(
         vscode.window.registerWebviewViewProvider('pyttd.timeline', timelineProvider)
+    );
+
+    // Register variable history webview provider
+    const varHistoryProvider = new VariableHistoryProvider(context.extensionUri);
+    context.subscriptions.push(
+        vscode.window.registerWebviewViewProvider('pyttd.variableHistory', varHistoryProvider)
     );
 
     // Status bar provider
@@ -101,7 +108,7 @@ export function activate(context: vscode.ExtensionContext) {
         }),
     );
 
-    // P1-3: Show Variable History command
+    // P1-3: Show Variable History command (webview panel)
     context.subscriptions.push(
         vscode.commands.registerCommand('pyttd.showVariableHistory', async () => {
             const session = vscode.debug.activeDebugSession;
@@ -119,18 +126,11 @@ export function activate(context: vscode.ExtensionContext) {
                     variableName: varName,
                     startSeq: 0,
                     endSeq: 999999999,
-                    maxPoints: 100,
+                    maxPoints: 500,
                 });
-                const channel = vscode.window.createOutputChannel('pyttd Variable History');
-                channel.clear();
-                channel.appendLine(`History of '${varName}':`);
-                for (const entry of result.history || []) {
-                    channel.appendLine(`  seq ${entry.seq}: ${entry.value} (${entry.filename}:${entry.line})`);
-                }
-                if (!result.history || result.history.length === 0) {
-                    channel.appendLine('  (no changes found in recording)');
-                }
-                channel.show();
+                varHistoryProvider.showHistory(varName, result.history || []);
+                // Focus the variable history panel
+                vscode.commands.executeCommand('pyttd.variableHistory.focus');
             } catch (e: any) {
                 vscode.window.showErrorMessage(`Failed to get variable history: ${e.message}`);
             }
