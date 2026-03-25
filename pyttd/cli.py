@@ -5,6 +5,41 @@ import sys
 
 logger = logging.getLogger(__name__)
 
+EXIT_OK = 0
+EXIT_USER_ERROR = 1      # bad arguments, missing file
+EXIT_RECORDING_ERROR = 2  # recording failed
+EXIT_SCRIPT_ERROR = 3     # recorded script raised an exception
+
+
+def _format_stats(stats: dict) -> str:
+    fc = stats.get('frame_count', 0)
+    dropped = stats.get('dropped_frames', 0)
+    elapsed = stats.get('elapsed_time', 0.0)
+    rate = fc / elapsed if elapsed > 0 else 0
+    pool_ov = stats.get('pool_overflows', 0)
+    cp_count = stats.get('checkpoint_count', 0)
+    cp_mem = stats.get('checkpoint_memory_bytes', 0)
+
+    lines = []
+    lines.append(f"Recorded {fc:,} frames in {elapsed:.1f}s ({rate:,.0f} frames/sec).")
+
+    if dropped > 0:
+        lines.append(
+            f"WARNING: {dropped:,} frames dropped (ring buffer full). "
+            "Increase buffer size with --checkpoint-interval or reduce "
+            "recording scope with --include/--exclude."
+        )
+    if pool_ov > 0:
+        lines.append(
+            f"WARNING: {pool_ov:,} string pool overflows. "
+            "Some variable snapshots may be truncated."
+        )
+    if cp_count > 0:
+        cp_mb = cp_mem / (1024 * 1024)
+        lines.append(f"{cp_count} checkpoint(s), {cp_mb:.1f} MB total RSS.")
+
+    return "\n".join(lines)
+
 def main():
     from pyttd import __version__
     parser = argparse.ArgumentParser(prog='pyttd', description='Python Time-Travel Debugger')
@@ -47,6 +82,12 @@ def main():
                               help='Query specific run by UUID or prefix')
     query_parser.add_argument('--frames', action='store_true')
     query_parser.add_argument('--limit', type=int, default=50)
+    query_parser.add_argument('--search', type=str, default=None,
+                              help='Search frames by function name or filename substring')
+    query_parser.add_argument('--thread', type=int, default=None,
+                              help='Filter frames by thread ID')
+    query_parser.add_argument('--list-threads', action='store_true',
+                              help='List all thread IDs in the recording')
     query_parser.add_argument('--db', type=str, default=None)
 
     replay_parser = subparsers.add_parser('replay', help='Replay a recorded session')
@@ -116,7 +157,7 @@ def main():
 
     if args.command is None:
         parser.print_help()
-        sys.exit(1)
+        sys.exit(EXIT_USER_ERROR)
 
     if args.command == 'record':
         _cmd_record(args)
@@ -143,7 +184,7 @@ def _cmd_record(args):
     else:
         if not os.path.isfile(args.script):
             print(f"Error: script not found: {args.script}", file=sys.stderr)
-            sys.exit(1)
+            sys.exit(EXIT_USER_ERROR)
         script_abs = os.path.realpath(args.script)
         cwd = os.path.dirname(script_abs) or '.'
 
@@ -203,12 +244,15 @@ def _cmd_record(args):
     if script_error:
         if limit_stop:
             if args.max_frames > 0 and stats.get('frame_count', 0) >= args.max_frames:
-                print(f"Recording stopped: frame limit reached ({stats.get('frame_count', 0)} frames)")
+                print(f"Recording stopped: frame limit reached")
             else:
                 print(f"Recording stopped: database size limit reached")
+            print(_format_stats(stats))
         else:
             print(f"Script exited with {type(script_error).__name__}: {script_error}")
-    print(f"Recording complete: {stats}")
+            print(_format_stats(stats))
+    else:
+        print(_format_stats(stats))
 
     # Multi-run guidance
     from pyttd.models import storage as _storage
@@ -235,7 +279,7 @@ def _cmd_serve(args):
     if args.script:
         if not args.module and not os.path.isfile(args.script):
             print(f"Error: script not found: {args.script}", file=sys.stderr)
-            sys.exit(1)
+            sys.exit(EXIT_USER_ERROR)
         include_functions = args.include if args.include is not None else []
         env_vars = {}
         if args.env_file:
@@ -265,7 +309,7 @@ def _cmd_serve(args):
         db_path = args.db
         if not os.path.isfile(db_path):
             print(f"Error: database not found: {db_path}", file=sys.stderr)
-            sys.exit(1)
+            sys.exit(EXIT_USER_ERROR)
         server = PyttdServer(
             script=None,
             is_module=False,
@@ -277,9 +321,13 @@ def _cmd_serve(args):
     server.run()
 
 def _cmd_query(args):
-    from pyttd.query import get_last_run, get_all_runs, get_run_by_id, get_frames, get_line_code
+    from pyttd.query import (
+        get_last_run, get_all_runs, get_run_by_id, get_frames, get_line_code,
+        search_frames, get_frames_by_thread,
+    )
     from pyttd.models.constants import DB_NAME_SUFFIX
     from pyttd.models import storage
+    from pyttd.models.db import db as _db
     import glob as globmod
 
     db_path = args.db
@@ -287,12 +335,12 @@ def _cmd_query(args):
         dbs = sorted(globmod.glob(f"*{DB_NAME_SUFFIX}"), key=os.path.getmtime, reverse=True)
         if not dbs:
             print("No .pyttd.db files found in current directory. Use --db to specify path.")
-            sys.exit(1)
+            sys.exit(EXIT_USER_ERROR)
         db_path = dbs[0]
 
     if not os.path.exists(db_path):
         print(f"Database file not found: {db_path}")
-        sys.exit(1)
+        sys.exit(EXIT_USER_ERROR)
 
     try:
         if args.list_runs:
@@ -320,14 +368,51 @@ def _cmd_query(args):
                 run = get_run_by_id(db_path, args.run_id)
             except ValueError as e:
                 print(f"Error: {e}", file=sys.stderr)
-                sys.exit(1)
+                sys.exit(EXIT_USER_ERROR)
         else:
             try:
                 run = get_last_run(db_path)
             except ValueError as e:
                 print(f"Error: {e}", file=sys.stderr)
-                sys.exit(1)
+                sys.exit(EXIT_USER_ERROR)
         print(f"Run: {run.run_id} ({run.script_path or 'unknown'}) — {run.total_frames} frames")
+
+        if getattr(args, 'list_threads', False):
+            rows = _db.fetchall(
+                "SELECT thread_id, COUNT(*) as cnt FROM executionframes"
+                " WHERE run_id = ? GROUP BY thread_id ORDER BY cnt DESC",
+                (str(run.run_id),)
+            )
+            if not rows:
+                print("No threads found.")
+            else:
+                print(f"{'Thread ID':>20} {'Frames':>10}")
+                print(f"{'-'*20} {'-'*10}")
+                for row in rows:
+                    print(f"{row.thread_id:>20} {row.cnt:>10}")
+            return
+
+        search = getattr(args, 'search', None)
+        if search is not None:
+            frames = search_frames(run.run_id, search, limit=args.limit)
+            if not frames:
+                print(f"No frames matching '{search}'.")
+            else:
+                for f in frames:
+                    source = get_line_code(f.filename, f.line_no)
+                    print(f"  #{f.sequence_no:>6} {f.frame_event:<18} {f.function_name}:{f.line_no}  {source}")
+            return
+
+        thread = getattr(args, 'thread', None)
+        if thread is not None:
+            frames = get_frames_by_thread(run.run_id, thread, limit=args.limit)
+            if not frames:
+                print(f"No frames found for thread {thread}.")
+            else:
+                for f in frames:
+                    source = get_line_code(f.filename, f.line_no)
+                    print(f"  #{f.sequence_no:>6} {f.frame_event:<18} {f.function_name}:{f.line_no}  {source}")
+            return
 
         if args.frames:
             frames = get_frames(run.run_id, limit=args.limit)
@@ -349,12 +434,12 @@ def _cmd_replay(args):
         dbs = sorted(globmod.glob(f"*{DB_NAME_SUFFIX}"), key=os.path.getmtime, reverse=True)
         if not dbs:
             print("No .pyttd.db files found. Use --db to specify path.")
-            sys.exit(1)
+            sys.exit(EXIT_USER_ERROR)
         db_path = dbs[0]
 
     if not os.path.exists(db_path):
         print(f"Database file not found: {db_path}")
-        sys.exit(1)
+        sys.exit(EXIT_USER_ERROR)
 
     try:
         if args.run_id:
@@ -362,19 +447,19 @@ def _cmd_replay(args):
                 run = get_run_by_id(db_path, args.run_id)
             except ValueError as e:
                 print(f"Error: {e}", file=sys.stderr)
-                sys.exit(1)
+                sys.exit(EXIT_USER_ERROR)
         else:
             try:
                 run = get_last_run(db_path)
             except ValueError as e:
                 print(f"Error: {e}", file=sys.stderr)
-                sys.exit(1)
+                sys.exit(EXIT_USER_ERROR)
         controller = ReplayController()
         # CLI always uses warm-only (no live checkpoint children after recording exits)
         result = controller.warm_goto_frame(run.run_id, args.goto_frame)
         if "error" in result:
             print(f"Error: {result['error']}")
-            sys.exit(1)
+            sys.exit(EXIT_USER_ERROR)
         print(f"Frame {args.goto_frame}: {result}")
     finally:
         storage.close_db()
@@ -391,11 +476,11 @@ def _cmd_clean(args):
             dbs = sorted(globmod.glob(f"*{DB_NAME_SUFFIX}"), key=os.path.getmtime, reverse=True)
             if not dbs:
                 print("No .pyttd.db files found in current directory. Use --db to specify path.")
-                sys.exit(1)
+                sys.exit(EXIT_USER_ERROR)
             db_path = dbs[0]
         if not os.path.exists(db_path):
             print(f"Database file not found: {db_path}")
-            sys.exit(1)
+            sys.exit(EXIT_USER_ERROR)
         evicted = evict_old_runs(db_path, args.keep, dry_run=args.dry_run)
         if not evicted:
             print(f"Nothing to evict (database has {args.keep} or fewer runs).")
@@ -424,7 +509,7 @@ def _cmd_clean(args):
     if args.db:
         if not os.path.exists(args.db):
             print(f"Database file not found: {args.db}")
-            sys.exit(1)
+            sys.exit(EXIT_USER_ERROR)
         if args.dry_run:
             print(f"Would delete: {args.db}")
         else:
@@ -465,7 +550,7 @@ def _cmd_export(args):
     from pyttd.export import export_perfetto
     if not os.path.isfile(args.db):
         print(f"Error: database not found: {args.db}", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(EXIT_USER_ERROR)
     run_id = None
     if args.run_id:
         from pyttd.query import get_run_by_id
@@ -473,7 +558,7 @@ def _cmd_export(args):
             run = get_run_by_id(args.db, args.run_id)
         except ValueError as e:
             print(f"Error: {e}", file=sys.stderr)
-            sys.exit(1)
+            sys.exit(EXIT_USER_ERROR)
         run_id = run.run_id
     export_perfetto(args.db, args.output, run_id=run_id)
     print(f"Exported to {args.output}")

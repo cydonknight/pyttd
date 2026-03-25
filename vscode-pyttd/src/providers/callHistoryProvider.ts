@@ -1,6 +1,11 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 
+function shortName(qualname: string): string {
+    const lastDot = qualname.lastIndexOf('.');
+    return lastDot >= 0 ? qualname.substring(lastDot + 1) : qualname;
+}
+
 interface CallNode {
     callSeq: number;
     returnSeq: number | null;
@@ -10,6 +15,8 @@ interface CallNode {
     depth: number;
     hasException: boolean;
     isComplete: boolean;
+    isCoroutine?: boolean;
+    suspendCount?: number;
 }
 
 export class PyttdCallHistoryProvider implements vscode.TreeDataProvider<CallNode> {
@@ -21,7 +28,11 @@ export class PyttdCallHistoryProvider implements vscode.TreeDataProvider<CallNod
     }
 
     getTreeItem(element: CallNode): vscode.TreeItem {
-        let label = element.functionName;
+        const sname = shortName(element.functionName);
+        let label = sname;
+        if (element.suspendCount && element.suspendCount > 0) {
+            label += ` (${element.suspendCount} await${element.suspendCount > 1 ? 's' : ''})`;
+        }
         if (!element.isComplete) {
             label += ' (incomplete)';
         }
@@ -33,7 +44,12 @@ export class PyttdCallHistoryProvider implements vscode.TreeDataProvider<CallNod
                 : vscode.TreeItemCollapsibleState.None
         );
 
-        item.description = `${path.basename(element.filename)}:${element.line}`;
+        const fileInfo = `${path.basename(element.filename)}:${element.line}`;
+        if (sname !== element.functionName) {
+            item.description = element.functionName;
+        } else {
+            item.description = fileInfo;
+        }
         item.tooltip = `${element.functionName} at ${element.filename}:${element.line} (seq ${element.callSeq}${element.returnSeq !== null ? '–' + element.returnSeq : ''})`;
         item.iconPath = element.hasException
             ? new vscode.ThemeIcon('error')

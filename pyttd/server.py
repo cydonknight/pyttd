@@ -350,6 +350,7 @@ class PyttdServer:
             "get_traced_files": self._handle_get_traced_files,
             "get_execution_stats": self._handle_get_execution_stats,
             "get_call_children": self._handle_get_call_children,
+            "get_coroutine_suspensions": self._handle_get_coroutine_suspensions,
             "get_variable_children": self._handle_get_variable_children,
             "get_variable_history": self._handle_get_variable_history,
             "get_checkpoint_memory": self._handle_get_checkpoint_memory,
@@ -568,6 +569,16 @@ class PyttdServer:
         parent_call_seq = params.get("parentCallSeq")
         parent_return_seq = params.get("parentReturnSeq")
         return {"children": self.session.get_call_children(parent_call_seq, parent_return_seq)}
+
+    def _handle_get_coroutine_suspensions(self, params: dict) -> dict:
+        if self.session.state != "replay":
+            return {"error": "not_in_replay"}
+        return {
+            "suspensions": self.session.get_coroutine_suspensions(
+                params.get("call_seq", 0),
+                params.get("return_seq", 0),
+            )
+        }
 
     def _handle_get_variable_children(self, params: dict) -> dict:
         if self.session.state != "replay":
