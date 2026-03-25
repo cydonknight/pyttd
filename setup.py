@@ -19,6 +19,7 @@ sources = [
     "ext/replay.c",
     "ext/iohook.c",
     "ext/sqliteflush.c",
+    "ext/binlog.c",
 ]
 
 libraries = []

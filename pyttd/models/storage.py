@@ -56,11 +56,14 @@ def initialize_schema():
             pass  # Column already exists
 
 def delete_db_files(db_path: str):
-    """Delete a SQLite database and its WAL/SHM companion files."""
+    """Delete a SQLite database, WAL/SHM companions, and binlog if present."""
     for suffix in ("", "-wal", "-shm"):
         path = db_path + suffix
         if os.path.exists(path):
             os.remove(path)
+    binlog_path = db_path.replace(".pyttd.db", ".pyttd.binlog")
+    if binlog_path != db_path and os.path.exists(binlog_path):
+        os.remove(binlog_path)
 
 def batch_insert(model_class, rows: list[dict], batch_size: int = 500):
     """Batch-insert rows into the ExecutionFrames table.

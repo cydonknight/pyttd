@@ -53,8 +53,8 @@ class Recorder:
 
         self._run_id = schema.create_run(script_path=script_path, is_attach=attach)
 
-        # Initialize C-level SQLite flush
-        pyttd_native.set_flush_db(db_path, self._run_id)
+        # Initialize binary log for recording
+        pyttd_native.binlog_open(db_path, self._run_id)
 
         # Auto-evict old runs if keep_runs is configured
         if self.config.keep_runs > 0:
@@ -103,7 +103,7 @@ class Recorder:
         if self.config.max_frames > 0:
             pyttd_native.set_max_frames(self.config.max_frames)
         if self.config.max_db_size_mb > 0:
-            pyttd_native.set_flush_size_limit(
+            pyttd_native.binlog_set_size_limit(
                 self.config.max_db_size_mb * 1024 * 1024)
         if self.config.checkpoint_memory_limit_mb > 0:
             pyttd_native.set_checkpoint_memory_limit(
@@ -120,8 +120,13 @@ class Recorder:
         self._recording = False
         os.environ.pop('PYTTD_RECORDING', None)
 
-        # Rebuild secondary indexes via raw sqlite3 (flush thread's C-level
-        # connection is already closed by stop_recording → sqliteflush_close).
+        # Bulk-load binary log into SQLite
+        try:
+            pyttd_native.binlog_load(self._db_path)
+        except Exception:
+            logger.warning("Failed to load binlog into SQLite", exc_info=True)
+
+        # Rebuild secondary indexes
         try:
             conn = _sqlite3.connect(self._db_path)
             for sql in schema.SECONDARY_INDEX_CREATE:

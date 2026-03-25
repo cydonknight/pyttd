@@ -619,22 +619,37 @@ class Session:
             (str(self.run_id),))
         return [row.filename for row in rows]
 
-    def get_execution_stats(self, filename: str) -> list[dict]:
+    def get_execution_stats(self, filename: str = "") -> list[dict]:
         self._require_replay()
-        filename = os.path.realpath(filename)
-        rows = db.fetchdicts(
-            "SELECT function_name,"
-            " SUM(CASE WHEN frame_event = 'call' THEN 1 ELSE 0 END) AS call_count,"
-            " SUM(CASE WHEN frame_event = 'exception_unwind' THEN 1 ELSE 0 END) AS exception_count,"
-            " MIN(CASE WHEN frame_event = 'call' THEN sequence_no END) AS first_call_seq,"
-            " COALESCE("
-            "   MIN(CASE WHEN frame_event = 'call' THEN NULLIF(line_no, -1) END),"
-            "   MIN(CASE WHEN frame_event = 'line' THEN line_no END)"
-            " ) AS def_line"
-            " FROM executionframes"
-            " WHERE run_id = ? AND filename = ?"
-            " GROUP BY function_name",
-            (str(self.run_id), filename))
+        if filename:
+            filename = os.path.realpath(filename)
+            rows = db.fetchdicts(
+                "SELECT function_name,"
+                " SUM(CASE WHEN frame_event = 'call' THEN 1 ELSE 0 END) AS call_count,"
+                " SUM(CASE WHEN frame_event = 'exception_unwind' THEN 1 ELSE 0 END) AS exception_count,"
+                " MIN(CASE WHEN frame_event = 'call' THEN sequence_no END) AS first_call_seq,"
+                " COALESCE("
+                "   MIN(CASE WHEN frame_event = 'call' THEN NULLIF(line_no, -1) END),"
+                "   MIN(CASE WHEN frame_event = 'line' THEN line_no END)"
+                " ) AS def_line"
+                " FROM executionframes"
+                " WHERE run_id = ? AND filename = ?"
+                " GROUP BY function_name",
+                (str(self.run_id), filename))
+        else:
+            rows = db.fetchdicts(
+                "SELECT function_name,"
+                " SUM(CASE WHEN frame_event = 'call' THEN 1 ELSE 0 END) AS call_count,"
+                " SUM(CASE WHEN frame_event = 'exception_unwind' THEN 1 ELSE 0 END) AS exception_count,"
+                " MIN(CASE WHEN frame_event = 'call' THEN sequence_no END) AS first_call_seq,"
+                " COALESCE("
+                "   MIN(CASE WHEN frame_event = 'call' THEN NULLIF(line_no, -1) END),"
+                "   MIN(CASE WHEN frame_event = 'line' THEN line_no END)"
+                " ) AS def_line"
+                " FROM executionframes"
+                " WHERE run_id = ?"
+                " GROUP BY function_name",
+                (str(self.run_id),))
 
         return [{
             'functionName': r['function_name'],

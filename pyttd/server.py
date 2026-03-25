@@ -515,7 +515,9 @@ class PyttdServer:
     def _handle_goto_frame(self, params: dict) -> dict:
         if self.session.state != "replay":
             return {"error": "not_in_replay"}
-        target_seq = params.get("targetSeq") or params.get("target_seq")
+        target_seq = params.get("targetSeq")
+        if target_seq is None:
+            target_seq = params.get("target_seq")
         if target_seq is None:
             return {"error": "missing_targetSeq"}
         return self.session.goto_frame(target_seq)
@@ -530,7 +532,9 @@ class PyttdServer:
     def _handle_restart_frame(self, params: dict) -> dict:
         if self.session.state != "replay":
             return {"error": "not_in_replay"}
-        frame_seq = params.get("frameSeq") or params.get("frame_seq")
+        frame_seq = params.get("frameSeq")
+        if frame_seq is None:
+            frame_seq = params.get("frame_seq")
         if frame_seq is None:
             return {"error": "missing_frameSeq"}
         return self.session.restart_frame(frame_seq)

@@ -9,7 +9,7 @@
 #include "checkpoint_store.h"
 #include "replay.h"
 #include "iohook.h"
-#include "sqliteflush.h"
+#include "binlog.h"
 
 static PyMethodDef PyttdMethods[] = {
     {"start_recording", (PyCFunction)pyttd_start_recording, METH_VARARGS | METH_KEYWORDS,
@@ -49,10 +49,12 @@ static PyMethodDef PyttdMethods[] = {
      "Return dict with checkpoint memory info (total_bytes, entries, etc.)"},
     {"set_checkpoint_memory_limit", (PyCFunction)pyttd_set_checkpoint_memory_limit, METH_VARARGS,
      "Set checkpoint memory limit in bytes (0 = unlimited). Triggers aggressive eviction."},
-    {"set_flush_db", (PyCFunction)pyttd_set_flush_db, METH_VARARGS,
-     "Set SQLite database path and run_id for C-level flush thread"},
-    {"set_flush_size_limit", (PyCFunction)pyttd_set_flush_size_limit, METH_VARARGS,
-     "Set DB file size limit in bytes for auto-stop during recording"},
+    {"binlog_open", (PyCFunction)pyttd_binlog_open, METH_VARARGS,
+     "Open binary log for recording"},
+    {"binlog_load", (PyCFunction)pyttd_binlog_load, METH_VARARGS,
+     "Load binary log into SQLite database"},
+    {"binlog_set_size_limit", (PyCFunction)pyttd_binlog_set_size_limit, METH_VARARGS,
+     "Set binlog file size limit in bytes for auto-stop during recording"},
     {NULL, NULL, 0, NULL}
 };
 

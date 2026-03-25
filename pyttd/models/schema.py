@@ -91,7 +91,8 @@ def create_run(script_path=None, is_attach=False):
     """Create a new Runs record. Returns run_id string (hex, no dashes)."""
     run_id = uuid.uuid4().hex
     db.execute(
-        "INSERT INTO runs (run_id, timestamp_start, script_path, is_attach) VALUES (?, ?, ?, ?)",
+        "INSERT INTO runs (run_id, timestamp_start, script_path, is_attach, total_frames)"
+        " VALUES (?, ?, ?, ?, 0)",
         (run_id, datetime.now().timestamp(), script_path, int(is_attach)))
     db.commit()
     return run_id

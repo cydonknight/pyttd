@@ -194,9 +194,18 @@ def _cmd_record(args):
             stats = recorder.stop()
         finally:
             recorder.cleanup()
+    # Determine if KeyboardInterrupt was caused by a recording limit
+    limit_stop = (isinstance(script_error, KeyboardInterrupt) and (
+        (args.max_frames > 0 and stats.get('frame_count', 0) >= args.max_frames) or
+        args.max_db_size > 0
+    ))
+
     if script_error:
-        if isinstance(script_error, KeyboardInterrupt) and args.max_frames > 0 and stats.get('frame_count', 0) >= args.max_frames:
-            print(f"Recording stopped: frame limit reached ({stats.get('frame_count', 0)} frames)")
+        if limit_stop:
+            if args.max_frames > 0 and stats.get('frame_count', 0) >= args.max_frames:
+                print(f"Recording stopped: frame limit reached ({stats.get('frame_count', 0)} frames)")
+            else:
+                print(f"Recording stopped: database size limit reached")
         else:
             print(f"Script exited with {type(script_error).__name__}: {script_error}")
     print(f"Recording complete: {stats}")
@@ -217,10 +226,8 @@ def _cmd_record(args):
 
     if isinstance(script_error, SystemExit):
         sys.exit(script_error.code)
-    elif isinstance(script_error, KeyboardInterrupt):
-        # Don't re-raise if max-frames triggered the stop
-        if not (args.max_frames > 0 and stats.get('frame_count', 0) >= args.max_frames):
-            raise script_error
+    elif isinstance(script_error, KeyboardInterrupt) and not limit_stop:
+        raise script_error
 
 def _cmd_serve(args):
     from pyttd.server import PyttdServer

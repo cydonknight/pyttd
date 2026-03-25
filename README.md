@@ -144,6 +144,7 @@ install_signal_handler()  # First USR1 arms, second disarms
 
 ### Recording
 - C extension recorder using PEP 523 frame eval hooks (not `sys.settrace`)
+- Binary log recording — buffered `fwrite` during execution, bulk SQLite load at stop; no Python objects in the flush path
 - Lock-free per-thread SPSC ring buffers with background flush
 - Fork-based checkpointing for fast cold navigation (Linux/macOS)
 - Multi-thread recording with globally ordered sequence numbers
@@ -278,14 +279,29 @@ Options:
 | `PYTTD_RECORDING` | Set to `1` during active recording; scripts can check `os.environ.get('PYTTD_RECORDING')` |
 | `PYTTD_ARM_SIGNAL` | Auto-install signal handler on import — e.g., `PYTTD_ARM_SIGNAL=USR1` installs a SIGUSR1 toggle handler |
 
+## Performance
+
+Recording overhead on Apple M-series (Python 3.13):
+
+| Workload | Slowdown | Peak RSS |
+|----------|----------|----------|
+| I/O-bound | 1.3x | 27 MB |
+| Compute-bound | 4.9x | 33 MB |
+| Tight loop (10K iterations) | 3.5x | 33 MB |
+| Deep recursion (1K depth) | 2.8x | 33 MB |
+| Many locals (20 vars) | 3.1x | 33 MB |
+| Multi-thread (4 threads) | 3.8x | 46 MB |
+
+Recording uses a binary log with buffered writes during execution, then bulk-loads into SQLite at stop time. No Python objects are allocated in the flush path. Zero external runtime dependencies.
+
 ## Architecture
 
 Three-layer system:
 
 | Layer | Technology | Responsibility |
 |-------|-----------|----------------|
-| C Extension (`pyttd_native`) | C, CPython API | Frame recording, ring buffer, checkpoints, I/O hooks |
-| Python Backend (`pyttd/`) | Python, Peewee, SQLite | JSON-RPC server, session navigation, query API |
+| C Extension (`pyttd_native`) | C, CPython API | Frame recording, ring buffer, checkpoints, binary log, I/O hooks |
+| Python Backend (`pyttd/`) | Python, SQLite | JSON-RPC server, session navigation, query API |
 | VSCode Extension (`vscode-pyttd/`) | TypeScript | DAP handlers, timeline webview, CodeLens, inline values |
 
 See [docs/architecture.md](docs/architecture.md) for the full design.
@@ -303,8 +319,9 @@ See [docs/architecture.md](docs/architecture.md) for the full design.
 ## Requirements
 
 - **Python >= 3.12** (required for `PyUnstable_InterpreterFrame_*` C API)
-- **C compiler** (GCC, Clang, or MSVC)
+- **C compiler** (GCC, Clang, or MSVC) with SQLite development headers
 - **VSCode** (for the extension; CLI works standalone)
+- **Zero external Python dependencies** — uses only the standard library (`sqlite3`)
 
 ## Known Limitations
 
@@ -315,13 +332,13 @@ See [docs/architecture.md](docs/architecture.md) for the full design.
 - Variable repr strings are capped at 256 characters
 - Expandable variable children are capped at 50 entries, 1 level deep
 - Attach mode (`arm()`) disables checkpoints — cold navigation is unavailable for attached recordings; the initial call stack is synthesized from frame inspection at arm time
-- Tight loops with per-line events have high overhead (hundreds of times slower); use `--include` to scope recording for compute-heavy code
+- Tight loops with per-line events have measurable overhead (~3-5x); use `--include` to scope recording for compute-heavy code
 - `--max-frames` is approximate — the actual frame count may slightly exceed the limit because events already in flight complete before the stop signal takes effect
 - Log points capture only the first hit per `continue` — if a log breakpoint's line executes multiple times before the next stopping point, only the first occurrence is logged
 
 ## Testing
 
-351 Python tests across 26 test modules + 95 VSCode extension (Mocha) tests:
+355 Python tests across 26 test modules + 95 VSCode extension (Mocha) tests:
 
 ```bash
 # Run all Python tests
