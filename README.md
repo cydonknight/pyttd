@@ -56,6 +56,9 @@ pyttd record examples/hello.py --include process_data --include validate
 # Query the recording
 pyttd query --last-run --frames
 
+# Search for a function across the trace
+pyttd query --last-run --search process_data
+
 # List all runs in a database
 pyttd query --list-runs --db hello.pyttd.db
 
@@ -151,8 +154,8 @@ install_signal_handler()  # First USR1 arms, second disarms
 - Async/await and generator support with coroutine frame tracking
 - I/O hooks for deterministic checkpoint replay — `time.time`, `time.monotonic`, `time.perf_counter`, `time.sleep`, `random.random`, `random.randint`, `random.uniform`, `random.gauss`, `random.choice`, `random.sample`, `random.shuffle`, `os.urandom`, `uuid.uuid4`, `uuid.uuid1`, `datetime.datetime.now`, `datetime.datetime.utcnow`
 - Secrets filtering — sensitive variable names (`password`, `token`, `secret`, `api_key`, etc.) automatically redacted during recording; configurable patterns with `--secret-patterns`
-- Selective function recording — `--include` / `--exclude` filter by function name, `--include-file` / `--exclude-file` filter by source file (glob patterns)
-- Expandable variable trees — dicts, lists, tuples, sets, and objects with `__dict__` are serialized with structure, not just `repr()`
+- Selective recording — `--include` / `--exclude` filter by function name (matches both qualified and bare names, e.g. `--include failing` matches `main.<locals>.failing`), `--include-file` / `--exclude-file` filter by source file path (glob patterns where `*` matches across `/`)
+- Expandable variable trees — dicts, lists, tuples, sets, objects with `__dict__`, and `__slots__`-based classes (including `@dataclass(slots=True)` and `NamedTuple` with field names) are serialized with structure, not just `repr()`
 - Runtime attach — `arm()` / `disarm()` API to start/stop recording from within a running process, or toggle via Unix signal
 - Checkpoint memory tracking and configurable limits
 
@@ -172,10 +175,10 @@ install_signal_handler()  # First USR1 arms, second disarms
 - Canvas-based timeline scrubber with click/drag/zoom
 - CodeLens annotations showing call and exception counts per function
 - Inline variable values during stepping
-- Call history tree with lazy-loaded nesting and exception markers
+- Call history tree with lazy-loaded nesting, exception markers, and coroutine suspend/resume merging (consecutive await cycles shown as a single entry with suspend count)
 - Exception breakpoint filters (uncaught, all raised)
 - Function breakpoints, data breakpoints, conditional breakpoints, hit conditions, log points
-- Variable history tracking across the recording
+- Variable history webview — canvas chart for numeric values, HTML table for non-numeric, click-to-navigate; accessible from Variables panel context menu
 - Breakpoint verification — validates that breakpoints target executable lines; condition eval errors shown in Debug Console
 - Status bar with recording progress (frame count, dropped frames, DB size, checkpoint count and memory)
 - Keyboard shortcuts: Ctrl+Shift+F11 (step back), Ctrl+Shift+F5 (reverse continue)
@@ -218,10 +221,10 @@ Options:
   --args VALUE [VALUE ...]          Arguments to pass to the script
   --no-redact                       Disable secrets redaction
   --secret-patterns PAT             Additional pattern to redact (repeatable)
-  --include FUNC                    Only record functions matching this pattern (repeatable)
-  --include-file GLOB               Only record functions in files matching this glob (repeatable)
-  --exclude FUNC                    Exclude functions matching this pattern (repeatable)
-  --exclude-file GLOB               Exclude files matching this glob (repeatable)
+  --include FUNC                    Only record functions matching this pattern (repeatable; matches bare name too)
+  --include-file GLOB               Only record functions in files matching this glob (* matches /) (repeatable)
+  --exclude FUNC                    Exclude functions matching this pattern (repeatable; matches bare name too)
+  --exclude-file GLOB               Exclude files matching this glob (* matches /) (repeatable)
   --max-frames N                    Stop recording after approximately N frames (0 = unlimited)
   --db-path PATH                    Custom database path (default: <script>.pyttd.db)
   --max-db-size MB                  Auto-stop recording when DB exceeds this size in MB (0 = unlimited)
@@ -232,7 +235,8 @@ Options:
 ### query
 
 ```bash
-pyttd query [--last-run | --run-id UUID] [--list-runs] [--frames] [--limit N] [--db path.pyttd.db]
+pyttd query [--last-run | --run-id UUID] [--list-runs] [--frames] [--limit N]
+    [--search PATTERN] [--thread THREAD_ID] [--list-threads] [--db path.pyttd.db]
 ```
 
 ### replay
@@ -338,7 +342,7 @@ See [docs/architecture.md](docs/architecture.md) for the full design.
 
 ## Testing
 
-355 Python tests across 26 test modules + 95 VSCode extension (Mocha) tests:
+392 Python tests across 30 test modules + 95 VSCode extension (Mocha) tests:
 
 ```bash
 # Run all Python tests
