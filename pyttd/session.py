@@ -911,6 +911,7 @@ class Session:
                                        condition: str, after_seq: int,
                                        hit_condition: str = '',
                                        log_message: str = '') -> int | None:
+        filename = os.path.realpath(filename)
         bp_key = (filename, line)
 
         if not condition or not condition.strip():
@@ -970,6 +971,7 @@ class Session:
 
     def _find_conditional_hit_reverse(self, filename: str, line: int,
                                        condition: str, before_seq: int) -> int | None:
+        filename = os.path.realpath(filename)
         if not condition or not condition.strip():
             hit = db.fetchone(
                 "SELECT sequence_no FROM executionframes"

@@ -55,8 +55,6 @@ class PyttdServer:
         self._shutdown = False
         self._rpc = None
         self._conn = None
-        self._frame_count = 0
-        self._frame_count_lock = threading.Lock()
         self._replay_db = replay_db
         self._target_run_id = target_run_id
 
@@ -130,9 +128,12 @@ class PyttdServer:
         # 3. Capture stdout/stderr
         self._setup_capture()
 
-        # 4. Install signal handlers
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
+        # 4. Install signal handlers (only works in main thread)
+        try:
+            signal.signal(signal.SIGINT, self._signal_handler)
+            signal.signal(signal.SIGTERM, self._signal_handler)
+        except ValueError:
+            pass  # non-main thread — signals handled elsewhere
 
         # 5. Accept connection (30s timeout)
         sock.settimeout(30)
@@ -412,7 +413,14 @@ class PyttdServer:
         return {}
 
     def _handle_set_breakpoints(self, params: dict) -> dict:
+        source_path = params.get("source", {}).get("path", "")
+        if source_path:
+            source_path = os.path.realpath(source_path)
         breakpoints = params.get("breakpoints", [])
+        if source_path:
+            for bp in breakpoints:
+                if "file" not in bp:
+                    bp["file"] = source_path
         self.session.set_breakpoints(breakpoints)
         if self.session.state == "replay":
             verification = self.session.verify_breakpoints(breakpoints)
@@ -684,14 +692,6 @@ class PyttdServer:
         script_abs = self.script
         if not self.is_module:
             script_abs = os.path.realpath(self.script)
-
-        # Wrap flush callback to track frame count
-        original_on_flush = self.recorder._on_flush
-        def counting_flush(events):
-            original_on_flush(events)
-            with self._frame_count_lock:
-                self._frame_count += len(events)
-        self.recorder._on_flush = counting_flush
 
         self.recorder.start(self._db_path, script_path=script_abs)
         self.session.state = "recording"

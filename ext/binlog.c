@@ -230,7 +230,12 @@ int binlog_close(void) {
 
 void binlog_close_child(void) {
     if (g_binlog_fp) {
-        fclose(g_binlog_fp);
+        /* After fork, the child inherits the parent's stdio buffer.
+         * fclose() would flush that buffer, writing duplicate data to the
+         * shared file.  Close the underlying fd directly instead. */
+        int fd = fileno(g_binlog_fp);
+        if (fd >= 0) close(fd);
+        /* Prevent libc from flushing or double-closing */
         g_binlog_fp = NULL;
     }
 }
@@ -238,6 +243,7 @@ void binlog_close_child(void) {
 int binlog_write_batch(const FrameEvent *events, uint32_t count) {
     if (!g_binlog_fp || count == 0) return -1;
 
+    int write_error = 0;
     for (uint32_t i = 0; i < count; i++) {
         const FrameEvent *e = &events[i];
 
@@ -282,7 +288,8 @@ int binlog_write_batch(const FrameEvent *events, uint32_t count) {
         /* hdr[46..47] reserved, already zero */
 
         if (fwrite(hdr, BINLOG_RECORD_HEADER_SIZE, 1, g_binlog_fp) != 1) {
-            continue;
+            write_error = 1;
+            break;  /* I/O error — stop to avoid cascading corruption */
         }
         int write_ok = 1;
         if (filename_len > 0 && fwrite(resolved, filename_len, 1, g_binlog_fp) != 1)
@@ -291,7 +298,7 @@ int binlog_write_batch(const FrameEvent *events, uint32_t count) {
             write_ok = 0;
         if (write_ok && locals_len > 0 && fwrite(locals, locals_len, 1, g_binlog_fp) != 1)
             write_ok = 0;
-        if (!write_ok) break;  /* partial record written — file is corrupt, stop */
+        if (!write_ok) { write_error = 1; break; }
 
         g_binlog_records++;
         g_binlog_bytes += total_size;
@@ -302,7 +309,7 @@ int binlog_write_batch(const FrameEvent *events, uint32_t count) {
         check_size_limit();
     }
 
-    return 0;
+    return write_error ? -1 : 0;
 }
 
 uint64_t binlog_record_count(void) {

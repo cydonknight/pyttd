@@ -454,3 +454,67 @@ class TestErrorHandling:
         assert stopped["reason"] == "recording_complete"
         resp = client.send_and_receive("get_threads")
         assert "result" in resp
+
+
+class TestBreakpointPropagation:
+    """Verify set_breakpoints propagates source path and breakpoints fire."""
+
+    def test_set_breakpoints_propagates_source(self, server_session):
+        """After set_breakpoints, continue should stop at the breakpoint."""
+        client, script_path = server_session("""\
+            def target():
+                x = 10
+                y = 20
+                return x + y
+            target()
+        """)
+        stopped = _run_to_replay(client, script_path)
+        assert stopped["reason"] == "recording_complete"
+
+        # Set breakpoint on line 3 (y = 20) using source path
+        resp = client.send_and_receive("set_breakpoints", {
+            "source": {"path": script_path},
+            "breakpoints": [{"line": 3}],
+        })
+        verified = resp["result"].get("verified", [])
+        assert len(verified) == 1
+        assert verified[0]["verified"] is True
+
+        # Navigate to start
+        resp = client.send_and_receive("reverse_continue")
+        start_seq = resp["result"]["seq"]
+
+        # Continue forward — should hit breakpoint on line 3
+        resp = client.send_and_receive("continue")
+        result = resp["result"]
+        assert result["reason"] == "breakpoint", \
+            f"Expected reason 'breakpoint', got '{result['reason']}' at seq={result['seq']}"
+
+    def test_reverse_continue_hits_breakpoint(self, server_session):
+        """reverse_continue should stop at breakpoints too."""
+        client, script_path = server_session("""\
+            def target():
+                a = 1
+                b = 2
+                return a + b
+            target()
+        """)
+        stopped = _run_to_replay(client, script_path)
+
+        # Set breakpoint on line 2 (a = 1)
+        resp = client.send_and_receive("set_breakpoints", {
+            "source": {"path": script_path},
+            "breakpoints": [{"line": 2}],
+        })
+
+        # Navigate to end
+        resp = client.send_and_receive("continue")
+        assert resp["result"]["reason"] == "breakpoint"  # hits first
+
+        # Continue to end
+        resp = client.send_and_receive("continue")
+
+        # Reverse continue — should hit breakpoint
+        resp = client.send_and_receive("reverse_continue")
+        result = resp["result"]
+        assert result["reason"] == "breakpoint"

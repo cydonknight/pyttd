@@ -69,6 +69,7 @@ static EvalFrameFunc g_original_eval = NULL;
 static PyObject *g_flush_callback = NULL;
 static double g_start_time = 0.0;
 static double g_stop_time = 0.0;
+static RingbufStats g_saved_rb_stats = {0, 0};
 PYTTD_THREAD_LOCAL int g_inside_repr = 0;
 
 /* Perf: per-thread code object cache — avoids PyFrame_GetCode + UTF-8 extraction on cache hit */
@@ -418,7 +419,7 @@ static int should_include_file(const char *filename) {
     if (!g_file_include_mode) return 1;
     for (int i = 0; i < g_file_include_filter.count; i++) {
 #ifndef _WIN32
-        if (fnmatch(g_file_include_filter.patterns[i], filename, FNM_PATHNAME) == 0) {
+        if (fnmatch(g_file_include_filter.patterns[i], filename, 0) == 0) {
             return 1;
         }
 #else
@@ -446,7 +447,7 @@ static int should_exclude(const char *filename, const char *funcname) {
     }
     for (int i = 0; i < g_exclude_file_filter.count; i++) {
 #ifndef _WIN32
-        if (fnmatch(g_exclude_file_filter.patterns[i], filename, FNM_PATHNAME) == 0) return 1;
+        if (fnmatch(g_exclude_file_filter.patterns[i], filename, 0) == 0) return 1;
 #else
         if (strstr(filename, g_exclude_file_filter.patterns[i]) != NULL) return 1;
 #endif
@@ -1094,6 +1095,14 @@ static int pyttd_trace_func(PyObject *obj, PyFrameObject *frame, int what, PyObj
             filename = PyUnicode_AsUTF8(code->co_filename);
             funcname = PyUnicode_AsUTF8(code->co_qualname);
             if (!filename || !funcname) { PyErr_Clear(); Py_DECREF(code); return 0; }
+            /* Filter check for frames not entered via eval hook (e.g. arm mode).
+             * The eval hook normally prevents trace installation for filtered frames,
+             * but trace_current_frame() bypasses this for the caller's frame. */
+            if (should_ignore(filename, funcname) ||
+                should_exclude(filename, funcname)) {
+                Py_DECREF(code);
+                return 0;
+            }
             is_coro = (code->co_flags & PYTTD_CORO_FLAGS) ? 1 : 0;
             /* Update cache: release old code ref, hold new one */
             Py_XDECREF(g_cached_code);
@@ -1150,8 +1159,11 @@ static int pyttd_trace_func(PyObject *obj, PyFrameObject *frame, int what, PyObj
 
         ringbuf_push(&event);
 
-        /* P1-4: Auto-stop when max_frames reached (line events are most frequent) */
+        /* P1-4: Auto-stop when max_frames reached (line events are most frequent).
+         * Disable g_max_frames after first trigger to prevent cascading
+         * KeyboardInterrupts when user code catches the first one. */
         if (g_max_frames > 0 && event.sequence_no >= g_max_frames) {
+            g_max_frames = 0;
             atomic_store_explicit(&g_stop_requested, 1, memory_order_relaxed);
         }
 
@@ -1204,6 +1216,12 @@ static int pyttd_trace_func(PyObject *obj, PyFrameObject *frame, int what, PyObj
             ret_filename = PyUnicode_AsUTF8(ret_code->co_filename);
             ret_funcname = PyUnicode_AsUTF8(ret_code->co_qualname);
             if (!ret_filename || !ret_funcname) { PyErr_Clear(); Py_DECREF(ret_code); return 0; }
+            if (should_ignore(ret_filename, ret_funcname) ||
+                should_exclude(ret_filename, ret_funcname)) {
+                Py_DECREF(ret_code);
+                g_cached_frame = NULL;
+                return 0;
+            }
             ret_is_coro = (ret_code->co_flags & PYTTD_CORO_FLAGS) ? 1 : 0;
         }
         int line_no = PyFrame_GetLineNumber(frame);
@@ -1224,6 +1242,11 @@ static int pyttd_trace_func(PyObject *obj, PyFrameObject *frame, int what, PyObj
 
         ringbuf_push(&event);
         if (ret_code) Py_DECREF(ret_code);
+
+        if (g_max_frames > 0 && event.sequence_no >= g_max_frames) {
+            g_max_frames = 0;
+            atomic_store_explicit(&g_stop_requested, 1, memory_order_relaxed);
+        }
 
         /* Invalidate cache — frame is being returned, CPython may recycle it */
         g_cached_frame = NULL;
@@ -1255,6 +1278,11 @@ static int pyttd_trace_func(PyObject *obj, PyFrameObject *frame, int what, PyObj
                 Py_DECREF(exc_code);
                 goto exc_restore;
             }
+            if (should_ignore(exc_filename, exc_funcname) ||
+                should_exclude(exc_filename, exc_funcname)) {
+                Py_DECREF(exc_code);
+                goto exc_restore;
+            }
             exc_is_coro = (exc_code->co_flags & PYTTD_CORO_FLAGS) ? 1 : 0;
         }
         int line_no = PyFrame_GetLineNumber(frame);
@@ -1279,6 +1307,11 @@ static int pyttd_trace_func(PyObject *obj, PyFrameObject *frame, int what, PyObj
 
         ringbuf_push(&event);
         if (exc_code) Py_DECREF(exc_code);
+
+        if (g_max_frames > 0 && event.sequence_no >= g_max_frames) {
+            g_max_frames = 0;
+            atomic_store_explicit(&g_stop_requested, 1, memory_order_relaxed);
+        }
 
 exc_restore:
         /* Discard any errors from recording, restore original exception */
@@ -1474,6 +1507,7 @@ static PyObject *pyttd_eval_hook(PyThreadState *tstate,
 
     /* P1-4: Auto-stop when max_frames reached */
     if (g_max_frames > 0 && call_event.sequence_no >= g_max_frames) {
+        g_max_frames = 0;
         atomic_store_explicit(&g_stop_requested, 1, memory_order_relaxed);
     }
 
@@ -1691,7 +1725,10 @@ static void flush_one_buffer(ThreadRingBuffer *rb) {
     PyGILState_Release(gstate);
 
     /* Write to binary log — no GIL, no SQLite, just fwrite */
-    binlog_write_batch(batch, count);
+    if (binlog_write_batch(batch, count) < 0) {
+        /* I/O error writing binlog — stop recording to prevent silent data loss */
+        atomic_store_explicit(&g_stop_requested, 1, memory_order_relaxed);
+    }
     atomic_fetch_add_explicit(&g_flush_count, 1, memory_order_relaxed);
 
     /* Consumer pool reset — flush thread owns consumer pool exclusively. */
@@ -1714,8 +1751,11 @@ static DWORD WINAPI flush_thread_func(LPVOID arg) {
         if (atomic_load_explicit(&g_flush_stop, memory_order_relaxed)) break;
         flush_batch();
     }
-    /* Final flush */
-    flush_batch();
+    /* Final flush — drain ALL remaining events (ring buffer may hold more
+     * than FLUSH_BATCH_SIZE if the script was faster than the flush interval) */
+    do {
+        flush_batch();
+    } while (ringbuf_any_pending());
 
     /* Close flush thread's C-level SQLite connection (no GIL needed) */
     binlog_close();
@@ -1753,8 +1793,11 @@ static void *flush_thread_func(void *arg) {
             pthread_mutex_unlock(&g_flush_mutex);
         }
     }
-    /* Final flush */
-    flush_batch();
+    /* Final flush — drain ALL remaining events (ring buffer may hold more
+     * than FLUSH_BATCH_SIZE if the script was faster than the flush interval) */
+    do {
+        flush_batch();
+    } while (ringbuf_any_pending());
 
     /* Close flush thread's C-level SQLite connection (no GIL needed) */
     binlog_close();
@@ -1918,6 +1961,7 @@ PyObject *pyttd_start_recording(PyObject *self, PyObject *args, PyObject *kwargs
     g_call_depth = -1;  /* TLS — main thread */
     atomic_store_explicit(&g_flush_count, 0, memory_order_relaxed);
     g_stop_time = 0.0;
+    g_saved_rb_stats = (RingbufStats){0, 0};
     g_inside_repr = 0;
     g_cached_frame = NULL;
     Py_XDECREF(g_cached_code); g_cached_code = NULL;
@@ -2118,6 +2162,9 @@ PyObject *pyttd_stop_recording(PyObject *self, PyObject *Py_UNUSED(args)) {
     }
 #endif
 
+    /* Save ring buffer stats before destroy */
+    g_saved_rb_stats = ringbuf_get_stats();
+
     /* Destroy ring buffer system */
     ringbuf_system_destroy();
 
@@ -2138,7 +2185,7 @@ PyObject *pyttd_stop_recording(PyObject *self, PyObject *Py_UNUSED(args)) {
 PyObject *pyttd_get_recording_stats(PyObject *self, PyObject *Py_UNUSED(args)) {
     (void)self;
 
-    RingbufStats rb_stats = ringbuf_get_stats();
+    RingbufStats rb_stats = g_saved_rb_stats;
     double elapsed = (g_stop_time > 0.0 ? g_stop_time : get_monotonic_time()) - g_start_time;
 
     PyObject *dict = PyDict_New();

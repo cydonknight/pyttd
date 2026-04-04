@@ -346,6 +346,16 @@ ThreadRingBuffer *ringbuf_get_head(void) {
     return g_thread_rb_head;
 }
 
+int ringbuf_any_pending(void) {
+    for (ThreadRingBuffer *rb = g_thread_rb_head; rb; rb = rb->next) {
+        if (!rb->initialized) continue;
+        uint32_t tail = atomic_load_explicit(&rb->tail, memory_order_relaxed);
+        uint32_t head = atomic_load_explicit(&rb->head, memory_order_acquire);
+        if (head != tail) return 1;
+    }
+    return 0;
+}
+
 /* ---- Aggregate Stats ---- */
 
 RingbufStats ringbuf_get_stats(void) {

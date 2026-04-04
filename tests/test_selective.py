@@ -13,6 +13,49 @@ from pyttd.models.db import db
 from pyttd.models.storage import delete_db_files, close_db
 
 
+def _record_with_file_filters(tmp_path, files: dict, main_script: str,
+                              include_files=None, exclude_files=None,
+                              exclude_functions=None):
+    """Record a multi-file project with file-level filters.
+
+    Args:
+        files: dict of {filename: content} to write into tmp_path
+        main_script: key in `files` that is the entry point
+        include_files: list of glob patterns for --include-file
+        exclude_files: list of glob patterns for --exclude-file
+        exclude_functions: list of glob patterns for --exclude
+    """
+    for name, content in files.items():
+        (tmp_path / name).write_text(textwrap.dedent(content))
+    script_file = tmp_path / main_script
+    db_path = str(tmp_path / "test.pyttd.db")
+    delete_db_files(db_path)
+
+    config = PyttdConfig(
+        checkpoint_interval=0,
+        include_files=include_files or [],
+        exclude_files=exclude_files or [],
+        exclude_functions=exclude_functions or [],
+    )
+    recorder = Recorder(config)
+    recorder.start(db_path, script_path=str(script_file))
+
+    old_argv = sys.argv[:]
+    old_path = sys.path[:]
+    sys.argv = [str(script_file)]
+    sys.path.insert(0, str(tmp_path))
+    try:
+        runpy.run_path(str(script_file), run_name='__main__')
+    except BaseException:
+        pass
+    finally:
+        sys.argv = old_argv
+        sys.path[:] = old_path
+    stats = recorder.stop()
+    run_id = recorder.run_id
+    return db_path, run_id, stats
+
+
 def _record_with_include(tmp_path, script_content, include_functions):
     script_file = tmp_path / "test_script.py"
     script_file.write_text(textwrap.dedent(script_content))
@@ -276,6 +319,75 @@ class TestSelectiveRecording:
             funcs2 = set(r.function_name for r in rows)
             assert 'foo' in funcs2
             assert 'bar' in funcs2
+        finally:
+            close_db()
+            db.init(None)
+
+
+@pytest.mark.skipif(sys.platform == 'win32', reason="File glob patterns use fnmatch (Unix only)")
+class TestFileFilters:
+    def test_exclude_file_glob_matches_full_path(self, tmp_path):
+        """--exclude-file '*helper*' excludes non-module frames from helper.py."""
+        db_path, run_id, _ = _record_with_file_filters(tmp_path,
+            files={
+                'helper.py': '''\
+                    def helper_func():
+                        return 42
+                ''',
+                'main.py': '''\
+                    from helper import helper_func
+                    def main_func():
+                        return helper_func()
+                    main_func()
+                ''',
+            },
+            main_script='main.py',
+            exclude_files=['*helper*'])
+        try:
+            rows = db.fetchall(
+                "SELECT DISTINCT function_name FROM executionframes"
+                " WHERE run_id = ?",
+                (str(run_id),))
+            funcs = set(r.function_name for r in rows)
+            # helper_func should be excluded (file pattern match)
+            assert 'helper_func' not in funcs, \
+                f"helper_func should be excluded but found in: {funcs}"
+            # main_func should still be present
+            assert 'main_func' in funcs
+            # <module> is always recorded (even for excluded files)
+            assert '<module>' in funcs
+        finally:
+            close_db()
+            db.init(None)
+
+    def test_include_file_glob_matches_full_path(self, tmp_path):
+        """--include-file '*main*' only records non-module frames from main.py."""
+        db_path, run_id, _ = _record_with_file_filters(tmp_path,
+            files={
+                'libmod.py': '''\
+                    def lib_func():
+                        return 99
+                ''',
+                'main.py': '''\
+                    from libmod import lib_func
+                    def main_func():
+                        return lib_func()
+                    main_func()
+                ''',
+            },
+            main_script='main.py',
+            include_files=['*main*'])
+        try:
+            rows = db.fetchall(
+                "SELECT DISTINCT function_name FROM executionframes"
+                " WHERE run_id = ?",
+                (str(run_id),))
+            funcs = set(r.function_name for r in rows)
+            # lib_func should be excluded (file not in include list)
+            assert 'lib_func' not in funcs, \
+                f"lib_func should not appear but found in: {funcs}"
+            # main_func should be present
+            assert 'main_func' in funcs
         finally:
             close_db()
             db.init(None)

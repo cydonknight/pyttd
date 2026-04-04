@@ -16,3 +16,4 @@ out/
 *.pyttd.db-wal
 *.pyttd.db-shm
 TTdebug.db
+samplecode

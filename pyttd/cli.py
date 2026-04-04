@@ -59,13 +59,15 @@ def main():
     record_parser.add_argument('--include', action='append', default=None,
                                help='Only record functions matching this pattern (repeatable, supports glob: *, ?, [])')
     record_parser.add_argument('--include-file', action='append', default=None,
-                               help='Only record functions in files matching this glob pattern (repeatable)')
+                               help='Only record functions in files whose full path matches this glob '
+                                    '(* matches any chars including /). Repeatable')
     record_parser.add_argument('--exclude', action='append', default=None,
                                help='Exclude functions matching this pattern from recording (repeatable)')
     record_parser.add_argument('--exclude-file', action='append', default=None,
-                               help='Exclude files matching this glob pattern from recording (repeatable)')
+                               help='Exclude files whose full path matches this glob from recording '
+                                    '(* matches any chars including /). Repeatable')
     record_parser.add_argument('--max-frames', type=int, default=0,
-                               help='Maximum frames to record (0 = unlimited)')
+                               help='Approximate max frames to record; may slightly overshoot (0 = unlimited)')
     record_parser.add_argument('--db-path', type=str, default=None,
                                help='Custom database path (default: <script>.pyttd.db)')
     record_parser.add_argument('--max-db-size', type=int, default=0,
@@ -94,7 +96,9 @@ def main():
     replay_parser.add_argument('--last-run', action='store_true')
     replay_parser.add_argument('--run-id', type=str, default=None,
                                help='Replay specific run by UUID or prefix')
-    replay_parser.add_argument('--goto-frame', type=int, default=0)
+    replay_parser.add_argument('--goto-frame', type=int, default=0,
+                               help='Jump to frame N (uses stored data; for live variable '
+                                    'inspection use pyttd serve with a debugger frontend)')
     replay_parser.add_argument('--db', type=str, default=None)
 
     serve_parser = subparsers.add_parser('serve', help='Start JSON-RPC debug server')
@@ -107,13 +111,15 @@ def main():
     serve_parser.add_argument('--include', action='append', default=None,
                               help='Only record functions matching this pattern (repeatable)')
     serve_parser.add_argument('--include-file', action='append', default=None,
-                              help='Only record functions in files matching this glob pattern (repeatable)')
+                              help='Only record functions in files whose full path matches this glob '
+                                   '(* matches any chars including /). Repeatable')
     serve_parser.add_argument('--exclude', action='append', default=None,
                               help='Exclude functions matching this pattern from recording (repeatable)')
     serve_parser.add_argument('--exclude-file', action='append', default=None,
-                              help='Exclude files matching this glob pattern from recording (repeatable)')
+                              help='Exclude files whose full path matches this glob from recording '
+                                   '(* matches any chars including /). Repeatable')
     serve_parser.add_argument('--max-frames', type=int, default=0,
-                              help='Maximum frames to record (0 = unlimited)')
+                              help='Approximate max frames to record; may slightly overshoot (0 = unlimited)')
     serve_parser.add_argument('--env', nargs='+', default=None,
                               help='Environment variables (KEY=VALUE format)')
     serve_parser.add_argument('--env-file', type=str, default=None,
@@ -220,7 +226,18 @@ def _cmd_record(args):
     recorder = Recorder(config)
     runner = Runner()
 
-    recorder.start(db_path, script_path=script_abs)
+    try:
+        recorder.start(db_path, script_path=script_abs)
+    except Exception as e:
+        err_msg = str(e).lower()
+        if "unable to open" in err_msg or "no such file" in err_msg:
+            parent = os.path.dirname(db_path) or "."
+            if not os.path.isdir(parent):
+                print(f"Error: directory does not exist: {parent}", file=sys.stderr)
+            else:
+                print(f"Error: cannot create database: {e}", file=sys.stderr)
+            sys.exit(EXIT_USER_ERROR)
+        raise
     script_error = None
     stats = {}
     try:
@@ -271,7 +288,7 @@ def _cmd_record(args):
     if isinstance(script_error, SystemExit):
         sys.exit(script_error.code)
     elif isinstance(script_error, KeyboardInterrupt) and not limit_stop:
-        raise script_error
+        sys.exit(130)  # Standard SIGINT exit code
 
 def _cmd_serve(args):
     from pyttd.server import PyttdServer

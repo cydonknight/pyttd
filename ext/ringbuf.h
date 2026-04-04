@@ -65,6 +65,9 @@ void ringbuf_pool_reset_consumer_for(ThreadRingBuffer *rb);
 int  ringbuf_thread_count(void);        /* count of non-orphaned buffers */
 ThreadRingBuffer *ringbuf_get_head(void); /* for flush iteration */
 
+/* Check if any buffer still has pending events */
+int  ringbuf_any_pending(void);
+
 /* Aggregate stats */
 typedef struct {
     uint64_t dropped_frames;
