@@ -78,6 +78,18 @@
         "command": "pyttd.debugThisFile",
         "title": "Time-Travel Debug This File",
         "category": "pyttd"
+      },
+      {
+        "command": "pyttd.resumeRecording",
+        "title": "Resume Recording",
+        "category": "pyttd",
+        "icon": "$(debug-start)"
+      },
+      {
+        "command": "pyttd.stopRecording",
+        "title": "Stop Recording",
+        "category": "pyttd",
+        "icon": "$(debug-stop)"
       }
     ],
     "keybindings": [
@@ -91,6 +103,12 @@
         "command": "pyttd.reverseContinue",
         "key": "ctrl+shift+f5",
         "mac": "cmd+shift+f5",
+        "when": "debugType == 'pyttd' && inDebugMode"
+      },
+      {
+        "command": "pyttd.resumeRecording",
+        "key": "ctrl+shift+f6",
+        "mac": "cmd+shift+f6",
         "when": "debugType == 'pyttd' && inDebugMode"
       }
     ],

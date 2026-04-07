@@ -57,6 +57,7 @@ class Session:
         self._var_ref_cache = {}  # ref_id -> (seq, name) for expandable variables
         self.current_thread_id = None
         self.known_threads = {}  # {thread_id: "Thread Name"}
+        self._pause_boundary = None  # Set during paused replay to limit forward nav
 
     # --- Private query helpers ---
 
@@ -122,6 +123,22 @@ class Session:
         # Build initial stack at first_line_seq
         self.current_stack = self._build_stack_at(first_line_seq)
 
+    def enter_paused_replay(self, run_id, paused_seq: int):
+        """Enter replay mode with a forward navigation boundary at paused_seq.
+        Used during live debugging when the recording thread is paused."""
+        self.enter_replay(run_id, paused_seq)
+        self._pause_boundary = paused_seq
+
+    def clear_pause_boundary(self):
+        """Remove the pause boundary, allowing full forward navigation."""
+        self._pause_boundary = None
+
+    def _at_pause_boundary(self) -> bool:
+        """Check if current position is at or beyond the pause boundary."""
+        if self._pause_boundary is None:
+            return False
+        return self.current_frame_seq is not None and self.current_frame_seq >= self._pause_boundary
+
     def set_breakpoints(self, breakpoints: list[dict]):
         self.breakpoints = [
             {**bp, 'file': os.path.realpath(bp['file'])} if 'file' in bp else bp
@@ -168,13 +185,19 @@ class Session:
 
     def step_into(self) -> dict:
         self._require_replay()
+        if self._at_pause_boundary():
+            return {"reason": "pause_boundary", **self._current_position()}
         frame = self._fetch_line_after(self.current_frame_seq)
         if frame is None:
             return self._navigate_to(self.last_line_seq, "end")
+        if self._pause_boundary is not None and frame.sequence_no > self._pause_boundary:
+            return {"reason": "pause_boundary", **self._current_position()}
         return self._navigate_to(frame.sequence_no, "step")
 
     def step_over(self) -> dict:
         self._require_replay()
+        if self._at_pause_boundary():
+            return {"reason": "pause_boundary", **self._current_position()}
         current = self._get_current_frame()
         if current is None:
             return self._navigate_to(self.last_line_seq, "end")
@@ -186,10 +209,14 @@ class Session:
             (current_depth, current_thread))
         if frame is None:
             return self._navigate_to(self.last_line_seq, "end")
+        if self._pause_boundary is not None and frame.sequence_no > self._pause_boundary:
+            return {"reason": "pause_boundary", **self._current_position()}
         return self._navigate_to(frame.sequence_no, "step")
 
     def step_out(self) -> dict:
         self._require_replay()
+        if self._at_pause_boundary():
+            return {"reason": "pause_boundary", **self._current_position()}
         current = self._get_current_frame()
         if current is None:
             return self._navigate_to(self.last_line_seq, "end")
@@ -259,10 +286,14 @@ class Session:
 
         if parent_line is None:
             return self._navigate_to(self.last_line_seq, "end")
+        if self._pause_boundary is not None and parent_line.sequence_no > self._pause_boundary:
+            return {"reason": "pause_boundary", **self._current_position()}
         return self._navigate_to(parent_line.sequence_no, "step")
 
     def continue_forward(self) -> dict:
         self._require_replay()
+        if self._at_pause_boundary():
+            return {"reason": "pause_boundary", **self._current_position()}
         candidates = []
         self._log_messages = []
         self._condition_errors = []
@@ -609,6 +640,18 @@ class Session:
             if context == "repl":
                 return {"result": f"Error: cannot evaluate '{expression}' against recorded locals"}
             return {"result": "<not available>"}
+
+    def set_variable(self, var_name: str, new_value_expr: str) -> dict:
+        """Modify a variable in the paused frame.
+        Only works when the recording is paused (live frame accessible)."""
+        import pyttd_native
+        try:
+            result = pyttd_native.set_variable(var_name, new_value_expr)
+            return result if result else {"error": "set_variable returned None"}
+        except RuntimeError as e:
+            return {"error": str(e)}
+        except Exception as e:
+            return {"error": f"Failed to set variable: {e}"}
 
     # --- Phase 6: CodeLens, Call History ---
 
@@ -1234,6 +1277,20 @@ class Session:
 
     def _get_current_frame(self):
         return self._fetch_frame(self.current_frame_seq)
+
+    def _current_position(self) -> dict:
+        """Return position dict for the current frame (no navigation)."""
+        if self.current_frame_seq is not None:
+            frame = self._fetch_frame(self.current_frame_seq)
+            if frame:
+                return {
+                    "seq": self.current_frame_seq,
+                    "file": frame.filename,
+                    "line": frame.line_no,
+                    "function_name": frame.function_name,
+                    "thread_id": frame.thread_id,
+                }
+        return {"seq": self.current_frame_seq}
 
     def _navigate_to(self, seq: int, reason: str) -> dict:
         old_seq = self.current_frame_seq

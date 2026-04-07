@@ -28,6 +28,13 @@ extern pthread_cond_t g_flush_cond;
 /* Pre-fork synchronization condvars (defined in recorder.c) */
 extern pthread_cond_t g_pause_ack_cv;
 extern pthread_cond_t g_resume_cv;
+
+/* RESUME_LIVE support: trace function, callback, socket FD (defined in recorder.c) */
+extern int pyttd_trace_func(PyObject *obj, PyFrameObject *frame, int what, PyObject *arg);
+extern PyObject *g_resume_live_callback;
+extern int g_server_socket_fd;
+extern _Atomic int g_flush_stop;
+extern pthread_t g_flush_thread;
 extern _Atomic int g_pause_requested;
 extern _Atomic int g_pause_acked;
 
@@ -152,6 +159,104 @@ void serialize_error_result(int result_fd, const char *error_code, uint64_t last
     write_all(result_fd, buf, len);
 }
 
+/* ---- RESUME_LIVE: Child Goes Live ---- */
+
+void checkpoint_child_go_live(int result_fd, int cmd_fd) {
+    /* Called from fast-forward hooks when target is reached in RESUME_LIVE mode.
+     * Re-initializes the child as a live recording process. */
+
+    /* 1. Clear fast-forward state */
+    g_fast_forward_live = 0;
+    recorder_set_fast_forward(0, 0);  /* clears g_fast_forward and g_fast_forward_target */
+
+    /* 2. Generate new run_id */
+    PyObject *uuid_mod = PyImport_ImportModule("uuid");
+    if (!uuid_mod) { PyErr_Clear(); _exit(1); }
+    PyObject *uuid4 = PyObject_CallMethod(uuid_mod, "uuid4", NULL);
+    if (!uuid4) { PyErr_Clear(); Py_DECREF(uuid_mod); _exit(1); }
+    PyObject *hex_attr = PyObject_GetAttrString(uuid4, "hex");
+    if (!hex_attr) { PyErr_Clear(); Py_DECREF(uuid4); Py_DECREF(uuid_mod); _exit(1); }
+    const char *new_run_id = PyUnicode_AsUTF8(hex_attr);
+
+    /* 3. Reinitialize ring buffer */
+    ringbuf_system_init(PYTTD_DEFAULT_CAPACITY);
+    ringbuf_get_or_create(PyThread_get_thread_ident());
+
+    /* 4. Open new binlog for the branch */
+    binlog_open(g_recorder_db_path, new_run_id);
+
+    /* 5. Re-enable recording */
+    atomic_store_explicit(&g_recording, 1, memory_order_release);
+    atomic_store_explicit(&g_stop_requested, 0, memory_order_relaxed);
+
+    /* 6. Reinstall trace function */
+    PyEval_SetTrace((Py_tracefunc)pyttd_trace_func, Py_None);
+
+    /* 7. Reset I/O hooks to recording mode */
+    iohook_reset_child_state();
+
+    /* 8. Re-register signal handlers (were SIG_IGN in checkpoint_child_init) */
+    signal(SIGINT, SIG_DFL);
+    signal(SIGTERM, SIG_DFL);
+    signal(SIGPIPE, SIG_IGN);
+
+    /* 9. Restart flush thread */
+    atomic_store_explicit(&g_flush_stop, 0, memory_order_relaxed);
+    g_flush_thread_created = 0;
+    if (pthread_create(&g_flush_thread, NULL, flush_thread_func, NULL) == 0) {
+        g_flush_thread_created = 1;
+    }
+
+    /* 10. Reset checkpoint state */
+    atomic_store_explicit(&g_last_checkpoint_seq,
+        atomic_load_explicit(&g_sequence_counter, memory_order_relaxed),
+        memory_order_relaxed);
+
+    /* 11. Reset user pause state */
+    atomic_store_explicit(&g_user_pause_requested, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_user_paused, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_user_pause_thread_count, 0, memory_order_relaxed);
+
+    /* 12. Send handoff result to parent via result pipe */
+    char result_json[512];
+    uint64_t cur_seq = atomic_load_explicit(&g_sequence_counter, memory_order_relaxed);
+    snprintf(result_json, sizeof(result_json),
+        "{\"status\":\"live\",\"new_run_id\":\"%s\",\"seq\":%llu}",
+        new_run_id, (unsigned long long)cur_seq);
+
+    uint32_t net_len = htonl((uint32_t)strlen(result_json));
+    write_all(result_fd, &net_len, 4);
+    write_all(result_fd, result_json, strlen(result_json));
+
+    /* 13. Close pipe FDs — parent reads the result and shuts down */
+    close(result_fd);
+    close(cmd_fd);
+    g_cmd_fd = -1;
+    g_result_fd = -1;
+
+    /* 14. Call Python bootstrap callback to start the RPC event loop
+     * in a background thread (the main thread continues the user script) */
+    if (g_resume_live_callback) {
+        extern int g_server_socket_fd;
+        PyObject *result = PyObject_CallFunction(g_resume_live_callback,
+            "ssi", new_run_id, g_recorder_db_path, g_server_socket_fd);
+        if (!result) {
+            PyErr_WriteUnraisable(g_resume_live_callback);
+            PyErr_Clear();
+        }
+        Py_XDECREF(result);
+    }
+
+    /* 15. Cleanup Python refs */
+    Py_DECREF(hex_attr);
+    Py_DECREF(uuid4);
+    Py_DECREF(uuid_mod);
+
+    /* Return to caller (fast-forward hook).
+     * g_fast_forward_live is now 0, so the eval hook proceeds normally.
+     * The child is now the live process. */
+}
+
 /* ---- Child Command Loop ---- */
 
 int checkpoint_wait_for_command(int cmd_fd) {
@@ -185,6 +290,17 @@ int checkpoint_wait_for_command(int cmd_fd) {
             return checkpoint_wait_for_command(cmd_fd);
         }
         recorder_set_fast_forward(1, recorder_get_sequence_counter() + payload);
+        return 0;
+    }
+
+    if (opcode == 0x03) {  /* RESUME_LIVE(target) */
+        if (payload <= recorder_get_sequence_counter()) {
+            serialize_error_result(g_result_fd, "already_past_target",
+                                   recorder_get_sequence_counter());
+            return checkpoint_wait_for_command(cmd_fd);
+        }
+        iohook_enter_replay_mode(recorder_get_sequence_counter());
+        recorder_set_fast_forward_live(1, payload);
         return 0;
     }
 
@@ -224,6 +340,19 @@ static void checkpoint_child_command_loop(int cmd_fd, int result_fd,
                 g_result_fd = result_fd;
                 g_saved_tstate = saved_tstate;
                 return;  /* return to eval hook */
+            }
+        } else if (opcode == 0x03) {  /* RESUME_LIVE */
+            uint64_t target_seq = payload;
+            if (target_seq <= recorder_get_sequence_counter()) {
+                serialize_error_result(result_fd, "already_past_target",
+                                       recorder_get_sequence_counter());
+            } else {
+                iohook_enter_replay_mode(recorder_get_sequence_counter());
+                recorder_set_fast_forward_live(1, target_seq);
+                g_cmd_fd = cmd_fd;
+                g_result_fd = result_fd;
+                g_saved_tstate = saved_tstate;
+                return;  /* return to eval hook — fast-forward + go live */
             }
         } else if (opcode == 0x02) {  /* STEP */
             uint64_t delta = payload;

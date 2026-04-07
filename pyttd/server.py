@@ -52,6 +52,8 @@ class PyttdServer:
         self._msg_queue = queue.Queue()
         self._recording_thread = None
         self._recording = False
+        self._paused = False
+        self._paused_seq = None
         self._shutdown = False
         self._rpc = None
         self._conn = None
@@ -148,6 +150,13 @@ class PyttdServer:
         sock.settimeout(None)
         self._conn = conn
         self._rpc = JsonRpcConnection(conn)
+
+        # Store socket FD in C extension for checkpoint child handoff
+        try:
+            import pyttd_native
+            pyttd_native.set_socket_fd(conn.fileno())
+        except Exception:
+            pass
 
         # 6. Register with selector
         self._sel.register(conn, selectors.EVENT_READ, 'rpc')
@@ -333,6 +342,8 @@ class PyttdServer:
             "set_breakpoints": self._handle_set_breakpoints,
             "set_exception_breakpoints": self._handle_set_exception_breakpoints,
             "interrupt": self._handle_interrupt,
+            "pause": self._handle_pause,
+            "resume_recording": self._handle_resume_recording,
             "get_threads": self._handle_get_threads,
             "get_stack_trace": self._handle_get_stack_trace,
             "get_scopes": self._handle_get_scopes,
@@ -357,6 +368,8 @@ class PyttdServer:
             "get_checkpoint_memory": self._handle_get_checkpoint_memory,
             "set_function_breakpoints": self._handle_set_function_breakpoints,
             "set_data_breakpoints": self._handle_set_data_breakpoints,
+            "continue_from_past": self._handle_continue_from_past,
+            "set_variable": self._handle_set_variable,
             "disconnect": self._handle_disconnect,
         }.get(method)
 
@@ -383,6 +396,8 @@ class PyttdServer:
             import pyttd_native
             if hasattr(pyttd_native, 'restore_checkpoint'):
                 capabilities.extend(["cold_navigation", "checkpoints"])
+            if hasattr(pyttd_native, 'request_pause'):
+                capabilities.append("live_pause")
         except ImportError:
             pass
         return {"version": pyttd.__version__, "capabilities": capabilities}
@@ -436,6 +451,171 @@ class PyttdServer:
             import pyttd_native
             pyttd_native.request_stop()
         return {}
+
+    def _handle_pause(self, params: dict) -> dict:
+        """Pause the recording thread and enter paused replay mode."""
+        if not self._recording or self._paused:
+            return {"error": "not recording or already paused"}
+
+        import pyttd_native
+        import sqlite3 as _sqlite3
+
+        # 1. Pause recording thread (blocks until acked or timeout)
+        success = pyttd_native.request_pause()
+        if not success:
+            return {"error": "pause timeout — recording thread did not respond"}
+
+        # 2. Drain flush thread — wait for all ring buffer events to reach binlog
+        pyttd_native.flush_and_wait()
+
+        # 3. Flush binlog stdio buffer to disk
+        pyttd_native.binlog_flush()
+
+        # 4. Snapshot binlog → SQLite (incremental load)
+        pyttd_native.binlog_load_partial(self._db_path)
+
+        # 5. Rebuild secondary indexes for navigation queries
+        from pyttd.models import schema
+        try:
+            conn = _sqlite3.connect(self._db_path)
+            for sql in schema.SECONDARY_INDEX_CREATE:
+                try:
+                    conn.execute(sql)
+                except Exception:
+                    pass  # Index may already exist
+            conn.commit()
+            conn.close()
+        except Exception:
+            logger.debug("Failed to rebuild indexes during pause")
+
+        # 6. Read current sequence and enter paused replay
+        paused_seq = pyttd_native.get_sequence_counter()
+        # sequence_counter is the NEXT seq to assign, so last recorded is seq-1
+        if paused_seq > 0:
+            paused_seq -= 1
+
+        self._paused = True
+        self._paused_seq = paused_seq
+        self._recording = False
+
+        # Find the paused frame's line event (may be the last event or earlier)
+        from pyttd.models.db import db
+        last_line = db.fetchone(
+            "SELECT sequence_no FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line'"
+            " ORDER BY sequence_no DESC LIMIT 1",
+            (str(self.recorder.run_id),))
+        first_line = db.fetchone(
+            "SELECT sequence_no FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line'"
+            " ORDER BY sequence_no LIMIT 1",
+            (str(self.recorder.run_id),))
+
+        target_seq = last_line.sequence_no if last_line else 0
+        first_seq = first_line.sequence_no if first_line else 0
+
+        self.session.enter_paused_replay(self.recorder.run_id, first_seq)
+        # Navigate to the pause point
+        if target_seq != first_seq:
+            self.session.goto_frame(target_seq)
+
+        total_frames = paused_seq + 1
+
+        # 7. Notify DAP
+        if self._rpc and not self._rpc.is_closed:
+            self._rpc.send_notification("stopped", {
+                "seq": target_seq,
+                "reason": "pause",
+                "totalFrames": total_frames,
+                "thread_id": self.session.current_thread_id or 0,
+            })
+
+        return {"seq": target_seq, "totalFrames": total_frames}
+
+    def _handle_resume_recording(self, params: dict) -> dict:
+        """Resume the recording thread after a pause."""
+        if not self._paused:
+            return {"error": "not paused"}
+
+        import pyttd_native
+        import sqlite3 as _sqlite3
+
+        # 1. Drop secondary indexes (restore insert-speed optimization)
+        from pyttd.models import schema
+        try:
+            conn = _sqlite3.connect(self._db_path)
+            for sql in schema.SECONDARY_INDEX_DROP:
+                try:
+                    conn.execute(sql)
+                except Exception:
+                    pass
+            conn.commit()
+            conn.close()
+        except Exception:
+            logger.debug("Failed to drop indexes during resume")
+
+        # 2. Clear pause state
+        self._paused = False
+        self._paused_seq = None
+        self._recording = True
+        self.session.clear_pause_boundary()
+        self.session.state = "recording"
+
+        # 3. Resume recording thread
+        pyttd_native.resume()
+
+        return {}
+
+    def _handle_continue_from_past(self, params: dict) -> dict:
+        """Resume live execution from a historical checkpoint.
+        Called when user presses Continue while navigated backward from pause."""
+        target_seq = params.get("targetSeq", self.session.current_frame_seq)
+
+        import pyttd_native
+
+        # 1. Send RESUME_LIVE to nearest checkpoint child
+        try:
+            result = pyttd_native.resume_live(target_seq)
+        except RuntimeError as e:
+            return {"error": str(e)}
+
+        new_run_id = result.get("new_run_id")
+        resumed_seq = result.get("seq", target_seq)
+
+        # 2. Create branch run record
+        from pyttd.models import schema
+        schema.create_run(
+            script_path=self.script,
+            parent_run_id=str(self.recorder.run_id),
+            branch_seq=target_seq,
+        )
+
+        # 3. Stop our own recording (if still active)
+        if self._recording:
+            pyttd_native.request_stop()
+            if self._recording_thread:
+                self._recording_thread.join(timeout=5)
+
+        # 4. Send handoff notification to DAP before closing socket
+        if self._rpc and not self._rpc.is_closed:
+            self._rpc.send_notification("handoff", {
+                "new_run_id": new_run_id,
+                "seq": resumed_seq,
+            })
+
+        # 5. Shut down parent server — child takes over the socket
+        self._shutdown = True
+        return {"status": "handoff", "new_run_id": new_run_id}
+
+    def _handle_set_variable(self, params: dict) -> dict:
+        """Modify a variable in the paused frame."""
+        if not self._paused:
+            return {"error": "not paused"}
+        var_name = params.get("name", "")
+        new_value = params.get("value", "")
+        if not var_name:
+            return {"error": "no variable name"}
+        return self.session.set_variable(var_name, new_value)
 
     def _handle_get_threads(self, params: dict) -> dict:
         if self.session.state == "replay" and self.session.known_threads:
@@ -693,6 +873,7 @@ class PyttdServer:
         if not self.is_module:
             script_abs = os.path.realpath(self.script)
 
+        self.recorder._resume_live_callback = self._child_bootstrap_callback
         self.recorder.start(self._db_path, script_path=script_abs)
         self.session.state = "recording"
         self._recording = True
@@ -742,3 +923,185 @@ class PyttdServer:
                 os.write(self._wakeup_w, b'\x00')
             except OSError:
                 pass
+
+    @staticmethod
+    def _child_bootstrap_callback(new_run_id, db_path, socket_fd):
+        """Called in the resumed checkpoint child after checkpoint_child_go_live().
+        Starts a background RPC event loop on the inherited TCP socket.
+        The main thread continues executing the user script."""
+        import socket as _socket
+        import selectors as _selectors
+        from pyttd.models import storage
+        from pyttd.models.db import db
+        from pyttd.models import schema
+        from pyttd.protocol import JsonRpcConnection as _JsonRpcConnection
+        from pyttd.session import Session as _Session
+
+        # Reconnect to DB (child has stale connection from parent)
+        try:
+            storage.close_db()
+        except Exception:
+            pass
+        storage.connect_to_db(db_path)
+        storage.initialize_schema()
+
+        # Reconstruct socket from inherited FD
+        child_sock = _socket.fromfd(socket_fd, _socket.AF_INET, _socket.SOCK_STREAM)
+
+        # Create fresh RPC connection (empty buffer)
+        rpc = _JsonRpcConnection(child_sock)
+
+        # Create fresh session
+        session = _Session()
+        session.state = "recording"
+
+        def _child_dispatch(msg):
+            """Dispatch a single RPC in the child process."""
+            method = msg.get("method")
+            params = msg.get("params", {})
+            request_id = msg.get("id")
+
+            result = None
+            try:
+                if method == "get_threads":
+                    if session.state == "replay" and session.known_threads:
+                        result = {"threads": session.get_threads()}
+                    else:
+                        result = {"threads": [{"id": 1, "name": "Main Thread"}]}
+                elif method == "get_stack_trace":
+                    if session.state == "replay":
+                        result = {"stackFrames": session.get_stack_at(
+                            params.get("seq", session.current_frame_seq))}
+                    else:
+                        result = {"stackFrames": []}
+                elif method == "get_scopes":
+                    if session.state == "replay":
+                        seq = params.get("seq", session.current_frame_seq)
+                        result = {"scopes": [{"name": "Locals", "variablesReference": seq + 1}]}
+                    else:
+                        result = {"scopes": []}
+                elif method == "get_variables":
+                    if session.state == "replay":
+                        seq = params.get("seq", session.current_frame_seq)
+                        result = {"variables": session.get_variables_at(seq)}
+                    else:
+                        result = {"variables": []}
+                elif method == "evaluate":
+                    if session.state == "replay":
+                        seq = params.get("seq", session.current_frame_seq)
+                        result = session.evaluate_at(seq, params.get("expression", ""),
+                                                     params.get("context", "hover"))
+                    else:
+                        result = {"result": "", "error": "not_in_replay"}
+                elif method == "continue":
+                    if session.state == "replay":
+                        result = session.continue_forward()
+                    else:
+                        result = {"error": "not_in_replay"}
+                elif method == "next":
+                    if session.state == "replay":
+                        result = session.step_over()
+                    else:
+                        result = {"error": "not_in_replay"}
+                elif method == "step_in":
+                    if session.state == "replay":
+                        result = session.step_into()
+                    else:
+                        result = {"error": "not_in_replay"}
+                elif method == "step_out":
+                    if session.state == "replay":
+                        result = session.step_out()
+                    else:
+                        result = {"error": "not_in_replay"}
+                elif method == "step_back":
+                    if session.state == "replay":
+                        result = session.step_back()
+                    else:
+                        result = {"error": "not_in_replay"}
+                elif method == "reverse_continue":
+                    if session.state == "replay":
+                        result = session.reverse_continue()
+                    else:
+                        result = {"error": "not_in_replay"}
+                elif method == "goto_frame":
+                    if session.state == "replay":
+                        target = params.get("targetSeq", 0)
+                        result = session.goto_frame(target)
+                    else:
+                        result = {"error": "not_in_replay"}
+                elif method == "goto_targets":
+                    if session.state == "replay":
+                        result = session.goto_targets(
+                            params.get("file", ""), params.get("line", 0))
+                    else:
+                        result = {"targets": []}
+                elif method == "set_breakpoints":
+                    session.set_breakpoints(params.get("breakpoints", []))
+                    result = params.get("breakpoints", [])
+                elif method == "set_exception_breakpoints":
+                    session.set_exception_filters(params.get("filters", []))
+                    result = {}
+                elif method == "set_function_breakpoints":
+                    session.set_function_breakpoints(params.get("breakpoints", []))
+                    result = {}
+                elif method == "interrupt":
+                    import pyttd_native
+                    pyttd_native.request_stop()
+                    result = {}
+                elif method == "disconnect":
+                    result = {}
+                elif method == "get_timeline_summary":
+                    from pyttd.models.timeline import get_timeline_summary
+                    result = get_timeline_summary(
+                        str(session.run_id),
+                        params.get("startSeq", 0),
+                        params.get("endSeq", 0),
+                        params.get("bucketCount", 500),
+                        session.breakpoints)
+                elif method == "backend_init":
+                    import pyttd
+                    result = {"version": pyttd.__version__, "capabilities": ["recording", "warm_navigation"]}
+                else:
+                    if request_id is not None:
+                        rpc.send_error(request_id, -32601, f"Method not found: {method}")
+                    return
+
+                if request_id is not None:
+                    rpc.send_response(request_id, result or {})
+            except Exception as e:
+                if request_id is not None:
+                    rpc.send_error(request_id, -32603, str(e))
+
+        # Start the event loop on a daemon thread
+        def _child_event_loop():
+            """Full RPC loop in the resumed child — handles all DAP queries
+            while the user script runs on the main thread."""
+            sel = _selectors.DefaultSelector()
+            sel.register(child_sock, _selectors.EVENT_READ)
+            try:
+                while True:
+                    try:
+                        events = sel.select(timeout=1.0)
+                    except Exception:
+                        break
+                    for key, mask in events:
+                        try:
+                            data = child_sock.recv(65536)
+                            if not data:
+                                return
+                            rpc.feed(data)
+                            while True:
+                                try:
+                                    msg = rpc.try_read_message()
+                                except Exception:
+                                    break
+                                if msg is None:
+                                    break
+                                _child_dispatch(msg)
+                        except (ConnectionResetError, BrokenPipeError, OSError):
+                            return
+            finally:
+                sel.close()
+
+        t = threading.Thread(target=_child_event_loop, daemon=True)
+        t.start()

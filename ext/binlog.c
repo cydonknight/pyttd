@@ -27,6 +27,7 @@ static uint64_t g_binlog_bytes = 0;
 static char g_binlog_run_id[64] = {0};
 static uint64_t g_size_limit = 0;
 static uint64_t g_batch_count = 0;
+static uint64_t g_loaded_offset = 0;  /* Tracks partial-load position for incremental snapshots */
 
 /* 256KB write buffer for stdio */
 static char g_write_buf[256 * 1024];
@@ -207,6 +208,7 @@ int binlog_open(const char *db_path, const char *run_id) {
     g_binlog_bytes = BINLOG_HEADER_SIZE;
     g_batch_count = 0;
     g_size_limit = 0;
+    g_loaded_offset = 0;
     memset(g_realpath_cache, 0, sizeof(g_realpath_cache));
 
     return 0;
@@ -238,6 +240,205 @@ void binlog_close_child(void) {
         /* Prevent libc from flushing or double-closing */
         g_binlog_fp = NULL;
     }
+}
+
+int binlog_flush_to_disk(void) {
+    if (!g_binlog_fp) return -1;
+    return fflush(g_binlog_fp);
+}
+
+uint64_t binlog_get_loaded_offset(void) {
+    return g_loaded_offset;
+}
+
+int binlog_load_partial_into_sqlite(const char *db_path) {
+    /* Load binlog records from g_loaded_offset to current EOF into SQLite.
+     * Does NOT close or delete the binlog — recording continues appending.
+     * Uses a separate read handle from the write handle (g_binlog_fp).
+     * Uses INSERT OR IGNORE to handle re-loads gracefully. */
+
+    if (g_binlog_path[0] == '\0') return -1;
+
+    FILE *rfp = fopen(g_binlog_path, "rb");
+    if (!rfp) return -1;
+
+    /* First load: skip file header and extract run_id */
+    char run_id[33];
+    if (g_loaded_offset == 0) {
+        uint8_t file_header[BINLOG_HEADER_SIZE];
+        if (fread(file_header, BINLOG_HEADER_SIZE, 1, rfp) != 1) {
+            fclose(rfp);
+            return -1;
+        }
+        if (memcmp(file_header, BINLOG_MAGIC, BINLOG_MAGIC_SIZE) != 0) {
+            fclose(rfp);
+            return -1;
+        }
+        memcpy(run_id, file_header + 16, 32);
+        run_id[32] = '\0';
+        g_loaded_offset = BINLOG_HEADER_SIZE;
+    } else {
+        /* Subsequent loads: use stored run_id, seek to offset */
+        strncpy(run_id, g_binlog_run_id, sizeof(run_id) - 1);
+        run_id[32] = '\0';
+        fseek(rfp, (long)g_loaded_offset, SEEK_SET);
+    }
+
+    /* Open SQLite connection */
+    sqlite3 *sqldb = NULL;
+    int rc = sqlite3_open(db_path, &sqldb);
+    if (rc != SQLITE_OK) {
+        fclose(rfp);
+        return -1;
+    }
+
+    sqlite3_exec(sqldb, "PRAGMA journal_mode = wal", NULL, NULL, NULL);
+    sqlite3_exec(sqldb, "PRAGMA cache_size = -65536", NULL, NULL, NULL);
+    sqlite3_exec(sqldb, "PRAGMA synchronous = 1", NULL, NULL, NULL);
+    sqlite3_exec(sqldb, "PRAGMA busy_timeout = 5000", NULL, NULL, NULL);
+
+    /* Use INSERT OR IGNORE so final binlog_load_into_sqlite doesn't duplicate */
+    static const char *PARTIAL_INSERT_SQL =
+        "INSERT OR IGNORE INTO executionframes "
+        "(run_id, sequence_no, timestamp, line_no, filename, function_name, "
+        "frame_event, call_depth, locals_snapshot, thread_id, is_coroutine) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+    sqlite3_stmt *stmt = NULL;
+    rc = sqlite3_prepare_v2(sqldb, PARTIAL_INSERT_SQL, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        sqlite3_close(sqldb);
+        fclose(rfp);
+        return -1;
+    }
+
+    sqlite3_exec(sqldb, "BEGIN", NULL, NULL, NULL);
+
+    char stack_buf[8192];
+    char *heap_buf = NULL;
+    size_t heap_buf_size = 0;
+    uint64_t record_count = 0;
+    int error = 0;
+
+    while (!feof(rfp)) {
+        uint32_t total_size;
+        if (fread(&total_size, 4, 1, rfp) != 1) break;
+
+        if (total_size < BINLOG_RECORD_HEADER_SIZE) {
+            error = 1;
+            break;
+        }
+
+        uint8_t hdr[BINLOG_RECORD_HEADER_SIZE];
+        memcpy(hdr, &total_size, 4);
+        if (fread(hdr + 4, BINLOG_RECORD_HEADER_SIZE - 4, 1, rfp) != 1) break;
+
+        uint64_t seq;       memcpy(&seq, hdr + 4, 8);
+        double timestamp;   memcpy(&timestamp, hdr + 12, 8);
+        int32_t line_no;    memcpy(&line_no, hdr + 20, 4);
+        int32_t call_depth; memcpy(&call_depth, hdr + 24, 4);
+        uint64_t thread_id; memcpy(&thread_id, hdr + 28, 8);
+        uint8_t event_type = hdr[36];
+        uint8_t is_coroutine = hdr[37];
+        uint16_t filename_len;  memcpy(&filename_len, hdr + 38, 2);
+        uint16_t funcname_len;  memcpy(&funcname_len, hdr + 40, 2);
+        uint32_t locals_len;    memcpy(&locals_len, hdr + 42, 4);
+
+        uint32_t expected_payload = (uint32_t)filename_len + funcname_len + locals_len;
+        if (total_size != BINLOG_RECORD_HEADER_SIZE + expected_payload) {
+            long skip = (long)(total_size - BINLOG_RECORD_HEADER_SIZE);
+            if (skip > 0) fseek(rfp, skip, SEEK_CUR);
+            continue;
+        }
+
+        size_t payload_size = expected_payload;
+        char *buf;
+        if (payload_size <= sizeof(stack_buf)) {
+            buf = stack_buf;
+        } else {
+            if (payload_size > heap_buf_size) {
+                char *new_buf = (char *)realloc(heap_buf, payload_size + 1);
+                if (!new_buf) { error = 1; break; }
+                heap_buf = new_buf;
+                heap_buf_size = payload_size + 1;
+            }
+            buf = heap_buf;
+        }
+
+        if (payload_size > 0) {
+            if (fread(buf, payload_size, 1, rfp) != 1) break;
+        }
+
+        char fn_buf[PATH_MAX + 1];
+        size_t fn_copy = filename_len < PATH_MAX ? filename_len : PATH_MAX;
+        memcpy(fn_buf, buf, fn_copy);
+        fn_buf[fn_copy] = '\0';
+
+        char func_buf[1024];
+        size_t func_copy = funcname_len < 1023 ? funcname_len : 1023;
+        memcpy(func_buf, buf + filename_len, func_copy);
+        func_buf[func_copy] = '\0';
+
+        const char *locals_str = NULL;
+        char locals_stack[8192];
+        char *locals_heap = NULL;
+        if (locals_len > 0) {
+            char *locals_src = buf + filename_len + funcname_len;
+            if (locals_len < sizeof(locals_stack)) {
+                memcpy(locals_stack, locals_src, locals_len);
+                locals_stack[locals_len] = '\0';
+                locals_str = locals_stack;
+            } else {
+                locals_heap = (char *)malloc(locals_len + 1);
+                if (locals_heap) {
+                    memcpy(locals_heap, locals_src, locals_len);
+                    locals_heap[locals_len] = '\0';
+                    locals_str = locals_heap;
+                }
+            }
+        }
+
+        const char *event_str = unmap_event_type(event_type);
+
+        sqlite3_bind_text(stmt, 1, run_id, -1, SQLITE_STATIC);
+        sqlite3_bind_int64(stmt, 2, (sqlite3_int64)seq);
+        sqlite3_bind_double(stmt, 3, timestamp);
+        sqlite3_bind_int(stmt, 4, line_no);
+        sqlite3_bind_text(stmt, 5, fn_buf, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 6, func_buf, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 7, event_str, -1, SQLITE_STATIC);
+        sqlite3_bind_int(stmt, 8, call_depth);
+        if (locals_str) {
+            sqlite3_bind_text(stmt, 9, locals_str, -1, SQLITE_TRANSIENT);
+        } else {
+            sqlite3_bind_null(stmt, 9);
+        }
+        sqlite3_bind_int64(stmt, 10, (sqlite3_int64)thread_id);
+        sqlite3_bind_int(stmt, 11, is_coroutine);
+
+        sqlite3_step(stmt);
+        sqlite3_reset(stmt);
+
+        if (locals_heap) { free(locals_heap); locals_heap = NULL; }
+        record_count++;
+
+        if ((record_count % 10000) == 0) {
+            sqlite3_exec(sqldb, "COMMIT", NULL, NULL, NULL);
+            sqlite3_exec(sqldb, "BEGIN", NULL, NULL, NULL);
+        }
+    }
+
+    sqlite3_exec(sqldb, "COMMIT", NULL, NULL, NULL);
+    sqlite3_finalize(stmt);
+    sqlite3_close(sqldb);
+
+    if (heap_buf) free(heap_buf);
+
+    /* Update offset to current position for next incremental load */
+    g_loaded_offset = (uint64_t)ftell(rfp);
+    fclose(rfp);
+
+    return error ? -1 : 0;
 }
 
 int binlog_write_batch(const FrameEvent *events, uint32_t count) {
@@ -323,7 +524,7 @@ uint64_t binlog_byte_count(void) {
 /* ---- Bulk Loader (binlog -> SQLite) ---- */
 
 static const char *BULK_INSERT_SQL =
-    "INSERT INTO executionframes "
+    "INSERT OR IGNORE INTO executionframes "
     "(run_id, sequence_no, timestamp, line_no, filename, function_name, "
     "frame_event, call_depth, locals_snapshot, thread_id, is_coroutine) "
     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
@@ -585,5 +786,26 @@ PyObject *pyttd_binlog_set_size_limit(PyObject *self, PyObject *args) {
     unsigned long long limit;
     if (!PyArg_ParseTuple(args, "K", &limit)) return NULL;
     binlog_set_size_limit((uint64_t)limit);
+    Py_RETURN_NONE;
+}
+
+PyObject *pyttd_binlog_flush(PyObject *self, PyObject *Py_UNUSED(args)) {
+    (void)self;
+    if (binlog_flush_to_disk() != 0) {
+        PyErr_SetString(PyExc_RuntimeError, "Failed to flush binlog");
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
+PyObject *pyttd_binlog_load_partial(PyObject *self, PyObject *args) {
+    (void)self;
+    const char *db_path;
+    if (!PyArg_ParseTuple(args, "s", &db_path)) return NULL;
+
+    if (binlog_load_partial_into_sqlite(db_path) != 0) {
+        PyErr_SetString(PyExc_RuntimeError, "Failed to partially load binlog into SQLite");
+        return NULL;
+    }
     Py_RETURN_NONE;
 }

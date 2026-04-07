@@ -30,10 +30,17 @@ uint64_t binlog_byte_count(void);
 /* Size limit for auto-stop */
 void binlog_set_size_limit(uint64_t max_bytes);
 
+/* Partial load API (live debugging — snapshot binlog into SQLite during pause) */
+int  binlog_flush_to_disk(void);
+int  binlog_load_partial_into_sqlite(const char *db_path);
+uint64_t binlog_get_loaded_offset(void);
+
 /* Python-facing functions */
 #include <Python.h>
 PyObject *pyttd_binlog_open(PyObject *self, PyObject *args);
 PyObject *pyttd_binlog_load(PyObject *self, PyObject *args);
 PyObject *pyttd_binlog_set_size_limit(PyObject *self, PyObject *args);
+PyObject *pyttd_binlog_flush(PyObject *self, PyObject *Py_UNUSED(args));
+PyObject *pyttd_binlog_load_partial(PyObject *self, PyObject *args);
 
 #endif /* PYTTD_BINLOG_H */

@@ -19,10 +19,35 @@ PyObject *pyttd_set_file_include_patterns(PyObject *self, PyObject *args);
 PyObject *pyttd_set_exclude_patterns(PyObject *self, PyObject *args);
 PyObject *pyttd_trace_current_frame(PyObject *self, PyObject *Py_UNUSED(args));
 
+/* User pause API (live debugging) */
+PyObject *pyttd_request_user_pause(PyObject *self, PyObject *Py_UNUSED(args));
+PyObject *pyttd_user_resume(PyObject *self, PyObject *Py_UNUSED(args));
+PyObject *pyttd_is_user_paused(PyObject *self, PyObject *Py_UNUSED(args));
+PyObject *pyttd_get_sequence_counter(PyObject *self, PyObject *Py_UNUSED(args));
+PyObject *pyttd_flush_and_wait(PyObject *self, PyObject *Py_UNUSED(args));
+
+/* User pause globals exposed for checkpoint child init */
+extern _Atomic int g_user_pause_requested;
+extern _Atomic int g_user_paused;
+extern _Atomic int g_user_pause_thread_count;
+extern _Atomic int g_user_pause_expected;
+
 /* Phase 2 getters/setters — used by checkpoint.c and replay.c */
 void recorder_set_fast_forward(int enabled, uint64_t target_seq);
+void recorder_set_fast_forward_live(int enabled, uint64_t target_seq);
 uint64_t recorder_get_sequence_counter(void);
 int recorder_get_call_depth(void);
+PyObject *pyttd_set_socket_fd(PyObject *self, PyObject *args);
+PyObject *pyttd_set_variable(PyObject *self, PyObject *args);
+
+/* Phase 2: RESUME_LIVE support */
+extern int g_fast_forward_live;
+extern char g_recorder_db_path[1024];
+
+/* Flush thread — exposed for checkpoint_child_go_live */
+#ifndef _WIN32
+void *flush_thread_func(void *arg);
+#endif
 
 /* Phase 2 globals exposed for checkpoint child init */
 extern _Atomic int g_recording;

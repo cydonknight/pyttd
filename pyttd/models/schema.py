@@ -84,16 +84,20 @@ SECONDARY_INDEX_CREATE = [
 
 MIGRATION_SQL = [
     'ALTER TABLE runs ADD COLUMN is_attach INTEGER DEFAULT 0',
+    'ALTER TABLE runs ADD COLUMN parent_run_id TEXT NULL',
+    'ALTER TABLE runs ADD COLUMN branch_seq INTEGER NULL',
 ]
 
 
-def create_run(script_path=None, is_attach=False):
+def create_run(script_path=None, is_attach=False, parent_run_id=None, branch_seq=None):
     """Create a new Runs record. Returns run_id string (hex, no dashes)."""
     run_id = uuid.uuid4().hex
     db.execute(
-        "INSERT INTO runs (run_id, timestamp_start, script_path, is_attach, total_frames)"
-        " VALUES (?, ?, ?, ?, 0)",
-        (run_id, datetime.now().timestamp(), script_path, int(is_attach)))
+        "INSERT INTO runs (run_id, timestamp_start, script_path, is_attach,"
+        " total_frames, parent_run_id, branch_seq)"
+        " VALUES (?, ?, ?, ?, 0, ?, ?)",
+        (run_id, datetime.now().timestamp(), script_path, int(is_attach),
+         parent_run_id, branch_seq))
     db.commit()
     return run_id
 

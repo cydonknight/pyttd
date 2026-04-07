@@ -18,9 +18,11 @@ Traditional debuggers only move forward. If you step past a bug, you start over.
 - **Track variable history** across the entire recording
 - **Set conditional, function, data, and log breakpoints** — all work in both directions
 - **Attach to running processes** to start recording mid-execution
+- **Pause mid-execution** to inspect state and navigate history, then resume recording
+- **Resume from any checkpoint** — navigate backward to a historical point, press Continue, and the debugger resumes live execution from that point on a branched timeline (Unix only)
 - **Export traces** to Perfetto for external analysis
 
-pyttd is a **post-mortem replay debugger** — your script runs to completion, and then you debug the recorded trace.
+pyttd supports both **post-mortem replay** (script runs to completion, then you debug the trace) and **live pause-and-inspect** (pause a running script mid-execution, navigate the recorded history, resume recording, or resume from a historical checkpoint to fork the execution timeline).
 
 ## Installation
 
@@ -157,6 +159,7 @@ install_signal_handler()  # First USR1 arms, second disarms
 - Selective recording — `--include` / `--exclude` filter by function name (matches both qualified and bare names, e.g. `--include failing` matches `main.<locals>.failing`), `--include-file` / `--exclude-file` filter by source file path (glob patterns where `*` matches across `/`)
 - Expandable variable trees — dicts, lists, tuples, sets, objects with `__dict__`, and `__slots__`-based classes (including `@dataclass(slots=True)` and `NamedTuple` with field names) are serialized with structure, not just `repr()`
 - Runtime attach — `arm()` / `disarm()` API to start/stop recording from within a running process, or toggle via Unix signal
+- Live pause-and-inspect — pause a running script at the next line boundary, snapshot the binary log into SQLite for navigation, step backward through history, then resume recording; the recording thread releases the GIL during pause so the server can operate
 - Checkpoint memory tracking and configurable limits
 
 ### Navigation
@@ -168,6 +171,7 @@ install_signal_handler()  # First USR1 arms, second disarms
 - Function breakpoints — break on any call to a named function
 - Data breakpoints — break when a variable's value changes
 - Jump: goto frame, goto targets (all executions of a line), restart frame
+- Resume from past — while paused, navigate backward to a checkpoint and press Continue to fork execution from that point; the checkpoint child takes over the live process with a new branched timeline (Unix only, requires checkpoints)
 - Warm navigation (SQLite, sub-ms) for stepping; cold navigation (checkpoint restore, 50-300ms) for jumps
 
 ### VSCode Extension
@@ -180,6 +184,7 @@ install_signal_handler()  # First USR1 arms, second disarms
 - Function breakpoints, data breakpoints, conditional breakpoints, hit conditions, log points
 - Variable history webview — canvas chart for numeric values, HTML table for non-numeric, click-to-navigate; accessible from Variables panel context menu
 - Breakpoint verification — validates that breakpoints target executable lines; condition eval errors shown in Debug Console
+- Live pause — click Pause during recording to suspend execution, inspect variables, navigate backward, then resume with the Resume Recording command
 - Status bar with recording progress (frame count, dropped frames, DB size, checkpoint count and memory)
 - Keyboard shortcuts: Ctrl+Shift+F11 (step back), Ctrl+Shift+F5 (reverse continue)
 

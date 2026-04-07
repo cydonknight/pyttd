@@ -18,6 +18,7 @@
     let maxDepthOverall = 1;
     let isDragging = false;
     let pendingGoto = null;
+    let isLivePaused = false;
     let lastGotoTime = 0;
     const GOTO_THROTTLE_MS = 150;
 
@@ -120,6 +121,24 @@
                 ctx.closePath();
                 ctx.fill();
             }
+        }
+
+        // Live edge marker — green dashed line at right edge when paused
+        if (isLivePaused && viewEndSeq > viewStartSeq) {
+            const edgeX = padding.left + drawW;
+            ctx.strokeStyle = '#4CAF50';
+            ctx.lineWidth = 2;
+            ctx.setLineDash([4, 4]);
+            ctx.beginPath();
+            ctx.moveTo(edgeX, padding.top);
+            ctx.lineTo(edgeX, padding.top + drawH);
+            ctx.stroke();
+            ctx.setLineDash([]);
+            // "LIVE" label
+            ctx.fillStyle = '#4CAF50';
+            ctx.font = '10px monospace';
+            ctx.textAlign = 'right';
+            ctx.fillText('LIVE', edgeX - 2, padding.top - 3);
         }
 
         // Sequence range labels
@@ -322,6 +341,10 @@
                 currentSeq = data.seq;
                 render();
             }
+        } else if (msg.type === 'pyttd/pauseState') {
+            const data = msg.data;
+            isLivePaused = !!data.isPaused;
+            render();
         }
     });
 

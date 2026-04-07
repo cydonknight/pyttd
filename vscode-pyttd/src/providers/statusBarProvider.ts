@@ -3,7 +3,7 @@ import * as vscode from 'vscode';
 export class PyttdStatusBarProvider {
     private statusBarItem: vscode.StatusBarItem;
     private warningItem: vscode.StatusBarItem;
-    private state: 'idle' | 'recording' | 'replay' = 'idle';
+    private state: 'idle' | 'recording' | 'replay' | 'paused' = 'idle';
     private frameCount = 0;
     private currentSeq = 0;
     private totalFrames = 0;
@@ -65,15 +65,29 @@ export class PyttdStatusBarProvider {
         this.warningItem.hide();
     }
 
-    updatePosition(seq: number): void {
-        if (this.state !== 'replay') return;
-        this.currentSeq = seq;
-        this.updateReplayDisplay();
-    }
-
     private updateReplayDisplay(): void {
         this.statusBarItem.text = `$(debug-alt) TTD: Replay (${this.currentSeq.toLocaleString()} / ${this.totalFrames.toLocaleString()})`;
         this.statusBarItem.tooltip = `pyttd replay mode\nPosition: seq ${this.currentSeq}\nTotal frames: ${this.totalFrames.toLocaleString()}\nClick to focus timeline`;
+    }
+
+    enterPaused(seq: number, totalFrames: number): void {
+        this.state = 'paused';
+        this.currentSeq = seq;
+        this.totalFrames = totalFrames;
+        this.statusBarItem.text = `$(debug-pause) TTD: Paused (${seq.toLocaleString()} / ${totalFrames.toLocaleString()})`;
+        this.statusBarItem.tooltip = `pyttd paused — recording suspended\nPosition: seq ${seq}\nTotal frames: ${totalFrames.toLocaleString()}\nUse Resume Recording to continue`;
+        this.statusBarItem.show();
+        this.warningItem.hide();
+    }
+
+    updatePosition(seq: number): void {
+        if (this.state !== 'replay' && this.state !== 'paused') return;
+        this.currentSeq = seq;
+        if (this.state === 'paused') {
+            this.statusBarItem.text = `$(debug-pause) TTD: Paused (${seq.toLocaleString()} / ${this.totalFrames.toLocaleString()})`;
+        } else {
+            this.updateReplayDisplay();
+        }
     }
 
     reset(): void {

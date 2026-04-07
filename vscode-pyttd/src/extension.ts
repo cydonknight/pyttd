@@ -89,6 +89,26 @@ export function activate(context: vscode.ExtensionContext) {
         }),
     );
 
+    // Resume recording command (for live debugging pause/resume)
+    context.subscriptions.push(
+        vscode.commands.registerCommand('pyttd.resumeRecording', () => {
+            const session = vscode.debug.activeDebugSession;
+            if (session && session.type === 'pyttd') {
+                session.customRequest('resume_recording');
+            }
+        }),
+    );
+
+    // Stop recording command (hard stop — sends interrupt, ends recording)
+    context.subscriptions.push(
+        vscode.commands.registerCommand('pyttd.stopRecording', () => {
+            const session = vscode.debug.activeDebugSession;
+            if (session && session.type === 'pyttd') {
+                session.customRequest('stop_recording');
+            }
+        }),
+    );
+
     // P1-3: Export Perfetto Trace command
     context.subscriptions.push(
         vscode.commands.registerCommand('pyttd.exportPerfetto', async () => {
@@ -182,8 +202,15 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(
         vscode.debug.onDidReceiveDebugSessionCustomEvent((e) => {
             if (e.session.type !== 'pyttd') return;
-            if (e.event === 'pyttd/timelineData' || e.event === 'pyttd/positionChanged') {
+            if (e.event === 'pyttd/timelineData' || e.event === 'pyttd/positionChanged' || e.event === 'pyttd/pauseState') {
                 timelineProvider.postMessage({ type: e.event, data: e.body });
+            }
+            if (e.event === 'pyttd/pauseState') {
+                if (e.body.isPaused) {
+                    statusBar.enterPaused(e.body.seq || 0, e.body.totalFrames || 0);
+                } else {
+                    statusBar.startRecording();
+                }
             }
             // P1-2: Surface errors as VSCode notifications
             if (e.event === 'pyttd/error') {

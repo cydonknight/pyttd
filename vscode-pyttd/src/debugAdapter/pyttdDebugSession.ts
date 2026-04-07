@@ -55,6 +55,9 @@ export class PyttdDebugSession extends LoggingDebugSession {
     private childRefMap = new Map<number, number>();
     private stopOnEntry = true;
     private droppedFrameWarningShown = false;
+    private isPaused = false;
+    private pausedAtSeq = 0;
+    private backendCapabilities: string[] = [];
 
     public constructor() {
         super();
@@ -71,6 +74,7 @@ export class PyttdDebugSession extends LoggingDebugSession {
         response.body.supportsEvaluateForHovers = true;
         (response.body as any).supportsProgressReporting = true;
         response.body.supportsStepBack = true;
+        response.body.supportsSetVariable = true;
         response.body.supportsGotoTargetsRequest = true;
         response.body.supportsRestartFrame = true;
         response.body.supportsConditionalBreakpoints = true;
@@ -159,6 +163,12 @@ export class PyttdDebugSession extends LoggingDebugSession {
 
                 return this.backend.sendRequest('backend_init');
             })
+            .then((initResult: any) => {
+                if (initResult && initResult.capabilities) {
+                    this.backendCapabilities = initResult.capabilities;
+                }
+                return;
+            })
             .then(() => {
                 const launchParams: any = {
                     args: config.args || [],
@@ -197,7 +207,14 @@ export class PyttdDebugSession extends LoggingDebugSession {
                 this.droppedFrameWarningShown = false;
                 this.sendEvent(new ProgressEndEvent(this.progressId));
 
-                if (!this.stopOnEntry && params.reason === 'recording_complete') {
+                if (params.reason === 'pause') {
+                    this.isPaused = true;
+                    this.pausedAtSeq = params.seq;
+                    this.sendEvent(new Event('pyttd/pauseState', { isPaused: true, seq: params.seq, totalFrames: this.totalFrames }));
+                    this.sendEvent(new StoppedEvent('pause', params.thread_id || 1));
+                } else if (!this.stopOnEntry && params.reason === 'recording_complete') {
+                    this.isPaused = false;
+                    this.sendEvent(new Event('pyttd/pauseState', { isPaused: false }));
                     // Auto-continue to first breakpoint
                     this.backend.sendRequest('continue').then((result: any) => {
                         this.currentSeq = result.seq;
@@ -206,6 +223,7 @@ export class PyttdDebugSession extends LoggingDebugSession {
                         this.sendEvent(new StoppedEvent('entry', params.thread_id || 1));
                     });
                 } else {
+                    this.isPaused = false;
                     this.sendEvent(new StoppedEvent('entry', params.thread_id || 1));
                 }
 
@@ -265,6 +283,12 @@ export class PyttdDebugSession extends LoggingDebugSession {
                 }
                 break;
             }
+            case 'handoff':
+                // Parent server handing off to checkpoint child — child takes over socket
+                this.isPaused = false;
+                this.isReplaying = false;
+                this.sendEvent(new Event('pyttd/pauseState', { isPaused: false }));
+                break;
             case 'logpoint':
                 this.sendEvent(new OutputEvent(params.message + '\n', 'console'));
                 break;
@@ -521,6 +545,32 @@ export class PyttdDebugSession extends LoggingDebugSession {
         }
     }
 
+    protected setVariableRequest(
+        response: DebugProtocol.SetVariableResponse,
+        args: DebugProtocol.SetVariableArguments
+    ): void {
+        if (!this.isPaused) {
+            this.sendErrorResponse(response, 1, 'Variables can only be modified when paused');
+            return;
+        }
+        this.backend.sendRequest('set_variable', {
+            name: args.name,
+            value: args.value,
+        }).then((result: any) => {
+            if (result.error) {
+                this.sendErrorResponse(response, 1, result.error);
+            } else {
+                response.body = {
+                    value: result.value || args.value,
+                    variablesReference: 0,
+                };
+                this.sendResponse(response);
+            }
+        }).catch((err: Error) => {
+            this.sendErrorResponse(response, 1, err.message);
+        });
+    }
+
     protected evaluateRequest(
         response: DebugProtocol.EvaluateResponse,
         args: DebugProtocol.EvaluateArguments
@@ -560,6 +610,34 @@ export class PyttdDebugSession extends LoggingDebugSession {
 
         if (!this.isReplaying) {
             this.sendResponse(response);
+            return;
+        }
+
+        // Phase 2: if paused and navigated backward, offer resume from past
+        if (this.isPaused && this.currentSeq < this.pausedAtSeq &&
+            this.backendCapabilities.includes('checkpoints')) {
+            this.backend.sendRequest('continue_from_past', {
+                targetSeq: this.currentSeq,
+            }).then((result: any) => {
+                if (result.status === 'handoff') {
+                    this.isPaused = false;
+                    this.isReplaying = false;
+                    this.sendResponse(response);
+                    this.sendEvent(new Event('pyttd/pauseState', { isPaused: false }));
+                    this.sendEvent(new ProgressStartEvent(this.progressId, 'Recording (resumed)...'));
+                } else if (result.error) {
+                    // Fallback to normal continue if resume_live fails
+                    this.backend.sendRequest('continue').then((r: any) => {
+                        this.currentSeq = r.seq;
+                        this.sendResponse(response);
+                        this.sendStoppedForReason(r.reason, r);
+                    }).catch((e: Error) => {
+                        this.sendErrorResponse(response, 1, e.message);
+                    });
+                }
+            }).catch((err: Error) => {
+                this.sendErrorResponse(response, 1, err.message);
+            });
             return;
         }
 
@@ -643,7 +721,21 @@ export class PyttdDebugSession extends LoggingDebugSession {
         args: DebugProtocol.PauseArguments
     ): void {
         if (!this.isReplaying) {
-            this.backend.sendRequest('interrupt').catch(() => {});
+            if (this.backendCapabilities.includes('live_pause')) {
+                // Live pause — suspend recording thread and enter paused replay
+                this.backend.sendRequest('pause').then((result: any) => {
+                    if (result.error) {
+                        // Fall back to interrupt if pause fails
+                        this.backend.sendRequest('interrupt').catch(() => {});
+                    }
+                    // The backend sends a 'stopped' notification with reason 'pause'
+                    // which will be handled by handleNotification
+                }).catch(() => {
+                    this.backend.sendRequest('interrupt').catch(() => {});
+                });
+            } else {
+                this.backend.sendRequest('interrupt').catch(() => {});
+            }
         }
         this.sendResponse(response);
     }
@@ -690,6 +782,13 @@ export class PyttdDebugSession extends LoggingDebugSession {
             case 'goto':
                 this.sendEvent(new StoppedEvent('goto', threadId));
                 break;
+            case 'pause_boundary': {
+                const ev = new StoppedEvent('step', threadId) as DebugProtocol.StoppedEvent;
+                ev.body.description = 'Pause boundary — resume recording to continue';
+                ev.body.text = 'Pause boundary';
+                this.sendEvent(ev);
+                break;
+            }
             default:
                 this.sendEvent(new StoppedEvent('step', threadId));
                 break;
@@ -901,6 +1000,27 @@ export class PyttdDebugSession extends LoggingDebugSession {
                 .catch((err: Error) => {
                     this.sendErrorResponse(response, 1, err.message);
                 });
+        } else if (command === 'resume_recording') {
+            if (!this.isPaused) {
+                this.sendResponse(response);
+                return;
+            }
+            this.backend.sendRequest('resume_recording')
+                .then(() => {
+                    this.isPaused = false;
+                    this.isReplaying = false;
+                    this.sendResponse(response);
+                    this.sendEvent(new Event('pyttd/pauseState', { isPaused: false }));
+                    // Restart progress reporting (recording resumed)
+                    this.sendEvent(new ProgressStartEvent(this.progressId, 'Recording...'));
+                })
+                .catch((err: Error) => {
+                    this.sendErrorResponse(response, 1, err.message);
+                });
+        } else if (command === 'stop_recording') {
+            // Hard stop — interrupt recording (terminal, not resumable)
+            this.backend.sendRequest('interrupt').catch(() => {});
+            this.sendResponse(response);
         } else if (['get_execution_stats', 'get_traced_files',
                      'get_call_children', 'get_variables',
                      'get_variable_history',

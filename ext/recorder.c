@@ -102,7 +102,11 @@ static int g_trace_installed_externally = 0;  /* set by trace_current_frame */
 
 /* ---- Phase 2: Checkpoint/fast-forward state ---- */
 static int g_fast_forward = 0;
+int g_fast_forward_live = 0;  /* 1 = RESUME_LIVE mode (reinit recording on target) */
 static uint64_t g_fast_forward_target = 0;
+char g_recorder_db_path[1024] = {0};  /* Set by start_recording, used by checkpoint_child_go_live */
+int g_server_socket_fd = -1;  /* TCP socket FD for handoff to checkpoint child */
+PyObject *g_resume_live_callback = NULL;  /* Python callback for child bootstrap */
 _Atomic uint64_t g_last_checkpoint_seq = 0;
 static PyObject *g_checkpoint_callback = NULL;
 static int g_checkpoint_interval = 0;
@@ -239,7 +243,7 @@ static HANDLE g_flush_thread = NULL;
 static HANDLE g_flush_mutex_win = NULL;
 static HANDLE g_flush_event = NULL;
 #else
-static pthread_t g_flush_thread;
+pthread_t g_flush_thread;
 int g_flush_thread_created = 0;
 pthread_mutex_t g_flush_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t g_flush_cond = PTHREAD_COND_INITIALIZER;
@@ -250,13 +254,48 @@ pthread_cond_t g_resume_cv = PTHREAD_COND_INITIALIZER;
 _Atomic int g_pause_requested = 0;
 _Atomic int g_pause_acked = 0;
 #endif
-static _Atomic int g_flush_stop = 0;
+_Atomic int g_flush_stop = 0;
 static int g_flush_interval_ms = 10;
+
+/* ---- User Pause (live debugging) — "pause all" barrier ---- */
+/* Distinct from pre-fork pause (g_pause_requested) which targets the flush thread.
+ * User pause targets ALL recording threads — each parks at its next LINE boundary.
+ * The RPC thread waits until all threads have parked (atomic barrier). */
+_Atomic int g_user_pause_requested = 0;
+_Atomic int g_user_paused = 0;               /* 1 when all threads parked (or timeout) */
+_Atomic int g_user_pause_thread_count = 0;    /* Threads currently parked */
+_Atomic int g_user_pause_expected = 0;        /* Total threads that must park */
+/* Per-thread frame reference for the paused frame (TLS — each thread holds its own) */
+PYTTD_THREAD_LOCAL PyObject *g_my_paused_frame = NULL;
+/* Main thread's paused frame (for Phase 3 variable modification) */
+static PyObject *g_main_paused_frame = NULL;
+#ifdef _WIN32
+static CRITICAL_SECTION g_user_pause_cs;
+static CONDITION_VARIABLE g_user_pause_cv;
+static CONDITION_VARIABLE g_user_pause_ack_cv;
+static int g_user_pause_cs_initialized = 0;
+#else
+static pthread_mutex_t g_user_pause_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_user_pause_cv = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t g_user_pause_ack_cv = PTHREAD_COND_INITIALIZER;
+#endif
+
+/* ---- Flush-and-wait synchronization (for binlog snapshot on pause) ---- */
+static _Atomic int g_flush_immediate = 0;
+#ifndef _WIN32
+static pthread_cond_t g_flush_done_cv = PTHREAD_COND_INITIALIZER;
+#endif
 
 /* ---- Phase 2 getter/setter ---- */
 
 void recorder_set_fast_forward(int enabled, uint64_t target_seq) {
     g_fast_forward = enabled;
+    g_fast_forward_target = target_seq;
+}
+
+void recorder_set_fast_forward_live(int enabled, uint64_t target_seq) {
+    g_fast_forward = enabled;
+    g_fast_forward_live = enabled;
     g_fast_forward_target = target_seq;
 }
 
@@ -1051,7 +1090,7 @@ char g_locals_buf[MAX_LOCALS_JSON_SIZE];
 static int pyttd_trace_func_fast_forward(PyObject *obj, PyFrameObject *frame, int what, PyObject *arg);
 #endif
 
-static int pyttd_trace_func(PyObject *obj, PyFrameObject *frame, int what, PyObject *arg) {
+int pyttd_trace_func(PyObject *obj, PyFrameObject *frame, int what, PyObject *arg) {
     (void)obj;
 
 #ifdef PYTTD_HAS_FORK
@@ -1158,6 +1197,67 @@ static int pyttd_trace_func(PyObject *obj, PyFrameObject *frame, int what, PyObj
         event.is_coroutine = is_coro;
 
         ringbuf_push(&event);
+
+        /* User pause check — "pause all" barrier for live debugging.
+         * Every recording thread parks here independently. The last thread
+         * to park signals the RPC thread. Resume broadcasts to all. */
+        if (atomic_load_explicit(&g_user_pause_requested, memory_order_acquire)) {
+            /* Hold a strong reference to the paused frame (per-thread TLS) */
+            Py_INCREF(frame);
+            g_my_paused_frame = (PyObject *)frame;
+            if (g_my_thread_id == g_main_thread_id) {
+                g_main_paused_frame = (PyObject *)frame;
+            }
+
+            /* Park this thread — increment barrier counter */
+            int parked = atomic_fetch_add_explicit(&g_user_pause_thread_count, 1,
+                                                    memory_order_acq_rel) + 1;
+
+            /* Signal RPC thread on FIRST park.  We don't wait for all threads because
+             * ringbuf_thread_count() includes pre-allocated buffers for threads that
+             * may not be executing user code.  The flush_and_wait mechanism drains
+             * all pending events regardless.  Other threads park as they hit their
+             * next LINE event (g_user_pause_requested stays set via the flag — each
+             * thread reads it independently without clearing). */
+            if (parked == 1) {
+#ifdef _WIN32
+                EnterCriticalSection(&g_user_pause_cs);
+                atomic_store_explicit(&g_user_paused, 1, memory_order_release);
+                WakeConditionVariable(&g_user_pause_ack_cv);
+                LeaveCriticalSection(&g_user_pause_cs);
+#else
+                pthread_mutex_lock(&g_user_pause_mutex);
+                atomic_store_explicit(&g_user_paused, 1, memory_order_release);
+                pthread_cond_signal(&g_user_pause_ack_cv);
+                pthread_mutex_unlock(&g_user_pause_mutex);
+#endif
+            }
+
+            /* Release GIL and wait for resume broadcast */
+            Py_BEGIN_ALLOW_THREADS
+#ifdef _WIN32
+            EnterCriticalSection(&g_user_pause_cs);
+            while (atomic_load_explicit(&g_user_paused, memory_order_acquire)) {
+                SleepConditionVariableCS(&g_user_pause_cv, &g_user_pause_cs, INFINITE);
+            }
+            LeaveCriticalSection(&g_user_pause_cs);
+#else
+            pthread_mutex_lock(&g_user_pause_mutex);
+            while (atomic_load_explicit(&g_user_paused, memory_order_acquire)) {
+                pthread_cond_wait(&g_user_pause_cv, &g_user_pause_mutex);
+            }
+            pthread_mutex_unlock(&g_user_pause_mutex);
+#endif
+            Py_END_ALLOW_THREADS
+
+            /* Resumed — release per-thread paused frame reference */
+            Py_XDECREF(g_my_paused_frame);
+            g_my_paused_frame = NULL;
+            if (g_my_thread_id == g_main_thread_id) {
+                g_main_paused_frame = NULL;
+            }
+            atomic_fetch_sub_explicit(&g_user_pause_thread_count, 1, memory_order_relaxed);
+        }
 
         /* P1-4: Auto-stop when max_frames reached (line events are most frequent).
          * Disable g_max_frames after first trigger to prevent cascading
@@ -1332,6 +1432,7 @@ exc_restore:
 /* Forward declarations */
 int checkpoint_wait_for_command(int cmd_fd);
 int serialize_target_state(int result_fd, int event_type, PyObject *trace_arg);
+void checkpoint_child_go_live(int result_fd, int cmd_fd);
 
 static int pyttd_trace_func_fast_forward(PyObject *obj, PyFrameObject *frame, int what, PyObject *arg) {
     (void)obj;
@@ -1344,8 +1445,12 @@ static int pyttd_trace_func_fast_forward(PyObject *obj, PyFrameObject *frame, in
     case PyTrace_LINE: {
         uint64_t seq = atomic_fetch_add_explicit(&g_sequence_counter, 1, memory_order_relaxed);
         if (seq == g_fast_forward_target) {
-            serialize_target_state(g_result_fd, -1, NULL);
-            checkpoint_wait_for_command(g_cmd_fd);
+            if (g_fast_forward_live) {
+                checkpoint_child_go_live(g_result_fd, g_cmd_fd);
+            } else {
+                serialize_target_state(g_result_fd, -1, NULL);
+                checkpoint_wait_for_command(g_cmd_fd);
+            }
         }
         return 0;
     }
@@ -1354,8 +1459,12 @@ static int pyttd_trace_func_fast_forward(PyObject *obj, PyFrameObject *frame, in
         if (arg == NULL) return 0;  /* exception propagation */
         uint64_t seq = atomic_fetch_add_explicit(&g_sequence_counter, 1, memory_order_relaxed);
         if (seq == g_fast_forward_target) {
-            serialize_target_state(g_result_fd, PyTrace_RETURN, arg);
-            checkpoint_wait_for_command(g_cmd_fd);
+            if (g_fast_forward_live) {
+                checkpoint_child_go_live(g_result_fd, g_cmd_fd);
+            } else {
+                serialize_target_state(g_result_fd, PyTrace_RETURN, arg);
+                checkpoint_wait_for_command(g_cmd_fd);
+            }
         }
         return 0;
     }
@@ -1363,8 +1472,12 @@ static int pyttd_trace_func_fast_forward(PyObject *obj, PyFrameObject *frame, in
     case PyTrace_EXCEPTION: {
         uint64_t seq = atomic_fetch_add_explicit(&g_sequence_counter, 1, memory_order_relaxed);
         if (seq == g_fast_forward_target) {
-            serialize_target_state(g_result_fd, PyTrace_EXCEPTION, arg);
-            checkpoint_wait_for_command(g_cmd_fd);
+            if (g_fast_forward_live) {
+                checkpoint_child_go_live(g_result_fd, g_cmd_fd);
+            } else {
+                serialize_target_state(g_result_fd, PyTrace_EXCEPTION, arg);
+                checkpoint_wait_for_command(g_cmd_fd);
+            }
         }
         return 0;
     }
@@ -1641,8 +1754,12 @@ static PyObject *pyttd_eval_hook_fast_forward(PyThreadState *tstate,
 
     /* Check if target reached at call event */
     if (call_seq == g_fast_forward_target) {
-        serialize_target_state(g_result_fd, -1, NULL);
-        checkpoint_wait_for_command(g_cmd_fd);
+        if (g_fast_forward_live) {
+            checkpoint_child_go_live(g_result_fd, g_cmd_fd);
+        } else {
+            serialize_target_state(g_result_fd, -1, NULL);
+            checkpoint_wait_for_command(g_cmd_fd);
+        }
     }
 
     /* Install trace function for line/return/exception counting.
@@ -1662,8 +1779,12 @@ static PyObject *pyttd_eval_hook_fast_forward(PyThreadState *tstate,
     if (result == NULL && PyErr_Occurred()) {
         uint64_t unwind_seq = atomic_fetch_add_explicit(&g_sequence_counter, 1, memory_order_relaxed);
         if (unwind_seq == g_fast_forward_target) {
-            serialize_target_state(g_result_fd, -1, NULL);
-            checkpoint_wait_for_command(g_cmd_fd);
+            if (g_fast_forward_live) {
+                checkpoint_child_go_live(g_result_fd, g_cmd_fd);
+            } else {
+                serialize_target_state(g_result_fd, -1, NULL);
+                checkpoint_wait_for_command(g_cmd_fd);
+            }
         }
     }
 
@@ -1762,7 +1883,7 @@ static DWORD WINAPI flush_thread_func(LPVOID arg) {
     return 0;
 }
 #else
-static void *flush_thread_func(void *arg) {
+void *flush_thread_func(void *arg) {
     (void)arg;
     while (!atomic_load_explicit(&g_flush_stop, memory_order_relaxed)) {
         struct timespec ts;
@@ -1781,6 +1902,15 @@ static void *flush_thread_func(void *arg) {
 
         if (atomic_load_explicit(&g_flush_stop, memory_order_relaxed)) break;
         flush_batch();
+
+        /* Flush-and-wait: immediate drain requested by pause handler */
+        if (atomic_exchange_explicit(&g_flush_immediate, 0, memory_order_acq_rel)) {
+            /* One more drain to catch anything added since last batch */
+            flush_batch();
+            pthread_mutex_lock(&g_flush_mutex);
+            pthread_cond_signal(&g_flush_done_cv);
+            pthread_mutex_unlock(&g_flush_mutex);
+        }
 
         /* Phase 2: Pre-fork synchronization — pause if requested */
         if (atomic_load_explicit(&g_pause_requested, memory_order_acquire)) {
@@ -1912,7 +2042,8 @@ PyObject *pyttd_start_recording(PyObject *self, PyObject *args, PyObject *kwargs
     static char *kwlist[] = {"flush_callback", "buffer_size", "flush_interval_ms",
                              "checkpoint_callback", "checkpoint_interval",
                              "io_flush_callback", "io_replay_loader",
-                             "attach_mode", NULL};
+                             "attach_mode", "db_path",
+                             "resume_live_callback", NULL};
     PyObject *callback = NULL;
     int buffer_size = PYTTD_DEFAULT_CAPACITY;
     int flush_interval_ms = 10;
@@ -1921,12 +2052,15 @@ PyObject *pyttd_start_recording(PyObject *self, PyObject *args, PyObject *kwargs
     PyObject *io_flush_cb = NULL;
     PyObject *io_replay_loader = NULL;
     int attach_mode = 0;
+    const char *db_path_arg = NULL;
+    PyObject *resume_live_cb = NULL;
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|iiOiOOp", kwlist,
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|iiOiOOpsO", kwlist,
                                       &callback, &buffer_size, &flush_interval_ms,
                                       &checkpoint_cb, &checkpoint_interval,
                                       &io_flush_cb, &io_replay_loader,
-                                      &attach_mode)) {
+                                      &attach_mode, &db_path_arg,
+                                      &resume_live_cb)) {
         return NULL;
     }
 
@@ -1973,7 +2107,9 @@ PyObject *pyttd_start_recording(PyObject *self, PyObject *args, PyObject *kwargs
     g_cached_timestamp = 0.0;
     g_timestamp_counter = 0;
     g_fast_forward = 0;
+    g_fast_forward_live = 0;
     g_fast_forward_target = 0;
+    g_server_socket_fd = -1;
     g_max_frames = 0;
     g_trace_installed_externally = 0;
     atomic_store_explicit(&g_last_checkpoint_seq, 0, memory_order_relaxed);
@@ -1987,6 +2123,23 @@ PyObject *pyttd_start_recording(PyObject *self, PyObject *args, PyObject *kwargs
 #ifndef _WIN32
     atomic_store(&g_pause_requested, 0);
     atomic_store(&g_pause_acked, 0);
+#endif
+
+    /* Reset user pause state */
+    atomic_store_explicit(&g_user_pause_requested, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_user_paused, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_user_pause_thread_count, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_user_pause_expected, 0, memory_order_relaxed);
+    g_my_paused_frame = NULL;
+    g_main_paused_frame = NULL;
+    atomic_store_explicit(&g_flush_immediate, 0, memory_order_relaxed);
+#ifdef _WIN32
+    if (!g_user_pause_cs_initialized) {
+        InitializeCriticalSection(&g_user_pause_cs);
+        InitializeConditionVariable(&g_user_pause_cv);
+        InitializeConditionVariable(&g_user_pause_ack_cv);
+        g_user_pause_cs_initialized = 1;
+    }
 #endif
 
     /* Pre-intern constant strings for flush and trace hot paths */
@@ -2008,6 +2161,20 @@ PyObject *pyttd_start_recording(PyObject *self, PyObject *args, PyObject *kwargs
     }
     if (checkpoint_interval > 0) {
         g_checkpoint_interval = checkpoint_interval;
+    }
+
+    /* Save db_path for checkpoint_child_go_live */
+    if (db_path_arg) {
+        strncpy(g_recorder_db_path, db_path_arg, sizeof(g_recorder_db_path) - 1);
+        g_recorder_db_path[sizeof(g_recorder_db_path) - 1] = '\0';
+    }
+
+    /* Save resume_live callback for child bootstrap */
+    Py_XDECREF(g_resume_live_callback);
+    g_resume_live_callback = NULL;
+    if (resume_live_cb && resume_live_cb != Py_None && PyCallable_Check(resume_live_cb)) {
+        g_resume_live_callback = resume_live_cb;
+        Py_INCREF(g_resume_live_callback);
     }
 
     /* Initialize checkpoint store */
@@ -2102,6 +2269,23 @@ PyObject *pyttd_stop_recording(PyObject *self, PyObject *Py_UNUSED(args)) {
 
     g_stop_time = get_monotonic_time();
     atomic_store_explicit(&g_recording, 0, memory_order_relaxed);
+
+    /* If user-paused, resume ALL recording threads so they can unwind cleanly */
+    if (atomic_load_explicit(&g_user_paused, memory_order_relaxed) ||
+        atomic_load_explicit(&g_user_pause_thread_count, memory_order_relaxed) > 0) {
+        atomic_store_explicit(&g_user_pause_requested, 0, memory_order_release);
+        atomic_store_explicit(&g_user_paused, 0, memory_order_release);
+#ifdef _WIN32
+        EnterCriticalSection(&g_user_pause_cs);
+        WakeAllConditionVariable(&g_user_pause_cv);
+        LeaveCriticalSection(&g_user_pause_cs);
+#else
+        pthread_mutex_lock(&g_user_pause_mutex);
+        pthread_cond_broadcast(&g_user_pause_cv);
+        pthread_mutex_unlock(&g_user_pause_mutex);
+#endif
+    }
+    atomic_store_explicit(&g_user_pause_requested, 0, memory_order_relaxed);
 
     /* Release code object cache */
     g_cached_frame = NULL;
@@ -2431,4 +2615,239 @@ PyObject *pyttd_trace_current_frame(PyObject *self, PyObject *Py_UNUSED(args)) {
         g_trace_installed_externally = 1;
     }
     Py_RETURN_NONE;
+}
+
+/* ---- User Pause API (live debugging) ---- */
+
+PyObject *pyttd_request_user_pause(PyObject *self, PyObject *Py_UNUSED(args)) {
+    (void)self;
+    if (!atomic_load_explicit(&g_recording, memory_order_relaxed)) {
+        return PyBool_FromLong(0);
+    }
+    if (atomic_load_explicit(&g_user_paused, memory_order_relaxed)) {
+        /* Already paused */
+        return PyBool_FromLong(1);
+    }
+
+    /* Set the flag. All recording threads will check it and park.
+     * We signal as soon as the first thread parks (see trace function handler). */
+    atomic_store_explicit(&g_user_pause_thread_count, 0, memory_order_release);
+    atomic_store_explicit(&g_user_pause_requested, 1, memory_order_release);
+
+    /* Wait for ack with 5-second timeout.
+     * CRITICAL: Release the GIL during the wait — the recording thread needs
+     * the GIL to execute user code and fire LINE events where the pause check
+     * happens.  Without releasing the GIL here, the recording thread would be
+     * blocked waiting for the GIL forever. */
+    int success = 0;
+    Py_BEGIN_ALLOW_THREADS
+#ifdef _WIN32
+    EnterCriticalSection(&g_user_pause_cs);
+    DWORD deadline = GetTickCount() + 5000;
+    while (!atomic_load_explicit(&g_user_paused, memory_order_acquire)) {
+        DWORD remaining = deadline - GetTickCount();
+        if (remaining > 5000) break;  /* wrapped */
+        if (!SleepConditionVariableCS(&g_user_pause_cv, &g_user_pause_cs, remaining)) {
+            break;  /* timeout */
+        }
+    }
+    success = atomic_load_explicit(&g_user_paused, memory_order_acquire);
+    LeaveCriticalSection(&g_user_pause_cs);
+#else
+    struct timespec abs_timeout;
+    clock_gettime(CLOCK_REALTIME, &abs_timeout);
+    abs_timeout.tv_sec += 5;
+
+    pthread_mutex_lock(&g_user_pause_mutex);
+    while (!atomic_load_explicit(&g_user_paused, memory_order_acquire)) {
+        int rc = pthread_cond_timedwait(&g_user_pause_ack_cv, &g_user_pause_mutex, &abs_timeout);
+        if (rc != 0) break;  /* timeout or error */
+    }
+    success = atomic_load_explicit(&g_user_paused, memory_order_acquire);
+    pthread_mutex_unlock(&g_user_pause_mutex);
+#endif
+    Py_END_ALLOW_THREADS
+
+    if (!success) {
+        /* Timeout — clear request */
+        atomic_store_explicit(&g_user_pause_requested, 0, memory_order_relaxed);
+    }
+
+    return PyBool_FromLong(success);
+}
+
+PyObject *pyttd_user_resume(PyObject *self, PyObject *Py_UNUSED(args)) {
+    (void)self;
+    if (!atomic_load_explicit(&g_user_paused, memory_order_relaxed)) {
+        Py_RETURN_NONE;
+    }
+
+    /* Clear paused state and broadcast to wake ALL parked threads */
+    atomic_store_explicit(&g_user_pause_requested, 0, memory_order_release);
+    atomic_store_explicit(&g_user_paused, 0, memory_order_release);
+#ifdef _WIN32
+    EnterCriticalSection(&g_user_pause_cs);
+    WakeAllConditionVariable(&g_user_pause_cv);
+    LeaveCriticalSection(&g_user_pause_cs);
+#else
+    pthread_mutex_lock(&g_user_pause_mutex);
+    pthread_cond_broadcast(&g_user_pause_cv);
+    pthread_mutex_unlock(&g_user_pause_mutex);
+#endif
+    Py_RETURN_NONE;
+}
+
+PyObject *pyttd_is_user_paused(PyObject *self, PyObject *Py_UNUSED(args)) {
+    (void)self;
+    return PyBool_FromLong(atomic_load_explicit(&g_user_paused, memory_order_relaxed));
+}
+
+PyObject *pyttd_get_sequence_counter(PyObject *self, PyObject *Py_UNUSED(args)) {
+    (void)self;
+    uint64_t seq = atomic_load_explicit(&g_sequence_counter, memory_order_relaxed);
+    return PyLong_FromUnsignedLongLong(seq);
+}
+
+PyObject *pyttd_flush_and_wait(PyObject *self, PyObject *Py_UNUSED(args)) {
+    (void)self;
+    /* Signal the flush thread to do an immediate cycle and wait for completion.
+     * Only works on Unix (flush thread uses pthreads condvar). On Windows,
+     * we just sleep for one flush interval as a simple fallback. */
+#ifdef _WIN32
+    Sleep(g_flush_interval_ms + 5);
+#else
+    if (!g_flush_thread_created) {
+        Py_RETURN_NONE;
+    }
+    pthread_mutex_lock(&g_flush_mutex);
+    atomic_store_explicit(&g_flush_immediate, 1, memory_order_release);
+    pthread_cond_signal(&g_flush_cond);  /* wake flush thread immediately */
+    /* Wait for flush thread to signal completion */
+    struct timespec abs_timeout;
+    clock_gettime(CLOCK_REALTIME, &abs_timeout);
+    abs_timeout.tv_sec += 2;
+    pthread_cond_timedwait(&g_flush_done_cv, &g_flush_mutex, &abs_timeout);
+    pthread_mutex_unlock(&g_flush_mutex);
+#endif
+    Py_RETURN_NONE;
+}
+
+PyObject *pyttd_set_socket_fd(PyObject *self, PyObject *args) {
+    (void)self;
+    int fd;
+    if (!PyArg_ParseTuple(args, "i", &fd)) return NULL;
+    g_server_socket_fd = fd;
+    Py_RETURN_NONE;
+}
+
+PyObject *pyttd_set_variable(PyObject *self, PyObject *args) {
+    (void)self;
+    const char *var_name;
+    const char *new_value_expr;
+    if (!PyArg_ParseTuple(args, "ss", &var_name, &new_value_expr)) return NULL;
+
+    /* Only works when user-paused — live frame must be accessible */
+    if (!atomic_load_explicit(&g_user_paused, memory_order_relaxed)) {
+        PyErr_SetString(PyExc_RuntimeError, "set_variable: not paused");
+        return NULL;
+    }
+
+    PyObject *frame = g_main_paused_frame;
+    if (!frame) {
+        PyErr_SetString(PyExc_RuntimeError, "set_variable: no paused frame available");
+        return NULL;
+    }
+
+    /* Evaluate the new value expression with restricted builtins.
+     * Import builtins and build a restricted globals dict. */
+    PyObject *builtins_mod = PyImport_ImportModule("builtins");
+    if (!builtins_mod) return NULL;
+
+    PyObject *safe_globals = PyDict_New();
+    if (!safe_globals) { Py_DECREF(builtins_mod); return NULL; }
+
+    /* Add safe builtins: len, str, int, float, bool, list, dict, tuple, set,
+     * type, bytes, True, False, None, abs, min, max, sum, round, repr, range */
+    const char *safe_names[] = {
+        "len", "str", "int", "float", "bool", "list", "dict", "tuple", "set",
+        "type", "bytes", "bytearray", "frozenset", "complex", "range", "slice",
+        "isinstance", "issubclass", "abs", "min", "max", "sum", "round", "pow",
+        "all", "any", "enumerate", "zip", "sorted", "reversed",
+        "repr", "ascii", "chr", "ord", "hex", "oct", "bin",
+        "True", "False", "None", "hash", "id", "callable",
+        NULL
+    };
+    for (int i = 0; safe_names[i]; i++) {
+        PyObject *obj = PyObject_GetAttrString(builtins_mod, safe_names[i]);
+        if (obj) {
+            PyDict_SetItemString(safe_globals, safe_names[i], obj);
+            Py_DECREF(obj);
+        } else {
+            PyErr_Clear();
+        }
+    }
+    /* Set __builtins__ to the restricted dict to prevent import/exec/eval */
+    PyDict_SetItemString(safe_globals, "__builtins__", safe_globals);
+    Py_DECREF(builtins_mod);
+
+    /* Evaluate the expression */
+    PyObject *new_value = PyRun_String(new_value_expr, Py_eval_input, safe_globals, safe_globals);
+    Py_DECREF(safe_globals);
+    if (!new_value) {
+        /* Evaluation failed — return the error to the caller */
+        return NULL;
+    }
+
+    /* Get the frame's locals and set the variable */
+    PyObject *locals = PyFrame_GetLocals((PyFrameObject *)frame);
+    if (!locals) {
+        Py_DECREF(new_value);
+        PyErr_SetString(PyExc_RuntimeError, "set_variable: failed to get frame locals");
+        return NULL;
+    }
+
+    PyObject *name_obj = PyUnicode_FromString(var_name);
+    if (!name_obj) {
+        Py_DECREF(locals);
+        Py_DECREF(new_value);
+        return NULL;
+    }
+
+    /* Read old value for the result */
+    PyObject *old_value = PyObject_GetItem(locals, name_obj);
+    if (!old_value) {
+        PyErr_Clear();  /* Variable may not exist yet — that's OK for new vars */
+    }
+
+    /* Version-gated set:
+     * Python 3.13+ (PEP 667): PyFrame_GetLocals returns FrameLocalsProxy
+     *   which supports __setitem__ that writes through to fast locals.
+     * Python 3.12: PyFrame_GetLocals returns a dict snapshot.
+     *   PyDict_SetItem modifies the snapshot but doesn't sync to fast locals.
+     *   We use PyObject_SetItem which works for both dict and FrameLocalsProxy. */
+    int rc = PyObject_SetItem(locals, name_obj, new_value);
+
+    Py_DECREF(locals);
+    Py_DECREF(name_obj);
+    Py_DECREF(new_value);
+
+    if (rc < 0) {
+        Py_XDECREF(old_value);
+        return NULL;
+    }
+
+    /* Return result dict with old and new repr */
+    PyObject *result = PyDict_New();
+    if (result) {
+        PyObject *name_str = PyUnicode_FromString(var_name);
+        PyObject *new_repr = PyObject_Repr(new_value);
+        PyObject *old_repr = old_value ? PyObject_Repr(old_value) : PyUnicode_FromString("<undefined>");
+
+        if (name_str) { PyDict_SetItemString(result, "name", name_str); Py_DECREF(name_str); }
+        if (new_repr) { PyDict_SetItemString(result, "value", new_repr); Py_DECREF(new_repr); }
+        if (old_repr) { PyDict_SetItemString(result, "oldValue", old_repr); Py_DECREF(old_repr); }
+    }
+    Py_XDECREF(old_value);
+
+    return result;
 }

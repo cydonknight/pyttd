@@ -21,6 +21,7 @@ class Recorder:
         self._db_path = None
         self._flush_count = 0
         self._size_warned = False
+        self._resume_live_callback = None
 
     def start(self, db_path: str, script_path: str | None = None, attach: bool = False):
         """Initialize DB, create Runs record, set ignore patterns, install frame eval hook."""
@@ -87,6 +88,10 @@ class Recorder:
 
         kwargs['io_flush_callback'] = self._on_io_event
         kwargs['io_replay_loader'] = self._load_io_events_for_replay
+        kwargs['db_path'] = db_path
+
+        if self._resume_live_callback:
+            kwargs['resume_live_callback'] = self._resume_live_callback
 
         if attach:
             kwargs['attach_mode'] = 1
