@@ -4,6 +4,7 @@
 #include <stdatomic.h>
 #include <string.h>
 #include <time.h>
+#include <math.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -88,6 +89,14 @@ PYTTD_THREAD_LOCAL int g_timestamp_counter = 0;
 
 /* Perf: per-thread locals sampling state */
 PYTTD_THREAD_LOCAL int g_line_sample_counter = 0;
+/* Opt 2: tracks whether the most recent LINE event in this frame serialized locals.
+ * If true, RETURN only serializes __return__ (not full locals). */
+PYTTD_THREAD_LOCAL int g_locals_captured_this_frame = 0;
+/* Tracks whether any local in the current frame matched a secret pattern.
+ * Sticky across LINE events within the same frame. When set, the optimized
+ * serialize_return_only() path must emit "<redacted>" for __return__ because
+ * container returns (tuples, lists, dicts) can leak redacted string values. */
+PYTTD_THREAD_LOCAL int g_frame_had_redaction = 0;
 
 /* Seen-lines cache: direct-mapped, detects first occurrence of a new line number.
  * Forces locals serialization on first visit to a new source line (handles
@@ -103,6 +112,7 @@ static int g_trace_installed_externally = 0;  /* set by trace_current_frame */
 /* ---- Phase 2: Checkpoint/fast-forward state ---- */
 static int g_fast_forward = 0;
 int g_fast_forward_live = 0;  /* 1 = RESUME_LIVE mode (reinit recording on target) */
+char g_resume_live_run_id[33] = {0};  /* Parent-provided run_id for branch (set by RESUME_LIVE handler) */
 static uint64_t g_fast_forward_target = 0;
 char g_recorder_db_path[1024] = {0};  /* Set by start_recording, used by checkpoint_child_go_live */
 int g_server_socket_fd = -1;  /* TCP socket FD for handoff to checkpoint child */
@@ -388,10 +398,38 @@ static int ci_strstr(const char *haystack, const char *needle) {
     return 0;
 }
 
+/* Check if character is a word boundary for secret pattern matching.
+ * A boundary is: start/end of string, underscore, or transition between
+ * alpha and non-alpha. This prevents "auth" from matching "authenticate"
+ * while still matching "auth_token", "my_auth", or "AUTH". */
+static int is_word_boundary(const char *str, size_t pos, size_t len) {
+    if (pos == 0 || pos == len) return 1;
+    char c = str[pos];
+    char prev = str[pos - 1];
+    if (c == '_' || prev == '_') return 1;
+    return 0;
+}
+
 static int should_redact(const char *name) {
+    size_t name_len = strlen(name);
     for (int i = 0; i < g_secret_filter.count; i++) {
-        if (ci_strstr(name, g_secret_filter.patterns[i])) {
-            return 1;
+        const char *pattern = g_secret_filter.patterns[i];
+        size_t plen = strlen(pattern);
+        /* Scan for case-insensitive match at word boundaries */
+        for (size_t pos = 0; pos + plen <= name_len; pos++) {
+            int match = 1;
+            for (size_t j = 0; j < plen; j++) {
+                char nc = name[pos + j];
+                char pc = pattern[j];
+                if (nc >= 'A' && nc <= 'Z') nc += 32;
+                if (pc >= 'A' && pc <= 'Z') pc += 32;
+                if (nc != pc) { match = 0; break; }
+            }
+            if (match &&
+                is_word_boundary(name, pos, name_len) &&
+                is_word_boundary(name, pos + plen, name_len)) {
+                return 1;
+            }
         }
     }
     return 0;
@@ -473,16 +511,19 @@ static int should_include_file(const char *filename) {
 /* P1-6: Exclude filter (takes precedence over includes) */
 static int should_exclude(const char *filename, const char *funcname) {
     if (!g_exclude_mode) return 0;
-    /* Never exclude <module> — script entry must always record */
-    if (strcmp(funcname, "<module>") == 0) return 0;
-    const char *bname = bare_name(funcname);
-    for (int i = 0; i < g_exclude_func_filter.count; i++) {
+    /* For <module> frames, skip function-name exclusion but still check
+     * file exclusion — users expect --exclude-file to suppress ALL frames
+     * from that file, including module-level code. */
+    if (strcmp(funcname, "<module>") != 0) {
+        const char *bname = bare_name(funcname);
+        for (int i = 0; i < g_exclude_func_filter.count; i++) {
 #ifndef _WIN32
-        if (fnmatch(g_exclude_func_filter.patterns[i], funcname, 0) == 0 ||
-            fnmatch(g_exclude_func_filter.patterns[i], bname, 0) == 0) return 1;
+            if (fnmatch(g_exclude_func_filter.patterns[i], funcname, 0) == 0 ||
+                fnmatch(g_exclude_func_filter.patterns[i], bname, 0) == 0) return 1;
 #else
-        if (strstr(funcname, g_exclude_func_filter.patterns[i]) != NULL) return 1;
+            if (strstr(funcname, g_exclude_func_filter.patterns[i]) != NULL) return 1;
 #endif
+        }
     }
     for (int i = 0; i < g_exclude_file_filter.count; i++) {
 #ifndef _WIN32
@@ -579,6 +620,60 @@ static int is_expandable(PyObject *value) {
     return 0;
 }
 
+/* Fast-path repr: format common primitive types directly into buf
+ * without calling PyObject_Repr().  Returns buf (or a static literal)
+ * on success, NULL if the value needs full PyObject_Repr() treatment. */
+static const char *fast_repr(PyObject *value, char *buf, size_t buf_size) {
+    if (value == Py_None)  return "None";
+    if (value == Py_True)  return "True";
+    if (value == Py_False) return "False";
+
+    if (PyLong_Check(value)) {
+        int overflow;
+        long long v = PyLong_AsLongLongAndOverflow(value, &overflow);
+        if (overflow || PyErr_Occurred()) {
+            PyErr_Clear();
+            return NULL;  /* bignum — fall through to PyObject_Repr */
+        }
+        int n = snprintf(buf, buf_size, "%lld", v);
+        if (n < 0 || (size_t)n >= buf_size) return NULL;
+        return buf;
+    }
+
+    if (PyFloat_Check(value)) {
+        double d = PyFloat_AS_DOUBLE(value);
+        if (isinf(d))  return (d > 0) ? "inf" : "-inf";
+        if (isnan(d))  return "nan";
+        /* Use CPython's dtoa for exact repr match */
+        char *s = PyOS_double_to_string(d, 'r', 0, Py_DTSF_ADD_DOT_0, NULL);
+        if (!s) return NULL;
+        size_t len = strlen(s);
+        if (len >= buf_size) { PyMem_Free(s); return NULL; }
+        memcpy(buf, s, len + 1);
+        PyMem_Free(s);
+        return buf;
+    }
+
+    return NULL;
+}
+
+/* Get repr string for a child value, using fast path where possible.
+ * Sets *repr_obj to non-NULL if a Python object was created (caller must XDECREF).
+ * Returns the repr string, or NULL on failure. */
+static inline const char *child_repr(PyObject *value, char *fast_buf, size_t fast_size,
+                                      PyObject **repr_obj) {
+    *repr_obj = NULL;
+    const char *s = fast_repr(value, fast_buf, fast_size);
+    if (s) return s;
+    g_inside_repr = 1;
+    *repr_obj = PyObject_Repr(value);
+    g_inside_repr = 0;
+    if (!*repr_obj) { PyErr_Clear(); return NULL; }
+    s = PyUnicode_AsUTF8(*repr_obj);
+    if (!s) { Py_DECREF(*repr_obj); *repr_obj = NULL; PyErr_Clear(); return NULL; }
+    return s;
+}
+
 /* Write expandable structured JSON into buf at *pos.
  * Format: {"__type__":"dict","__len__":N,"__repr__":"...","__children__":[...]}
  * Returns 1 on success, 0 on buffer full (caller should fall back to flat repr). */
@@ -647,40 +742,32 @@ static int serialize_expandable_value(PyObject *value, char *buf, size_t buf_siz
         PyObject *key, *val;
         Py_ssize_t dict_pos = 0;
         while (PyDict_Next(value, &dict_pos, &key, &val) && child_count < MAX_CHILDREN) {
-            g_inside_repr = 1;
-            PyObject *krepr = PyObject_Repr(key);
-            PyObject *vrepr = PyObject_Repr(val);
-            g_inside_repr = 0;
-            if (!krepr || !vrepr) {
-                Py_XDECREF(krepr); Py_XDECREF(vrepr);
-                PyErr_Clear();
-                continue;
-            }
-            const char *ks = PyUnicode_AsUTF8(krepr);
-            const char *vs = PyUnicode_AsUTF8(vrepr);
+            char fast_k[64], fast_v[64];
+            PyObject *krepr, *vrepr;
+            const char *ks = child_repr(key, fast_k, sizeof(fast_k), &krepr);
+            const char *vs = child_repr(val, fast_v, sizeof(fast_v), &vrepr);
             if (!ks || !vs) {
-                Py_DECREF(krepr); Py_DECREF(vrepr);
-                PyErr_Clear();
+                Py_XDECREF(krepr); Py_XDECREF(vrepr);
                 continue;
             }
             if (!child_first) {
-                if (*pos + 2 >= buf_size) { Py_DECREF(krepr); Py_DECREF(vrepr); break; }
+                if (*pos + 2 >= buf_size) { Py_XDECREF(krepr); Py_XDECREF(vrepr); break; }
                 buf[(*pos)++] = ',';
                 buf[(*pos)++] = ' ';
             }
             child_first = 0;
             /* {"key":"k","value":"v","type":"t"} */
             const char *vtype = val->ob_type->tp_name;
-            if (*pos + 50 >= buf_size) { Py_DECREF(krepr); Py_DECREF(vrepr); break; }
+            if (*pos + 50 >= buf_size) { Py_XDECREF(krepr); Py_XDECREF(vrepr); break; }
             memcpy(buf + *pos, "{\"key\": \"", 9); *pos += 9;
             esc_len = json_escape_string(ks, buf + *pos, buf_size - *pos - 40);
-            if (esc_len < 0) { Py_DECREF(krepr); Py_DECREF(vrepr); break; }
+            if (esc_len < 0) { Py_XDECREF(krepr); Py_XDECREF(vrepr); break; }
             *pos += esc_len;
-            if (*pos + 44 >= buf_size) { Py_DECREF(krepr); Py_DECREF(vrepr); break; }
+            if (*pos + 44 >= buf_size) { Py_XDECREF(krepr); Py_XDECREF(vrepr); break; }
             memcpy(buf + *pos, "\", \"value\": \"", 13); *pos += 13;
-            if (*pos + 30 >= buf_size) { Py_DECREF(krepr); Py_DECREF(vrepr); break; }
+            if (*pos + 30 >= buf_size) { Py_XDECREF(krepr); Py_XDECREF(vrepr); break; }
             esc_len = json_escape_string(vs, buf + *pos, buf_size - *pos - 30);
-            Py_DECREF(krepr); Py_DECREF(vrepr);
+            Py_XDECREF(krepr); Py_XDECREF(vrepr);
             if (esc_len < 0) break;
             *pos += esc_len;
             n = snprintf(buf + *pos, buf_size - *pos, "\", \"type\": \"%s\"}", vtype);
@@ -706,14 +793,12 @@ static int serialize_expandable_value(PyObject *value, char *buf, size_t buf_siz
         Py_ssize_t limit = len < MAX_CHILDREN ? len : MAX_CHILDREN;
         for (Py_ssize_t i = 0; i < limit; i++) {
             PyObject *item = PyList_Check(value) ? PyList_GET_ITEM(value, i) : PyTuple_GET_ITEM(value, i);
-            g_inside_repr = 1;
-            PyObject *irepr = PyObject_Repr(item);
-            g_inside_repr = 0;
-            if (!irepr) { PyErr_Clear(); continue; }
-            const char *is = PyUnicode_AsUTF8(irepr);
-            if (!is) { Py_DECREF(irepr); PyErr_Clear(); continue; }
+            char fast_i[64];
+            PyObject *irepr;
+            const char *is = child_repr(item, fast_i, sizeof(fast_i), &irepr);
+            if (!is) { continue; }
             if (!child_first) {
-                if (*pos + 2 >= buf_size) { Py_DECREF(irepr); break; }
+                if (*pos + 2 >= buf_size) { Py_XDECREF(irepr); break; }
                 buf[(*pos)++] = ',';
                 buf[(*pos)++] = ' ';
             }
@@ -723,27 +808,27 @@ static int serialize_expandable_value(PyObject *value, char *buf, size_t buf_siz
             if (is_namedtuple && i < PyTuple_GET_SIZE(fields)) {
                 const char *fname = PyUnicode_AsUTF8(PyTuple_GET_ITEM(fields, i));
                 if (fname) {
-                    if (*pos + 50 >= buf_size) { Py_DECREF(irepr); break; }
+                    if (*pos + 50 >= buf_size) { Py_XDECREF(irepr); break; }
                     memcpy(buf + *pos, "{\"key\": \"", 9); *pos += 9;
                     esc_len = json_escape_string(fname, buf + *pos, buf_size - *pos - 40);
-                    if (esc_len < 0) { Py_DECREF(irepr); break; }
+                    if (esc_len < 0) { Py_XDECREF(irepr); break; }
                     *pos += esc_len;
-                    if (*pos + 16 >= buf_size) { Py_DECREF(irepr); break; }
+                    if (*pos + 16 >= buf_size) { Py_XDECREF(irepr); break; }
                     memcpy(buf + *pos, "\", \"value\": \"", 13); *pos += 13;
                 } else {
                     PyErr_Clear();
                     n = snprintf(buf + *pos, buf_size - *pos, "{\"key\": \"%zd\", \"value\": \"", i);
-                    if (n < 0 || (size_t)n >= buf_size - *pos) { Py_DECREF(irepr); break; }
+                    if (n < 0 || (size_t)n >= buf_size - *pos) { Py_XDECREF(irepr); break; }
                     *pos += n;
                 }
             } else {
                 n = snprintf(buf + *pos, buf_size - *pos, "{\"key\": \"%zd\", \"value\": \"", i);
-                if (n < 0 || (size_t)n >= buf_size - *pos) { Py_DECREF(irepr); break; }
+                if (n < 0 || (size_t)n >= buf_size - *pos) { Py_XDECREF(irepr); break; }
                 *pos += n;
             }
-            if (*pos + 30 >= buf_size) { Py_DECREF(irepr); break; }
+            if (*pos + 30 >= buf_size) { Py_XDECREF(irepr); break; }
             esc_len = json_escape_string(is, buf + *pos, buf_size - *pos - 30);
-            Py_DECREF(irepr);
+            Py_XDECREF(irepr);
             if (esc_len < 0) break;
             *pos += esc_len;
             n = snprintf(buf + *pos, buf_size - *pos, "\", \"type\": \"%s\"}", itype);
@@ -758,25 +843,23 @@ static int serialize_expandable_value(PyObject *value, char *buf, size_t buf_siz
             PyObject *item;
             int idx = 0;
             while ((item = PyIter_Next(iter)) && child_count < MAX_CHILDREN) {
-                g_inside_repr = 1;
-                PyObject *irepr = PyObject_Repr(item);
-                g_inside_repr = 0;
-                if (!irepr) { Py_DECREF(item); PyErr_Clear(); continue; }
-                const char *is = PyUnicode_AsUTF8(irepr);
-                if (!is) { Py_DECREF(irepr); Py_DECREF(item); PyErr_Clear(); continue; }
+                char fast_si[64];
+                PyObject *irepr;
+                const char *is = child_repr(item, fast_si, sizeof(fast_si), &irepr);
+                if (!is) { Py_DECREF(item); continue; }
                 if (!child_first) {
-                    if (*pos + 2 >= buf_size) { Py_DECREF(irepr); Py_DECREF(item); break; }
+                    if (*pos + 2 >= buf_size) { Py_XDECREF(irepr); Py_DECREF(item); break; }
                     buf[(*pos)++] = ',';
                     buf[(*pos)++] = ' ';
                 }
                 child_first = 0;
                 const char *itype = item->ob_type->tp_name;
                 n = snprintf(buf + *pos, buf_size - *pos, "{\"key\": \"%d\", \"value\": \"", idx);
-                if (n < 0 || (size_t)n >= buf_size - *pos) { Py_DECREF(irepr); Py_DECREF(item); break; }
+                if (n < 0 || (size_t)n >= buf_size - *pos) { Py_XDECREF(irepr); Py_DECREF(item); break; }
                 *pos += n;
-                if (*pos + 30 >= buf_size) { Py_DECREF(irepr); Py_DECREF(item); break; }
+                if (*pos + 30 >= buf_size) { Py_XDECREF(irepr); Py_DECREF(item); break; }
                 esc_len = json_escape_string(is, buf + *pos, buf_size - *pos - 30);
-                Py_DECREF(irepr);
+                Py_XDECREF(irepr);
                 Py_DECREF(item);
                 if (esc_len < 0) break;
                 *pos += esc_len;
@@ -800,29 +883,27 @@ static int serialize_expandable_value(PyObject *value, char *buf, size_t buf_siz
             while (PyDict_Next(obj_dict, &dict_pos, &key, &val) && child_count < MAX_CHILDREN) {
                 const char *ks = PyUnicode_AsUTF8(key);
                 if (!ks) { PyErr_Clear(); continue; }
-                g_inside_repr = 1;
-                PyObject *vrepr = PyObject_Repr(val);
-                g_inside_repr = 0;
-                if (!vrepr) { PyErr_Clear(); continue; }
-                const char *vs = PyUnicode_AsUTF8(vrepr);
-                if (!vs) { Py_DECREF(vrepr); PyErr_Clear(); continue; }
+                char fast_ov[64];
+                PyObject *vrepr;
+                const char *vs = child_repr(val, fast_ov, sizeof(fast_ov), &vrepr);
+                if (!vs) { continue; }
                 if (!child_first) {
-                    if (*pos + 2 >= buf_size) { Py_DECREF(vrepr); break; }
+                    if (*pos + 2 >= buf_size) { Py_XDECREF(vrepr); break; }
                     buf[(*pos)++] = ',';
                     buf[(*pos)++] = ' ';
                 }
                 child_first = 0;
                 const char *vtype = val->ob_type->tp_name;
-                if (*pos + 50 >= buf_size) { Py_DECREF(vrepr); break; }
+                if (*pos + 50 >= buf_size) { Py_XDECREF(vrepr); break; }
                 memcpy(buf + *pos, "{\"key\": \"", 9); *pos += 9;
                 esc_len = json_escape_string(ks, buf + *pos, buf_size - *pos - 40);
-                if (esc_len < 0) { Py_DECREF(vrepr); break; }
+                if (esc_len < 0) { Py_XDECREF(vrepr); break; }
                 *pos += esc_len;
-                if (*pos + 44 >= buf_size) { Py_DECREF(vrepr); break; }
+                if (*pos + 44 >= buf_size) { Py_XDECREF(vrepr); break; }
                 memcpy(buf + *pos, "\", \"value\": \"", 13); *pos += 13;
-                if (*pos + 30 >= buf_size) { Py_DECREF(vrepr); break; }
+                if (*pos + 30 >= buf_size) { Py_XDECREF(vrepr); break; }
                 esc_len = json_escape_string(vs, buf + *pos, buf_size - *pos - 30);
-                Py_DECREF(vrepr);
+                Py_XDECREF(vrepr);
                 if (esc_len < 0) break;
                 *pos += esc_len;
                 n = snprintf(buf + *pos, buf_size - *pos, "\", \"type\": \"%s\"}", vtype);
@@ -845,29 +926,27 @@ static int serialize_expandable_value(PyObject *value, char *buf, size_t buf_siz
                 if (!name_str) { PyErr_Clear(); continue; }
                 PyObject *slot_val = PyObject_GetAttr(value, slot_name);
                 if (!slot_val) { PyErr_Clear(); continue; }  /* unset slot */
-                g_inside_repr = 1;
-                PyObject *vrepr = PyObject_Repr(slot_val);
-                g_inside_repr = 0;
-                if (!vrepr) { Py_DECREF(slot_val); PyErr_Clear(); continue; }
-                const char *vs = PyUnicode_AsUTF8(vrepr);
-                if (!vs) { Py_DECREF(vrepr); Py_DECREF(slot_val); PyErr_Clear(); continue; }
+                char fast_sv[64];
+                PyObject *vrepr;
+                const char *vs = child_repr(slot_val, fast_sv, sizeof(fast_sv), &vrepr);
+                if (!vs) { Py_DECREF(slot_val); continue; }
                 if (!child_first) {
-                    if (*pos + 2 >= buf_size) { Py_DECREF(vrepr); Py_DECREF(slot_val); break; }
+                    if (*pos + 2 >= buf_size) { Py_XDECREF(vrepr); Py_DECREF(slot_val); break; }
                     buf[(*pos)++] = ',';
                     buf[(*pos)++] = ' ';
                 }
                 child_first = 0;
                 const char *vtype = slot_val->ob_type->tp_name;
-                if (*pos + 50 >= buf_size) { Py_DECREF(vrepr); Py_DECREF(slot_val); break; }
+                if (*pos + 50 >= buf_size) { Py_XDECREF(vrepr); Py_DECREF(slot_val); break; }
                 memcpy(buf + *pos, "{\"key\": \"", 9); *pos += 9;
                 esc_len = json_escape_string(name_str, buf + *pos, buf_size - *pos - 40);
-                if (esc_len < 0) { Py_DECREF(vrepr); Py_DECREF(slot_val); break; }
+                if (esc_len < 0) { Py_XDECREF(vrepr); Py_DECREF(slot_val); break; }
                 *pos += esc_len;
-                if (*pos + 44 >= buf_size) { Py_DECREF(vrepr); Py_DECREF(slot_val); break; }
+                if (*pos + 44 >= buf_size) { Py_XDECREF(vrepr); Py_DECREF(slot_val); break; }
                 memcpy(buf + *pos, "\", \"value\": \"", 13); *pos += 13;
-                if (*pos + 30 >= buf_size) { Py_DECREF(vrepr); Py_DECREF(slot_val); break; }
+                if (*pos + 30 >= buf_size) { Py_XDECREF(vrepr); Py_DECREF(slot_val); break; }
                 esc_len = json_escape_string(vs, buf + *pos, buf_size - *pos - 30);
-                Py_DECREF(vrepr);
+                Py_XDECREF(vrepr);
                 Py_DECREF(slot_val);
                 if (esc_len < 0) break;
                 *pos += esc_len;
@@ -933,6 +1012,39 @@ static int serialize_one_local(const char *key_str, PyObject *value,
         buf[(*pos)++] = '"';
         *last_complete_pos = *pos;
         return 1;
+    }
+
+    /* Fast-path: format primitive types directly, skipping PyObject_Repr()
+     * and is_expandable() check (primitives are never expandable). */
+    {
+        char fast_buf[64];
+        const char *fast_str = fast_repr(value, fast_buf, sizeof(fast_buf));
+        if (fast_str) {
+            if (!*first) {
+                if (*pos + 2 >= buf_size) return 0;
+                buf[(*pos)++] = ',';
+                buf[(*pos)++] = ' ';
+            }
+            *first = 0;
+            if (*pos + 12 >= buf_size) return 0;
+            buf[(*pos)++] = '"';
+            int esc_len = json_escape_string(key_str, buf + *pos, buf_size - *pos - 10);
+            if (esc_len < 0) return 0;
+            *pos += esc_len;
+            if (*pos + 5 >= buf_size) return 0;
+            buf[(*pos)++] = '"';
+            buf[(*pos)++] = ':';
+            buf[(*pos)++] = ' ';
+            buf[(*pos)++] = '"';
+            if (*pos + 4 >= buf_size) return 0;
+            int esc_len2 = json_escape_string(fast_str, buf + *pos, buf_size - *pos - 3);
+            if (esc_len2 < 0) return 0;
+            *pos += esc_len2;
+            if (*pos + 2 >= buf_size) return 0;
+            buf[(*pos)++] = '"';
+            *last_complete_pos = *pos;
+            return 1;
+        }
     }
 
     /* Phase 10A: Try expandable serialization for container types */
@@ -1023,6 +1135,7 @@ const char *recorder_serialize_locals(PyObject *frame_obj, char *buf, size_t buf
 
     int first = 1;
     size_t last_complete_pos = 1;
+    int frame_had_redaction = 0;  /* Track for __return__ redaction */
 
 #if PY_VERSION_HEX < 0x030D0000
     PyObject *key, *value;
@@ -1030,6 +1143,7 @@ const char *recorder_serialize_locals(PyObject *frame_obj, char *buf, size_t buf
     while (PyDict_Next(locals, &dict_pos, &key, &value)) {
         const char *key_str = PyUnicode_AsUTF8(key);
         if (!key_str) { PyErr_Clear(); continue; }
+        if (should_redact(key_str)) { frame_had_redaction = 1; g_frame_had_redaction = 1; }
         if (!serialize_one_local(key_str, value, buf, buf_size, &pos, &first, &last_complete_pos))
             break;
     }
@@ -1043,6 +1157,7 @@ const char *recorder_serialize_locals(PyObject *frame_obj, char *buf, size_t buf
             PyObject *value = PyTuple_GET_ITEM(pair, 1);
             const char *key_str = PyUnicode_AsUTF8(key);
             if (!key_str) { PyErr_Clear(); continue; }
+            if (should_redact(key_str)) { frame_had_redaction = 1; g_frame_had_redaction = 1; }
             if (!serialize_one_local(key_str, value, buf, buf_size, &pos, &first, &last_complete_pos))
                 break;
         }
@@ -1052,12 +1167,30 @@ const char *recorder_serialize_locals(PyObject *frame_obj, char *buf, size_t buf
     }
 #endif
 
-    /* Add extra key/value (e.g. __return__) if provided */
+    /* Add extra key/value (e.g. __return__) if provided.
+     * If any local in this frame was redacted, also redact the __return__
+     * since containers can leak the redacted values through tuple/list returns. */
     if (extra_key && extra_val) {
         const char *ek = PyUnicode_AsUTF8(extra_key);
         if (ek) {
-            if (!serialize_one_local(ek, extra_val, buf, buf_size, &pos, &first, &last_complete_pos)) {
-                /* buffer full — fall through to truncation handling */
+            if (frame_had_redaction && strcmp(ek, "__return__") == 0) {
+                /* Write as redacted directly (bypass serialize_one_local) */
+                if (!first && pos + 2 < buf_size) {
+                    buf[pos++] = ',';
+                    buf[pos++] = ' ';
+                }
+                first = 0;
+                const char *redacted_template = "\"__return__\": \"<redacted>\"";
+                size_t tlen = strlen(redacted_template);
+                if (pos + tlen < buf_size) {
+                    memcpy(buf + pos, redacted_template, tlen);
+                    pos += tlen;
+                    last_complete_pos = pos;
+                }
+            } else {
+                if (!serialize_one_local(ek, extra_val, buf, buf_size, &pos, &first, &last_complete_pos)) {
+                    /* buffer full — fall through to truncation handling */
+                }
             }
         }
     }
@@ -1079,6 +1212,71 @@ const char *recorder_serialize_locals(PyObject *frame_obj, char *buf, size_t buf
 static const char *serialize_locals(PyObject *frame_obj, char *buf, size_t buf_size,
                                     PyObject *extra_key, PyObject *extra_val) {
     return recorder_serialize_locals(frame_obj, buf, buf_size, extra_key, extra_val);
+}
+
+/* Opt 2: serialize only the __return__ (or __exception__) extra key/value.
+ * Produces: {"__return__": "<repr>"}.  Much cheaper than full serialize_locals()
+ * which calls PyFrame_GetLocals() and iterates all variables.
+ *
+ * SECURITY: if the frame had any redacted local (tracked via sticky
+ * g_frame_had_redaction flag set by serialize_locals), emit "<redacted>" for
+ * __return__ — container returns like (password, api_key) would otherwise
+ * leak the secret values through repr(). */
+static const char *serialize_return_only(PyObject *extra_key, PyObject *extra_val,
+                                          char *buf, size_t buf_size) {
+    if (!extra_key || !extra_val) return NULL;
+    const char *ek = PyUnicode_AsUTF8(extra_key);
+    if (!ek) { PyErr_Clear(); return NULL; }
+
+    /* If any local in this frame was redacted, emit redacted marker directly. */
+    if (g_frame_had_redaction && strcmp(ek, "__return__") == 0) {
+        const char *redacted = "{\"__return__\": \"<redacted>\"}";
+        size_t rlen = strlen(redacted);
+        if (rlen + 1 > buf_size) return NULL;
+        memcpy(buf, redacted, rlen);
+        buf[rlen] = '\0';
+        return buf;
+    }
+
+    char fast_buf[64];
+    PyObject *repr = NULL;
+    const char *repr_str = fast_repr(extra_val, fast_buf, sizeof(fast_buf));
+    if (!repr_str) {
+        g_inside_repr = 1;
+        repr = PyObject_Repr(extra_val);
+        g_inside_repr = 0;
+        if (!repr) { PyErr_Clear(); return NULL; }
+        repr_str = PyUnicode_AsUTF8(repr);
+        if (!repr_str) { Py_DECREF(repr); PyErr_Clear(); return NULL; }
+    }
+
+    /* Truncate if needed */
+    char repr_truncated[MAX_REPR_LENGTH + 4];
+    size_t repr_len = strlen(repr_str);
+    if (repr_len > MAX_REPR_LENGTH) {
+        memcpy(repr_truncated, repr_str, MAX_REPR_LENGTH);
+        memcpy(repr_truncated + MAX_REPR_LENGTH, "...", 4);
+        repr_str = repr_truncated;
+    }
+
+    size_t pos = 0;
+    buf[pos++] = '{';
+    buf[pos++] = '"';
+    int esc_len = json_escape_string(ek, buf + pos, buf_size - pos - 20);
+    if (esc_len < 0) { Py_XDECREF(repr); return NULL; }
+    pos += esc_len;
+    buf[pos++] = '"';
+    buf[pos++] = ':';
+    buf[pos++] = ' ';
+    buf[pos++] = '"';
+    int esc_len2 = json_escape_string(repr_str, buf + pos, buf_size - pos - 3);
+    Py_XDECREF(repr);
+    if (esc_len2 < 0) return NULL;
+    pos += esc_len2;
+    buf[pos++] = '"';
+    buf[pos++] = '}';
+    buf[pos] = '\0';
+    return buf;
 }
 
 /* ---- Trace Function ---- */
@@ -1104,9 +1302,16 @@ int pyttd_trace_func(PyObject *obj, PyFrameObject *frame, int what, PyObject *ar
     /* Check stop request in trace function (not just eval hook) so that
      * request_stop() can interrupt tight loops within a single frame.
      * Use atomic exchange to clear the flag — fire only once, so the
-     * KeyboardInterrupt doesn't repeat in except/finally handlers. */
+     * KeyboardInterrupt doesn't repeat in except/finally handlers.
+     *
+     * B3 fix: suppress during g_in_checkpoint. The trace function fires on
+     * LINE events inside Python fork hooks (_prepareFork/_afterFork) called
+     * by PyOS_BeforeFork. Raising KeyboardInterrupt there produces noisy
+     * "RuntimeError: cannot release un-acquired lock" tracebacks. The stop
+     * signal will be re-checked after the checkpoint completes. */
     if (what == PyTrace_LINE &&
         g_my_thread_id == g_main_thread_id &&
+        !g_in_checkpoint &&
         atomic_exchange_explicit(&g_stop_requested, 0, memory_order_relaxed)) {
         PyErr_SetNone(PyExc_KeyboardInterrupt);
         return -1;
@@ -1151,6 +1356,8 @@ int pyttd_trace_func(PyObject *obj, PyFrameObject *frame, int what, PyObject *ar
             g_cached_funcname = funcname;
             g_cached_is_coro = is_coro;
             g_line_sample_counter = 0;  /* new frame → reset sampling */
+            g_locals_captured_this_frame = 0;
+            g_frame_had_redaction = 0;  /* new frame → reset sticky redaction flag */
             memset(g_seen_lines, 0, sizeof(g_seen_lines));
         }
 
@@ -1170,12 +1377,21 @@ int pyttd_trace_func(PyObject *obj, PyFrameObject *frame, int what, PyObject *ar
                 first_visit = 1;
             }
         }
+        /* Adaptive sampling interval: start at 8, increase for long-running frames */
+        int interval;
+        if (g_line_sample_counter <= 256)       interval = LOCALS_SAMPLE_INTERVAL;
+        else if (g_line_sample_counter <= 1024) interval = 32;
+        else if (g_line_sample_counter <= 4096) interval = 64;
+        else                                    interval = 128;
+
         if (g_line_sample_counter <= LOCALS_WARMUP
             || first_visit
-            || (g_line_sample_counter % LOCALS_SAMPLE_INTERVAL) == 0) {
+            || (g_line_sample_counter % interval) == 0) {
             locals_json = serialize_locals((PyObject *)frame, g_locals_buf, sizeof(g_locals_buf), NULL, NULL);
+            g_locals_captured_this_frame = 1;
         } else {
             locals_json = NULL;
+            g_locals_captured_this_frame = 0;
         }
 
         /* Item 5: Batch timestamp reads — re-read every 8th LINE event within a frame */
@@ -1273,6 +1489,7 @@ int pyttd_trace_func(PyObject *obj, PyFrameObject *frame, int what, PyObject *ar
         if (g_checkpoint_interval > 0 &&
             g_checkpoint_callback != NULL &&
             !g_in_checkpoint &&
+            !atomic_load_explicit(&g_stop_requested, memory_order_relaxed) &&
             event.sequence_no > 0 &&
             (event.sequence_no - atomic_load_explicit(&g_last_checkpoint_seq, memory_order_relaxed))
                 >= (uint64_t)g_checkpoint_interval) {
@@ -1326,7 +1543,15 @@ int pyttd_trace_func(PyObject *obj, PyFrameObject *frame, int what, PyObject *ar
         }
         int line_no = PyFrame_GetLineNumber(frame);
 
-        const char *locals_json = serialize_locals((PyObject *)frame, g_locals_buf, sizeof(g_locals_buf), g_str_dunder_return, arg);
+        /* Opt 2: if the most recent LINE already captured locals, only serialize __return__ */
+        const char *locals_json;
+        if (g_locals_captured_this_frame) {
+            locals_json = serialize_return_only(g_str_dunder_return, arg,
+                                                g_locals_buf, sizeof(g_locals_buf));
+        } else {
+            locals_json = serialize_locals((PyObject *)frame, g_locals_buf,
+                                           sizeof(g_locals_buf), g_str_dunder_return, arg);
+        }
 
         FrameEvent event;
         event.sequence_no = atomic_fetch_add_explicit(&g_sequence_counter, 1, memory_order_relaxed);
@@ -1532,9 +1757,10 @@ static PyObject *pyttd_eval_hook(PyThreadState *tstate,
 
     /* Check stop request — only interrupt the main thread, not the flush thread.
      * Use atomic exchange to clear the flag — fire only once.
-     * Note: g_my_thread_id may be 0 for the first eval hook call before
-     * ringbuf init; that's fine because g_main_thread_id is never 0. */
+     * B3: suppress during g_in_checkpoint to avoid raising KeyboardInterrupt
+     * inside PyOS_BeforeFork's _prepareFork handler (logging module fork hooks). */
     if (g_my_thread_id == g_main_thread_id &&
+        !g_in_checkpoint &&
         atomic_exchange_explicit(&g_stop_requested, 0, memory_order_relaxed)) {
         PyErr_SetNone(PyExc_KeyboardInterrupt);
         return NULL;
@@ -1629,6 +1855,7 @@ static PyObject *pyttd_eval_hook(PyThreadState *tstate,
     if (g_checkpoint_interval > 0 &&
         g_checkpoint_callback != NULL &&
         !g_in_checkpoint &&
+        !atomic_load_explicit(&g_stop_requested, memory_order_relaxed) &&
         call_event.sequence_no > 0 &&
         (call_event.sequence_no - atomic_load_explicit(&g_last_checkpoint_seq, memory_order_relaxed))
             >= (uint64_t)g_checkpoint_interval) {
@@ -1720,7 +1947,10 @@ static PyObject *pyttd_eval_hook_fast_forward(PyThreadState *tstate,
             g_filter_cache[fc_idx].result >= 0) {
             skip = g_filter_cache[fc_idx].result;
         } else {
-            skip = should_ignore(filename, funcname);
+            skip = should_ignore(filename, funcname)
+                || should_exclude(filename, funcname)
+                || !should_include_file(filename)
+                || !should_include(funcname);
             g_filter_cache[fc_idx].filename = filename;
             g_filter_cache[fc_idx].funcname = funcname;
             g_filter_cache[fc_idx].result = skip ? 1 : 0;
@@ -2103,6 +2333,8 @@ PyObject *pyttd_start_recording(PyObject *self, PyObject *args, PyObject *kwargs
     g_cached_funcname = NULL;
     g_cached_is_coro = 0;
     g_line_sample_counter = 0;
+    g_locals_captured_this_frame = 0;
+    g_frame_had_redaction = 0;
     memset(g_seen_lines, 0, sizeof(g_seen_lines));
     g_cached_timestamp = 0.0;
     g_timestamp_counter = 0;
@@ -2595,7 +2827,17 @@ PyObject *pyttd_request_stop(PyObject *self, PyObject *Py_UNUSED(args)) {
 
 PyObject *pyttd_set_recording_thread(PyObject *self, PyObject *Py_UNUSED(args)) {
     (void)self;
-    g_main_thread_id = PyThread_get_thread_ident();
+    unsigned long old_main = g_main_thread_id;
+    unsigned long new_main = PyThread_get_thread_ident();
+    g_main_thread_id = new_main;
+    /* If the recording thread is different from the original main thread
+     * (e.g., server mode: start_recording called from RPC thread, then
+     * set_recording_thread called from the spawned recording thread), mark
+     * the old main thread's pre-allocated ring buffer as orphaned so the
+     * checkpoint skip guard (ringbuf_thread_count() <= 1) isn't tripped. */
+    if (old_main != 0 && old_main != new_main) {
+        ringbuf_orphan_thread(old_main);
+    }
     Py_RETURN_NONE;
 }
 
@@ -2643,10 +2885,10 @@ PyObject *pyttd_request_user_pause(PyObject *self, PyObject *Py_UNUSED(args)) {
     Py_BEGIN_ALLOW_THREADS
 #ifdef _WIN32
     EnterCriticalSection(&g_user_pause_cs);
-    DWORD deadline = GetTickCount() + 5000;
+    DWORD deadline = GetTickCount() + 10000;
     while (!atomic_load_explicit(&g_user_paused, memory_order_acquire)) {
         DWORD remaining = deadline - GetTickCount();
-        if (remaining > 5000) break;  /* wrapped */
+        if (remaining > 10000) break;  /* wrapped */
         if (!SleepConditionVariableCS(&g_user_pause_cv, &g_user_pause_cs, remaining)) {
             break;  /* timeout */
         }
@@ -2656,7 +2898,7 @@ PyObject *pyttd_request_user_pause(PyObject *self, PyObject *Py_UNUSED(args)) {
 #else
     struct timespec abs_timeout;
     clock_gettime(CLOCK_REALTIME, &abs_timeout);
-    abs_timeout.tv_sec += 5;
+    abs_timeout.tv_sec += 10;  /* 10s timeout for CPU-bound scripts */
 
     pthread_mutex_lock(&g_user_pause_mutex);
     while (!atomic_load_explicit(&g_user_paused, memory_order_acquire)) {
@@ -2829,18 +3071,21 @@ PyObject *pyttd_set_variable(PyObject *self, PyObject *args) {
 
     Py_DECREF(locals);
     Py_DECREF(name_obj);
-    Py_DECREF(new_value);
 
     if (rc < 0) {
+        Py_DECREF(new_value);
         Py_XDECREF(old_value);
         return NULL;
     }
+
+    /* Build repr BEFORE releasing new_value reference */
+    PyObject *new_repr = PyObject_Repr(new_value);
+    Py_DECREF(new_value);
 
     /* Return result dict with old and new repr */
     PyObject *result = PyDict_New();
     if (result) {
         PyObject *name_str = PyUnicode_FromString(var_name);
-        PyObject *new_repr = PyObject_Repr(new_value);
         PyObject *old_repr = old_value ? PyObject_Repr(old_value) : PyUnicode_FromString("<undefined>");
 
         if (name_str) { PyDict_SetItemString(result, "name", name_str); Py_DECREF(name_str); }

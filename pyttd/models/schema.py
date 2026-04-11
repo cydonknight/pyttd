@@ -86,12 +86,18 @@ MIGRATION_SQL = [
     'ALTER TABLE runs ADD COLUMN is_attach INTEGER DEFAULT 0',
     'ALTER TABLE runs ADD COLUMN parent_run_id TEXT NULL',
     'ALTER TABLE runs ADD COLUMN branch_seq INTEGER NULL',
+    'ALTER TABLE executionframes ADD COLUMN is_coroutine INTEGER DEFAULT 0',
 ]
 
 
-def create_run(script_path=None, is_attach=False, parent_run_id=None, branch_seq=None):
-    """Create a new Runs record. Returns run_id string (hex, no dashes)."""
-    run_id = uuid.uuid4().hex
+def create_run(script_path=None, is_attach=False, parent_run_id=None, branch_seq=None, run_id=None):
+    """Create a new Runs record. Returns run_id string (hex, no dashes).
+
+    If ``run_id`` is provided, use it instead of generating a fresh UUID.
+    This is used by ``continue_from_past`` so the parent-side DB row matches
+    the run_id the C checkpoint child generated for its binlog."""
+    if run_id is None:
+        run_id = uuid.uuid4().hex
     db.execute(
         "INSERT INTO runs (run_id, timestamp_start, script_path, is_attach,"
         " total_frames, parent_run_id, branch_seq)"
@@ -102,8 +108,16 @@ def create_run(script_path=None, is_attach=False, parent_run_id=None, branch_seq
     return run_id
 
 
+_ALLOWED_RUN_COLUMNS = frozenset({
+    'timestamp_end', 'total_frames', 'script_path', 'is_attach',
+    'parent_run_id', 'branch_seq',
+})
+
 def update_run(run_id, **kwargs):
     """Update a Runs record by run_id."""
+    for k in kwargs:
+        if k not in _ALLOWED_RUN_COLUMNS:
+            raise ValueError(f"Invalid column name for update_run: {k}")
     sets = ", ".join(f"{k} = ?" for k in kwargs)
     vals = list(kwargs.values()) + [str(run_id)]
     db.execute(f"UPDATE runs SET {sets} WHERE run_id = ?", vals)

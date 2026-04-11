@@ -68,14 +68,21 @@ def stop_recording() -> dict:
 
 
 class ArmContext:
-    """Context manager for arm()/disarm() pattern."""
+    """Context manager for arm()/disarm() pattern.
+
+    After the context exits, ``stats`` contains the recording stats dict
+    (frame_count, elapsed_time, dropped_frames, etc.).
+    """
+
+    def __init__(self):
+        self.stats = None
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if _active_recorder is not None and _active_recorder._recording:
-            disarm()
+            self.stats = disarm()
         return False
 
 
@@ -139,13 +146,29 @@ def install_signal_handler(sig=None, db_path=None, **kwargs):
 
     Args:
         sig: Signal number (default: SIGUSR1 on Unix).
-        db_path: Path to save the .pyttd.db file.
+        db_path: Path to save the .pyttd.db file. Default: derived from
+                 the user script path at install time (not at signal-delivery time).
         **kwargs: Passed to PyttdConfig.
     """
     if sig is None:
         if not hasattr(signal, 'SIGUSR1'):
             raise RuntimeError("Signal-based arming requires Unix (SIGUSR1)")
         sig = signal.SIGUSR1
+
+    # Resolve db_path NOW, at install time, using the user's __main__ script.
+    # If we defer to arm() called from _handler, inspect.stack()[1] will be
+    # this internal _handler function and the DB will be written into the
+    # pyttd source tree (pyttd/main.pyttd.db).
+    if db_path is None:
+        try:
+            import __main__
+            main_file = getattr(__main__, '__file__', None)
+            if main_file:
+                db_path = compute_db_path(os.path.realpath(main_file))
+            elif sys.argv and sys.argv[0] and sys.argv[0] != '-c':
+                db_path = compute_db_path(os.path.realpath(sys.argv[0]))
+        except Exception:
+            pass
 
     def _handler(signum, frame):
         try:

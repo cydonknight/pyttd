@@ -408,10 +408,18 @@ static PyObject *io_replay_next(const char *function_name) {
     }
 
     if (g_io_replay_cursor >= PyList_GET_SIZE(g_io_replay_list)) {
-        /* More I/O calls than recorded — fall back warning */
-        PyErr_WarnFormat(PyExc_RuntimeWarning, 1,
-            "IO replay: cursor exhausted for %s, returning None", function_name);
-        if (PyErr_Occurred()) PyErr_Clear();
+        /* More I/O calls than recorded — auto-exit replay mode so subsequent
+         * hook invocations execute the real function. This normally means
+         * we're running past a RESUME_LIVE target (the replay list only
+         * covers the pre-target window). The current call still returns
+         * None (the caller already committed to a replay path); future
+         * calls are live. Silent — emitting a RuntimeWarning here was
+         * noisy and misleading in the continue_from_past flow. */
+        g_io_replay_mode = 0;
+        Py_XDECREF(g_io_replay_list);
+        g_io_replay_list = NULL;
+        g_io_replay_cursor = 0;
+        (void)function_name;
         Py_RETURN_NONE;
     }
 

@@ -214,11 +214,19 @@ int sqliteflush_insert_batch(const FrameEvent *events, uint32_t count) {
         rc = sqlite3_step(g_insert_stmt);
         sqlite3_reset(g_insert_stmt);
         if (rc != SQLITE_DONE) {
-            continue;
+            /* Per-row failure: abort the batch and rollback so the caller
+             * learns about the failure instead of silently losing events. */
+            sqlite3_exec(g_flush_db, "ROLLBACK", NULL, NULL, NULL);
+            return -1;
         }
     }
 
-    sqlite3_exec(g_flush_db, "COMMIT", NULL, NULL, NULL);
+    rc = sqlite3_exec(g_flush_db, "COMMIT", NULL, NULL, NULL);
+    if (rc != SQLITE_OK) {
+        /* COMMIT failed — SQLite rolls back automatically, but the caller
+         * must know the batch was not persisted. */
+        return -1;
+    }
 
     /* Throttled size check — every 100 batches */
     g_flush_batch_count++;

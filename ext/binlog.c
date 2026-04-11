@@ -416,26 +416,46 @@ int binlog_load_partial_into_sqlite(const char *db_path) {
         sqlite3_bind_int64(stmt, 10, (sqlite3_int64)thread_id);
         sqlite3_bind_int(stmt, 11, is_coroutine);
 
-        sqlite3_step(stmt);
+        rc = sqlite3_step(stmt);
         sqlite3_reset(stmt);
 
         if (locals_heap) { free(locals_heap); locals_heap = NULL; }
+
+        if (rc != SQLITE_DONE) {
+            error = 1;
+            break;
+        }
         record_count++;
 
         if ((record_count % 10000) == 0) {
-            sqlite3_exec(sqldb, "COMMIT", NULL, NULL, NULL);
-            sqlite3_exec(sqldb, "BEGIN", NULL, NULL, NULL);
+            if (sqlite3_exec(sqldb, "COMMIT", NULL, NULL, NULL) != SQLITE_OK) {
+                error = 1;
+                break;
+            }
+            if (sqlite3_exec(sqldb, "BEGIN", NULL, NULL, NULL) != SQLITE_OK) {
+                error = 1;
+                break;
+            }
         }
     }
 
-    sqlite3_exec(sqldb, "COMMIT", NULL, NULL, NULL);
+    if (sqlite3_exec(sqldb, "COMMIT", NULL, NULL, NULL) != SQLITE_OK) {
+        error = 1;
+    }
     sqlite3_finalize(stmt);
     sqlite3_close(sqldb);
 
     if (heap_buf) free(heap_buf);
 
-    /* Update offset to current position for next incremental load */
-    g_loaded_offset = (uint64_t)ftell(rfp);
+    /* Update offset to current position for next incremental load.
+     * Only advance the offset on success — if an error occurred, leave
+     * the offset unchanged so a retry can reload the same range. */
+    if (!error) {
+        long pos = ftell(rfp);
+        if (pos >= 0) {
+            g_loaded_offset = (uint64_t)pos;
+        }
+    }
     fclose(rfp);
 
     return error ? -1 : 0;
@@ -452,8 +472,10 @@ int binlog_write_batch(const FrameEvent *events, uint32_t count) {
         const char *funcname = e->function_name ? e->function_name : "";
         const char *locals = e->locals_json;
 
-        uint16_t filename_len = (uint16_t)strlen(resolved);
-        uint16_t funcname_len = (uint16_t)strlen(funcname);
+        size_t raw_fn_len = strlen(resolved);
+        size_t raw_func_len = strlen(funcname);
+        uint16_t filename_len = raw_fn_len > UINT16_MAX ? UINT16_MAX : (uint16_t)raw_fn_len;
+        uint16_t funcname_len = raw_func_len > UINT16_MAX ? UINT16_MAX : (uint16_t)raw_func_len;
         uint32_t locals_len = locals ? (uint32_t)strlen(locals) : 0;
 
         uint32_t total_size = BINLOG_RECORD_HEADER_SIZE +
@@ -503,12 +525,16 @@ int binlog_write_batch(const FrameEvent *events, uint32_t count) {
 
         g_binlog_records++;
         g_binlog_bytes += total_size;
+
+        /* Check size limit per record (not per batch) to minimize overshoot.
+         * Uses in-memory byte counter — no syscall needed. */
+        if (g_size_limit > 0 && g_binlog_bytes >= g_size_limit) {
+            atomic_store_explicit(&g_stop_requested, 1, memory_order_relaxed);
+            break;  /* stop writing more records in this batch */
+        }
     }
 
     g_batch_count++;
-    if (g_size_limit > 0 && (g_batch_count % 100) == 0) {
-        check_size_limit();
-    }
 
     return write_error ? -1 : 0;
 }
@@ -725,17 +751,29 @@ int binlog_load_into_sqlite(const char *db_path) {
             locals_heap = NULL;
         }
 
+        if (rc != SQLITE_DONE) {
+            error = 1;
+            break;
+        }
         record_count++;
 
         /* Periodic commit every 10000 records to prevent WAL bloat */
         if ((record_count % 10000) == 0) {
-            sqlite3_exec(sqldb, "COMMIT", NULL, NULL, NULL);
-            sqlite3_exec(sqldb, "BEGIN", NULL, NULL, NULL);
+            if (sqlite3_exec(sqldb, "COMMIT", NULL, NULL, NULL) != SQLITE_OK) {
+                error = 1;
+                break;
+            }
+            if (sqlite3_exec(sqldb, "BEGIN", NULL, NULL, NULL) != SQLITE_OK) {
+                error = 1;
+                break;
+            }
         }
     }
 
-    /* Final commit */
-    sqlite3_exec(sqldb, "COMMIT", NULL, NULL, NULL);
+    /* Final commit — critical for data persistence */
+    if (sqlite3_exec(sqldb, "COMMIT", NULL, NULL, NULL) != SQLITE_OK) {
+        error = 1;
+    }
 
     sqlite3_finalize(stmt);
     sqlite3_close(sqldb);
@@ -743,7 +781,8 @@ int binlog_load_into_sqlite(const char *db_path) {
     if (heap_buf) free(heap_buf);
     fclose(fp);
 
-    /* Delete binlog file on success */
+    /* Delete binlog file ONLY on full success — otherwise the on-disk binlog
+     * is the last surviving copy of the recording and must be preserved. */
     if (!error) {
 #ifndef _WIN32
         unlink(binlog_path);

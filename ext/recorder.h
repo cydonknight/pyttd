@@ -43,6 +43,7 @@ PyObject *pyttd_set_variable(PyObject *self, PyObject *args);
 /* Phase 2: RESUME_LIVE support */
 extern int g_fast_forward_live;
 extern char g_recorder_db_path[1024];
+extern char g_resume_live_run_id[33];  /* Parent-provided run_id for branch */
 
 /* Flush thread — exposed for checkpoint_child_go_live */
 #ifndef _WIN32

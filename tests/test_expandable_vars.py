@@ -122,7 +122,8 @@ class TestExpandableVariables:
             children = session.get_variable_children(d_var['variablesReference'])
             assert len(children) <= 50
 
-    def test_children_are_flat(self, record_func):
+    def test_nested_expansion(self, record_func):
+        """Nested dict children should be expandable (U5: multi-level)."""
         db_path, run_id, _ = record_func('''
             d = {"nested": {"inner": 1}}
             _ = d
@@ -135,8 +136,16 @@ class TestExpandableVariables:
         assert d_var is not None
         if d_var['variablesReference'] > 0:
             children = session.get_variable_children(d_var['variablesReference'])
-            for child in children:
-                assert child['variablesReference'] == 0
+            nested_child = next((c for c in children if 'nested' in c['name']), None)
+            assert nested_child is not None
+            # U5: nested dict should be expandable (variablesReference > 0)
+            assert nested_child['variablesReference'] > 0
+            # Expand second level
+            grandchildren = session.get_variable_children(nested_child['variablesReference'])
+            assert len(grandchildren) > 0
+            inner = next((gc for gc in grandchildren if 'inner' in gc['name']), None)
+            assert inner is not None
+            assert inner['value'] == '1'
 
     def test_set_variable_expandable(self, record_func):
         db_path, run_id, _ = record_func('''

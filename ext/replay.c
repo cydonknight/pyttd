@@ -167,7 +167,8 @@ PyObject *pyttd_restore_checkpoint(PyObject *self, PyObject *args) {
 PyObject *pyttd_resume_live(PyObject *self, PyObject *args) {
     (void)self;
     uint64_t target_seq;
-    if (!PyArg_ParseTuple(args, "K", &target_seq))
+    const char *run_id_str;
+    if (!PyArg_ParseTuple(args, "Ks", &target_seq, &run_id_str))
         return NULL;
 
     int idx = checkpoint_store_find_nearest(target_seq);
@@ -186,15 +187,22 @@ PyObject *pyttd_resume_live(PyObject *self, PyObject *args) {
     int child_pid = e->child_pid;
     e->is_busy = 1;
 
-    /* Build and send RESUME_LIVE command (opcode 0x03) */
-    uint8_t cmd[9];
+    /* Build and send RESUME_LIVE command (opcode 0x03):
+     * 9 base bytes [opcode:1][target_seq:8] + 32 bytes [run_id] = 41 total.
+     * The child reads the base 9 first, then reads the extra 32 on 0x03. */
+    uint8_t cmd[41];
     cmd[0] = 0x03;
     uint64_t payload = pyttd_htobe64(target_seq);
     memcpy(cmd + 1, &payload, sizeof(uint64_t));
+    /* Copy exactly 32 bytes of run_id (pad with NUL if shorter) */
+    memset(cmd + 9, 0, 32);
+    size_t rid_len = strlen(run_id_str);
+    if (rid_len > 32) rid_len = 32;
+    memcpy(cmd + 9, run_id_str, rid_len);
 
     ssize_t wn;
     Py_BEGIN_ALLOW_THREADS
-    wn = replay_write_all(cmd_fd, cmd, 9);
+    wn = replay_write_all(cmd_fd, cmd, 41);
     Py_END_ALLOW_THREADS
 
     if (wn < 0) {

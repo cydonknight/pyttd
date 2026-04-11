@@ -55,10 +55,13 @@ def get_run_by_id(db_path: str, run_id_str: str):
     if run is not None:
         return run
 
-    # Prefix match — cast run_id to text and LIKE
+    # Prefix match — cast run_id to text and LIKE.
+    # Escape LIKE wildcards (%, _) so a user passing literal '%' or '_' does
+    # not match unexpected runs. '\' is the escape character.
+    escaped = run_id_str.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
     matches = db.fetchall(
-        'SELECT * FROM runs WHERE CAST(run_id AS TEXT) LIKE ?',
-        (run_id_str + '%',)
+        "SELECT * FROM runs WHERE CAST(run_id AS TEXT) LIKE ? ESCAPE '\\'",
+        (escaped + '%',)
     )
 
     if len(matches) == 0:

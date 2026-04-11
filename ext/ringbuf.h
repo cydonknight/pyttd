@@ -61,6 +61,11 @@ int  ringbuf_pop_batch_from(ThreadRingBuffer *rb, FrameEvent *out,
 void ringbuf_pool_swap_for(ThreadRingBuffer *rb);
 void ringbuf_pool_reset_consumer_for(ThreadRingBuffer *rb);
 
+/* Mark a specific thread's buffer as orphaned (excludes it from thread_count).
+ * Used when the recording thread changes via set_recording_thread() to drop
+ * the pre-allocated RPC thread buffer so the checkpoint skip guard doesn't trip. */
+void ringbuf_orphan_thread(unsigned long thread_id);
+
 /* Registry queries */
 int  ringbuf_thread_count(void);        /* count of non-orphaned buffers */
 ThreadRingBuffer *ringbuf_get_head(void); /* for flush iteration */

@@ -198,7 +198,7 @@ class TestGotoFrame:
 
         result = session.goto_frame(999999)
         assert "error" in result
-        assert result["error"] == "frame_not_found"
+        assert "not found" in result["error"]
 
     def test_goto_frame_snaps_to_line(self, record_func):
         db_path, run_id, stats = record_func("""\

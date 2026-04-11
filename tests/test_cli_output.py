@@ -232,13 +232,13 @@ def test_exit_code_missing_script():
 
 
 def test_exit_code_no_command():
-    """CLI exits with EXIT_USER_ERROR (1) when no command is given."""
+    """CLI exits with 0 when no command is given (shows help)."""
     result = subprocess.run(
         [sys.executable, '-m', 'pyttd'],
         capture_output=True,
         text=True,
     )
-    assert result.returncode == EXIT_USER_ERROR
+    assert result.returncode == 0
 
 
 def test_exit_code_query_missing_db():

@@ -299,7 +299,9 @@ class PyttdServer:
 
     def _on_recording_complete(self, msg):
         self._recording = False
+        self._paused = False
         from pyttd.models.db import db
+        from pyttd.models import storage
 
         # If exception, send traceback as stderr output
         error_info = msg.get("error")
@@ -308,6 +310,32 @@ class PyttdServer:
                 "category": "stderr",
                 "output": error_info.get("traceback", "")
             })
+
+        # BUG-2 fix: Ensure DB connection is fresh and indexes are rebuilt.
+        # After a pause/resume cycle, indexes may have been dropped and the
+        # DB connection may be stale from the partial binlog load during pause.
+        try:
+            storage.close_db()
+        except Exception:
+            pass
+        storage.connect_to_db(self._db_path)
+        storage.initialize_schema()
+
+        # Rebuild secondary indexes (may have been dropped during resume)
+        import sqlite3 as _sqlite3
+        from pyttd.models import schema
+        try:
+            conn = _sqlite3.connect(self._db_path)
+            conn.execute("PRAGMA journal_mode = wal")
+            for sql in schema.SECONDARY_INDEX_CREATE:
+                try:
+                    conn.execute(sql)
+                except Exception:
+                    pass
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
 
         # Find first line event
         first_line = db.fetchone(
@@ -337,6 +365,7 @@ class PyttdServer:
 
         handler = {
             "backend_init": self._handle_backend_init,
+            "initialize": self._handle_backend_init,  # DAP standard alias
             "launch": self._handle_launch,
             "configuration_done": self._handle_configuration_done,
             "set_breakpoints": self._handle_set_breakpoints,
@@ -396,7 +425,8 @@ class PyttdServer:
             import pyttd_native
             if hasattr(pyttd_native, 'restore_checkpoint'):
                 capabilities.extend(["cold_navigation", "checkpoints"])
-            if hasattr(pyttd_native, 'request_pause'):
+            # Only advertise live_pause when recording is possible (not replay-only)
+            if hasattr(pyttd_native, 'request_pause') and not self._replay_db:
                 capabilities.append("live_pause")
         except ImportError:
             pass
@@ -463,7 +493,8 @@ class PyttdServer:
         # 1. Pause recording thread (blocks until acked or timeout)
         success = pyttd_native.request_pause()
         if not success:
-            return {"error": "pause timeout — recording thread did not respond"}
+            return {"error": "pause timeout — recording thread did not respond within 10s. "
+                    "For CPU-bound scripts, try --include to reduce recording scope."}
 
         # 2. Drain flush thread — wait for all ring buffer events to reach binlog
         pyttd_native.flush_and_wait()
@@ -478,6 +509,7 @@ class PyttdServer:
         from pyttd.models import schema
         try:
             conn = _sqlite3.connect(self._db_path)
+            conn.execute("PRAGMA journal_mode = wal")
             for sql in schema.SECONDARY_INDEX_CREATE:
                 try:
                     conn.execute(sql)
@@ -514,7 +546,10 @@ class PyttdServer:
         target_seq = last_line.sequence_no if last_line else 0
         first_seq = first_line.sequence_no if first_line else 0
 
-        self.session.enter_paused_replay(self.recorder.run_id, first_seq)
+        # enter_replay at first_seq (initial position), but set pause boundary
+        # to target_seq (last recorded event) so forward nav works up to pause point
+        self.session.enter_replay(self.recorder.run_id, first_seq)
+        self.session._pause_boundary = target_seq
         # Navigate to the pause point
         if target_seq != first_seq:
             self.session.goto_frame(target_seq)
@@ -544,6 +579,7 @@ class PyttdServer:
         from pyttd.models import schema
         try:
             conn = _sqlite3.connect(self._db_path)
+            conn.execute("PRAGMA journal_mode = wal")
             for sql in schema.SECONDARY_INDEX_DROP:
                 try:
                     conn.execute(sql)
@@ -569,43 +605,97 @@ class PyttdServer:
     def _handle_continue_from_past(self, params: dict) -> dict:
         """Resume live execution from a historical checkpoint.
         Called when user presses Continue while navigated backward from pause."""
-        target_seq = params.get("targetSeq", self.session.current_frame_seq)
-
+        import uuid as _uuid
         import pyttd_native
+        from pyttd.models import schema
+        from pyttd.models import storage
 
-        # 1. Send RESUME_LIVE to nearest checkpoint child
+        target_seq = params.get("targetSeq", self.session.current_frame_seq)
+        parent_run_id = str(self.recorder.run_id) if self.recorder.run_id else None
+
+        # ---- Phase 1: Stop parent recording, flush binlog → SQLite ----
+        # The child's checkpoint_child_go_live() will call binlog_open("wb")
+        # which TRUNCATES the shared binlog file. Parent's events must land
+        # in SQLite first or they are lost.
+        parent_frame_count = 0
+        if self._recording:
+            try:
+                pyttd_native.request_stop()
+                if self._recording_thread:
+                    self._recording_thread.join(timeout=5)
+            except Exception:
+                logger.exception("Failed to stop parent recording cleanly")
+            try:
+                stats = pyttd_native.get_recording_stats() or {}
+                parent_frame_count = int(stats.get("frame_count", 0) or 0)
+            except Exception:
+                parent_frame_count = 0
+
+        # ---- Phase 2: All parent DB writes, then close connection ----
+        # Generate the branch run_id HERE so we can write the runs row and
+        # close the DB BEFORE the child opens its own connection. This
+        # eliminates the concurrent-writer WAL corruption.
+        new_run_id = _uuid.uuid4().hex
+
+        if parent_run_id is not None:
+            try:
+                schema.update_run(parent_run_id, total_frames=parent_frame_count)
+            except Exception:
+                logger.debug("Failed to update parent total_frames", exc_info=True)
+
         try:
-            result = pyttd_native.resume_live(target_seq)
+            schema.create_run(
+                run_id=new_run_id,
+                script_path=self.script,
+                parent_run_id=parent_run_id,
+                branch_seq=target_seq,
+            )
+        except Exception:
+            logger.exception("Failed to create branch run record")
+
+        # Close parent's DB connection and release WAL lock so the child
+        # can safely open its own connection without concurrent-writer races.
+        try:
+            storage.close_db()
+        except Exception:
+            pass
+
+        # ---- Phase 3: Send RESUME_LIVE with parent-generated run_id ----
+        # The C protocol now carries the 32-byte run_id so the child uses
+        # the same UUID that's already in the runs table.
+        try:
+            result = pyttd_native.resume_live(target_seq, new_run_id)
         except RuntimeError as e:
+            self._shutdown = True
             return {"error": str(e)}
 
-        new_run_id = result.get("new_run_id")
-        resumed_seq = result.get("seq", target_seq)
+        resumed_seq = result.get("seq", target_seq) if isinstance(result, dict) else target_seq
 
-        # 2. Create branch run record
-        from pyttd.models import schema
-        schema.create_run(
-            script_path=self.script,
-            parent_run_id=str(self.recorder.run_id),
-            branch_seq=target_seq,
-        )
+        # Verify child acknowledged correctly
+        child_run_id = result.get("new_run_id") if isinstance(result, dict) else None
+        if isinstance(result, dict) and result.get("status") == "error":
+            err_msg = result.get("error", "unknown")
+            self._shutdown = True
+            return {"error": f"resume_live: {err_msg}", "detail": result}
 
-        # 3. Stop our own recording (if still active)
-        if self._recording:
-            pyttd_native.request_stop()
-            if self._recording_thread:
-                self._recording_thread.join(timeout=5)
-
-        # 4. Send handoff notification to DAP before closing socket
+        # ---- Phase 4: Send handoff notification to DAP ----
         if self._rpc and not self._rpc.is_closed:
             self._rpc.send_notification("handoff", {
                 "new_run_id": new_run_id,
                 "seq": resumed_seq,
+                "parent_run_id": parent_run_id,
+                "branch_seq": target_seq,
             })
 
-        # 5. Shut down parent server — child takes over the socket
+        # ---- Phase 5: Shut down parent ----
         self._shutdown = True
-        return {"status": "handoff", "new_run_id": new_run_id}
+        return {
+            "status": "handoff",
+            "new_run_id": new_run_id,
+            "seq": resumed_seq,
+            "parent_run_id": parent_run_id,
+            "branch_seq": target_seq,
+        }
 
     def _handle_set_variable(self, params: dict) -> dict:
         """Modify a variable in the paused frame."""
@@ -624,10 +714,11 @@ class PyttdServer:
 
     def _handle_get_stack_trace(self, params: dict) -> dict:
         if self.session.state != "replay":
-            return {"frames": []}
+            return {"stackFrames": []}
         seq = params.get("seq", self.session.current_frame_seq)
         frames = self.session.get_stack_at(seq)
-        return {"frames": frames}
+        # Return both keys for DAP compat and backward compat
+        return {"stackFrames": frames, "frames": frames}
 
     def _handle_get_scopes(self, params: dict) -> dict:
         if self.session.state != "replay":
@@ -708,7 +799,8 @@ class PyttdServer:
         if target_seq is None:
             target_seq = params.get("target_seq")
         if target_seq is None:
-            return {"error": "missing_targetSeq"}
+            return {"error": "missing_targetSeq",
+                    "message": "Required parameter 'targetSeq' not provided"}
         return self.session.goto_frame(target_seq)
 
     def _handle_goto_targets(self, params: dict) -> dict:
@@ -725,7 +817,8 @@ class PyttdServer:
         if frame_seq is None:
             frame_seq = params.get("frame_seq")
         if frame_seq is None:
-            return {"error": "missing_frameSeq"}
+            return {"error": "missing_frameSeq",
+                    "message": "Required parameter 'frameSeq' not provided"}
         return self.session.restart_frame(frame_seq)
 
     def _handle_get_timeline_summary(self, params: dict) -> dict:
@@ -738,7 +831,8 @@ class PyttdServer:
         buckets = get_timeline_summary(
             self.session.run_id, start_seq, end_seq, bucket_count,
             breakpoints=self.session.breakpoints)
-        return {"buckets": buckets}
+        total_frames = (self.session.last_line_seq or 0) + 1 if self.session.last_line_seq is not None else 0
+        return {"buckets": buckets, "totalFrames": total_frames}
 
     def _handle_get_traced_files(self, params: dict) -> dict:
         if self.session.state != "replay":
@@ -772,18 +866,23 @@ class PyttdServer:
         if self.session.state != "replay":
             return {"error": "not_in_replay"}
         seq = params.get("seq")
-        var_name = params.get("variableName")
+        var_name = params.get("variableName") or params.get("variable_name")
         if seq is not None and var_name is not None:
             return {"variables": self.session.get_variable_children_by_name(seq, var_name)}
         ref = params.get("variablesReference", 0)
+        if ref == 0 and var_name and seq is None:
+            return {"error": "missing_seq",
+                    "message": "When using variableName, 'seq' is also required"}
         return {"variables": self.session.get_variable_children(ref)}
 
     def _handle_get_variable_history(self, params: dict) -> dict:
         if self.session.state != "replay":
             return {"error": "not_in_replay"}
-        name = params.get("variableName", "")
+        name = params.get("variableName") or params.get("variable_name", "")
         start_seq = params.get("startSeq", 0)
-        end_seq = params.get("endSeq", self.session.last_line_seq or 0)
+        # Default end to last_line_seq; fall back to a large value so the
+        # query covers the full recording even if last_line_seq isn't set yet.
+        end_seq = params.get("endSeq", self.session.last_line_seq or 2**63)
         max_points = params.get("maxPoints", 500)
         return {"history": self.session.get_variable_history(name, start_seq, end_seq, max_points)}
 
@@ -822,6 +921,10 @@ class PyttdServer:
         from pyttd.models import storage
         from pyttd.models.db import db
 
+        try:
+            storage.close_db()
+        except Exception:
+            pass
         storage.connect_to_db(self._db_path)
         storage.initialize_schema()
 
@@ -873,6 +976,11 @@ class PyttdServer:
         if not self.is_module:
             script_abs = os.path.realpath(self.script)
 
+        # BUG-7: Delete stale WAL/SHM files from prior recordings to prevent
+        # "database is locked" errors when re-recording to the same DB path.
+        from pyttd.models.storage import delete_db_files
+        delete_db_files(self._db_path)
+
         self.recorder._resume_live_callback = self._child_bootstrap_callback
         self.recorder.start(self._db_path, script_path=script_abs)
         self.session.state = "recording"
@@ -914,6 +1022,15 @@ class PyttdServer:
                 import logging
                 logging.getLogger(__name__).error("recorder.stop() failed: %s", e)
                 stats = {}
+            # Close the recording thread's thread-local DB connection.
+            # recorder.stop() → schema.update_run opens a connection on THIS
+            # thread; if left open, it holds a WAL lock that prevents the
+            # checkpoint child from safely opening the DB after handoff.
+            try:
+                from pyttd.models import storage as _storage
+                _storage.close_db()
+            except Exception:
+                pass
             self._msg_queue.put({
                 "type": "recording_complete",
                 "stats": stats,
@@ -929,21 +1046,25 @@ class PyttdServer:
         """Called in the resumed checkpoint child after checkpoint_child_go_live().
         Starts a background RPC event loop on the inherited TCP socket.
         The main thread continues executing the user script."""
+        import atexit
         import socket as _socket
         import selectors as _selectors
+        from datetime import datetime as _datetime
         from pyttd.models import storage
         from pyttd.models.db import db
         from pyttd.models import schema
         from pyttd.protocol import JsonRpcConnection as _JsonRpcConnection
         from pyttd.session import Session as _Session
 
-        # Reconnect to DB (child has stale connection from parent)
+        # Reconnect to DB (child has stale connection from parent).
+        # Do NOT call initialize_schema() — the parent already created the
+        # schema, and the ALTER TABLE migrations open write transactions that
+        # can race with the parent's final writes to the same WAL file.
         try:
             storage.close_db()
         except Exception:
             pass
         storage.connect_to_db(db_path)
-        storage.initialize_schema()
 
         # Reconstruct socket from inherited FD
         child_sock = _socket.fromfd(socket_fd, _socket.AF_INET, _socket.SOCK_STREAM)
@@ -1105,3 +1226,45 @@ class PyttdServer:
 
         t = threading.Thread(target=_child_event_loop, daemon=True)
         t.start()
+
+        # NOTE: Findings #14/#16 (terminal notification + total_frames update)
+        # require the child to notify clients when it finishes the branched
+        # run. This is best-effort: the child's atexit may not fire reliably
+        # (e.g., SIGKILL from unrelated process, inherited broken pipes from
+        # parent capture, or interpreter teardown ordering issues). The child
+        # still records events via C binlog + flush, so the data is preserved
+        # even without atexit — total_frames and notification are cosmetic.
+        def _child_finalize():
+            import pyttd_native as _native
+            stats = {}
+            try:
+                stats = _native.stop_recording() or {}
+            except Exception:
+                pass
+            frame_count = 0
+            try:
+                frame_count = int(stats.get("frame_count", 0) or 0)
+            except Exception:
+                pass
+            try:
+                schema.update_run(new_run_id,
+                                  timestamp_end=_datetime.now().timestamp(),
+                                  total_frames=frame_count)
+            except Exception:
+                pass
+            try:
+                if not rpc.is_closed:
+                    rpc.send_notification("stopped", {
+                        "reason": "recording_complete",
+                        "totalFrames": frame_count,
+                        "run_id": new_run_id,
+                        "seq": frame_count,
+                    })
+            except Exception:
+                pass
+            try:
+                child_sock.close()
+            except Exception:
+                pass
+
+        atexit.register(_child_finalize)

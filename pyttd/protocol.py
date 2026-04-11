@@ -19,6 +19,8 @@ class JsonRpcConnection:
         self._buffer += data
 
     def try_read_message(self) -> dict | None:
+        if self._closed:
+            return None
         header_end = self._buffer.find(b"\r\n\r\n")
         if header_end < 0:
             if len(self._buffer) > MAX_HEADER_ACCUMULATION:

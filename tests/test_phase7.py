@@ -80,7 +80,7 @@ class TestCLI:
             [sys.executable, "-m", "pyttd"],
             capture_output=True, text=True,
         )
-        assert result.returncode != 0
+        assert result.returncode == 0
         assert "usage:" in result.stdout.lower() or "usage:" in result.stderr.lower()
 
 

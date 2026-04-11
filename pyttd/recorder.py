@@ -22,6 +22,7 @@ class Recorder:
         self._flush_count = 0
         self._size_warned = False
         self._resume_live_callback = None
+        self._prev_recording_env = None
 
     def start(self, db_path: str, script_path: str | None = None, attach: bool = False):
         """Initialize DB, create Runs record, set ignore patterns, install frame eval hook."""
@@ -53,9 +54,11 @@ class Recorder:
             logger.debug("Could not clean stale checkpoints (DB may have been locked)")
 
         self._run_id = schema.create_run(script_path=script_path, is_attach=attach)
+        logger.debug("Created run %s for %s (attach=%s)", self._run_id, script_path, attach)
 
         # Initialize binary log for recording
         pyttd_native.binlog_open(db_path, self._run_id)
+        logger.debug("Binlog opened at %s", db_path)
 
         # Auto-evict old runs if keep_runs is configured
         if self.config.keep_runs > 0:
@@ -64,6 +67,8 @@ class Recorder:
                 logger.info("Evicted %d old run(s)", len(evicted))
         all_ignore = list(INTERNAL_IGNORE) + list(self.config.ignore_patterns)
         pyttd_native.set_ignore_patterns(all_ignore)
+        logger.debug("Ignore patterns: %d total (%d internal + %d user)",
+                     len(all_ignore), len(INTERNAL_IGNORE), len(self.config.ignore_patterns))
 
         if self.config.redact_secrets and self.config.secret_patterns:
             pyttd_native.set_secret_patterns(self.config.secret_patterns)
@@ -71,11 +76,33 @@ class Recorder:
             pyttd_native.set_secret_patterns([])
 
         pyttd_native.set_include_patterns(self.config.include_functions)
-        pyttd_native.set_file_include_patterns(self.config.include_files)
+        # B1: Auto-wrap bare filenames so fnmatch matches against full paths.
+        # "script.py" → "*script.py" to match "/path/to/script.py".
+        def _normalize_file_patterns(patterns):
+            result = []
+            for p in patterns:
+                if p and '/' not in p and '*' not in p and '?' not in p and '[' not in p:
+                    p = '*' + p
+                result.append(p)
+            return result
+        pyttd_native.set_file_include_patterns(
+            _normalize_file_patterns(self.config.include_files))
         pyttd_native.set_exclude_patterns(
             self.config.exclude_functions,
-            self.config.exclude_files,
+            _normalize_file_patterns(self.config.exclude_files),
         )
+        if self.config.include_functions:
+            logger.debug("Include functions: %s", self.config.include_functions)
+        if self.config.include_files:
+            logger.debug("Include files: %s", self.config.include_files)
+        if self.config.exclude_functions:
+            logger.debug("Exclude functions: %s", self.config.exclude_functions)
+        if self.config.exclude_files:
+            logger.debug("Exclude files: %s", self.config.exclude_files)
+        if self.config.redact_secrets:
+            logger.debug("Secrets redaction enabled (%d patterns)", len(self.config.secret_patterns))
+        logger.debug("Config: checkpoint_interval=%d, max_frames=%d, max_db_size_mb=%s",
+                     self.config.checkpoint_interval, self.config.max_frames, self.config.max_db_size_mb)
 
         kwargs = dict(
             flush_callback=self._on_flush,
@@ -104,12 +131,14 @@ class Recorder:
             self._run_id = None
             storage.close_db()
             raise
+        # Save pre-existing value so stop() can restore it instead of clobbering
+        self._prev_recording_env = os.environ.get('PYTTD_RECORDING')
         os.environ['PYTTD_RECORDING'] = '1'
         if self.config.max_frames > 0:
             pyttd_native.set_max_frames(self.config.max_frames)
         if self.config.max_db_size_mb > 0:
             pyttd_native.binlog_set_size_limit(
-                self.config.max_db_size_mb * 1024 * 1024)
+                int(self.config.max_db_size_mb * 1024 * 1024))
         if self.config.checkpoint_memory_limit_mb > 0:
             pyttd_native.set_checkpoint_memory_limit(
                 self.config.checkpoint_memory_limit_mb * 1024 * 1024)
@@ -123,17 +152,26 @@ class Recorder:
             return {}
         pyttd_native.stop_recording()
         self._recording = False
-        os.environ.pop('PYTTD_RECORDING', None)
+        # Restore pre-existing PYTTD_RECORDING value (if any), otherwise clear
+        prev = getattr(self, '_prev_recording_env', None)
+        if prev is not None:
+            os.environ['PYTTD_RECORDING'] = prev
+        else:
+            os.environ.pop('PYTTD_RECORDING', None)
+        logger.debug("Recording stopped for run %s", self._run_id)
 
-        # Bulk-load binary log into SQLite
-        try:
-            pyttd_native.binlog_load(self._db_path)
-        except Exception:
-            logger.warning("Failed to load binlog into SQLite", exc_info=True)
+        # Bulk-load binary log into SQLite (skip if no events recorded)
+        stats = pyttd_native.get_recording_stats()
+        if stats.get('frame_count', 0) > 0:
+            try:
+                pyttd_native.binlog_load(self._db_path)
+            except Exception:
+                logger.debug("Failed to load binlog into SQLite", exc_info=True)
 
         # Rebuild secondary indexes
         try:
             conn = _sqlite3.connect(self._db_path)
+            conn.execute("PRAGMA journal_mode = wal")
             for sql in schema.SECONDARY_INDEX_CREATE:
                 conn.execute(sql)
             conn.commit()
@@ -208,5 +246,13 @@ class Recorder:
 
     def _on_checkpoint(self, child_pid: int, sequence_no: int):
         """Called by C eval hook (with GIL held) after successful fork().
-        Non-fatal — exception is logged and cleared by C code."""
-        schema.create_checkpoint(self._run_id, sequence_no, child_pid)
+        Non-fatal — exception is logged and cleared by C code.
+        KeyboardInterrupt can arrive here when request_stop() fires during
+        a checkpoint cycle (B4). Catch and suppress to avoid leaving
+        checkpoint metadata in an inconsistent state."""
+        try:
+            schema.create_checkpoint(self._run_id, sequence_no, child_pid)
+        except KeyboardInterrupt:
+            logger.debug("KeyboardInterrupt during checkpoint callback (suppressed)")
+        except Exception:
+            logger.debug("Checkpoint callback failed", exc_info=True)

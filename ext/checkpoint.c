@@ -17,6 +17,7 @@
 #include <errno.h>
 #include <string.h>
 #include <stdio.h>
+#include <fcntl.h>
 #include <arpa/inet.h>
 #include <stdatomic.h>
 #include <time.h>
@@ -165,18 +166,21 @@ void checkpoint_child_go_live(int result_fd, int cmd_fd) {
     /* Called from fast-forward hooks when target is reached in RESUME_LIVE mode.
      * Re-initializes the child as a live recording process. */
 
+    /* 0. Exit IO replay mode BEFORE anything else. Prevents a race where
+     * user code (or any recorded Python call during the transition) triggers
+     * a hooked IO function while replay mode is still on but the replay list
+     * may have been exhausted (finding #15 in FUNCTEST-REPORT). */
+    iohook_reset_child_state();
+
     /* 1. Clear fast-forward state */
     g_fast_forward_live = 0;
     recorder_set_fast_forward(0, 0);  /* clears g_fast_forward and g_fast_forward_target */
 
-    /* 2. Generate new run_id */
-    PyObject *uuid_mod = PyImport_ImportModule("uuid");
-    if (!uuid_mod) { PyErr_Clear(); _exit(1); }
-    PyObject *uuid4 = PyObject_CallMethod(uuid_mod, "uuid4", NULL);
-    if (!uuid4) { PyErr_Clear(); Py_DECREF(uuid_mod); _exit(1); }
-    PyObject *hex_attr = PyObject_GetAttrString(uuid4, "hex");
-    if (!hex_attr) { PyErr_Clear(); Py_DECREF(uuid4); Py_DECREF(uuid_mod); _exit(1); }
-    const char *new_run_id = PyUnicode_AsUTF8(hex_attr);
+    /* 2. Use the parent-provided run_id (set by RESUME_LIVE command handler).
+     * The parent generated this UUID, created the runs row in SQLite, and
+     * closed its DB connection BEFORE sending RESUME_LIVE — so there is no
+     * concurrent-write race between parent and child. */
+    const char *new_run_id = g_resume_live_run_id;
 
     /* 3. Reinitialize ring buffer */
     ringbuf_system_init(PYTTD_DEFAULT_CAPACITY);
@@ -247,11 +251,6 @@ void checkpoint_child_go_live(int result_fd, int cmd_fd) {
         Py_XDECREF(result);
     }
 
-    /* 15. Cleanup Python refs */
-    Py_DECREF(hex_attr);
-    Py_DECREF(uuid4);
-    Py_DECREF(uuid_mod);
-
     /* Return to caller (fast-forward hook).
      * g_fast_forward_live is now 0, so the eval hook proceeds normally.
      * The child is now the live process. */
@@ -260,51 +259,70 @@ void checkpoint_child_go_live(int result_fd, int cmd_fd) {
 /* ---- Child Command Loop ---- */
 
 int checkpoint_wait_for_command(int cmd_fd) {
-    PyThreadState *tstate = PyEval_SaveThread();  /* release GIL */
-    uint8_t cmd_buf[9];
-    ssize_t n = read_all(cmd_fd, cmd_buf, 9);
-    if (n <= 0) _exit(0);
+    while (1) {
+        PyThreadState *tstate = PyEval_SaveThread();  /* release GIL */
+        uint8_t cmd_buf[9];
+        ssize_t n = read_all(cmd_fd, cmd_buf, 9);
+        if (n <= 0) _exit(0);
 
-    uint8_t opcode = cmd_buf[0];
-    uint64_t payload;
-    memcpy(&payload, cmd_buf + 1, sizeof(uint64_t));
-    payload = pyttd_be64toh(payload);
+        uint8_t opcode = cmd_buf[0];
+        uint64_t payload;
+        memcpy(&payload, cmd_buf + 1, sizeof(uint64_t));
+        payload = pyttd_be64toh(payload);
 
-    PyEval_RestoreThread(tstate);  /* re-acquire GIL */
+        PyEval_RestoreThread(tstate);  /* re-acquire GIL */
 
-    if (opcode == 0xFF) _exit(0);  /* DIE */
+        if (opcode == 0xFF) _exit(0);  /* DIE */
 
-    if (opcode == 0x01) {  /* RESUME(target) */
-        if (payload <= recorder_get_sequence_counter()) {
-            serialize_error_result(g_result_fd, "already_past_target",
-                                   recorder_get_sequence_counter());
-            return checkpoint_wait_for_command(cmd_fd);
+        if (opcode == 0x01) {  /* RESUME(target) */
+            if (payload <= recorder_get_sequence_counter()) {
+                serialize_error_result(g_result_fd, "already_past_target",
+                                       recorder_get_sequence_counter());
+                continue;  /* wait for next command */
+            }
+            recorder_set_fast_forward(1, payload);
+            return 0;
         }
-        recorder_set_fast_forward(1, payload);
-        return 0;
-    }
 
-    if (opcode == 0x02) {  /* STEP(delta) */
-        if (payload == 0) {
-            serialize_target_state(g_result_fd, -1, NULL);
-            return checkpoint_wait_for_command(cmd_fd);
+        if (opcode == 0x02) {  /* STEP(delta) */
+            if (payload == 0) {
+                serialize_target_state(g_result_fd, -1, NULL);
+                continue;  /* wait for next command */
+            }
+            recorder_set_fast_forward(1, recorder_get_sequence_counter() + payload);
+            return 0;
         }
-        recorder_set_fast_forward(1, recorder_get_sequence_counter() + payload);
-        return 0;
-    }
 
-    if (opcode == 0x03) {  /* RESUME_LIVE(target) */
-        if (payload <= recorder_get_sequence_counter()) {
-            serialize_error_result(g_result_fd, "already_past_target",
-                                   recorder_get_sequence_counter());
-            return checkpoint_wait_for_command(cmd_fd);
+        if (opcode == 0x03) {  /* RESUME_LIVE(target, run_id) — 41 bytes total */
+            /* Read the additional 32-byte run_id */
+            char run_id_buf[33];
+            ssize_t n2 = read_all(cmd_fd, run_id_buf, 32);
+            run_id_buf[32] = '\0';
+            if (n2 <= 0) _exit(0);
+            memcpy(g_resume_live_run_id, run_id_buf, 33);
+
+            uint64_t cur = recorder_get_sequence_counter();
+            if (payload < cur) {
+                /* Child is past target — go live immediately from current
+                 * position. This happens when goto_frame advanced the child
+                 * to target N (counter becomes N+1 due to atomic_fetch_add)
+                 * and continue_from_past then targets N. The child has
+                 * already processed event N and is ready to resume from N+1. */
+                checkpoint_child_go_live(g_result_fd, cmd_fd);
+                return 0;
+            }
+            if (payload == cur) {
+                /* Exactly at target — go live without fast-forward. */
+                checkpoint_child_go_live(g_result_fd, cmd_fd);
+                return 0;
+            }
+            iohook_enter_replay_mode(cur);
+            recorder_set_fast_forward_live(1, payload);
+            return 0;
         }
-        iohook_enter_replay_mode(recorder_get_sequence_counter());
-        recorder_set_fast_forward_live(1, payload);
-        return 0;
-    }
 
-    _exit(1);  /* unknown opcode */
+        _exit(1);  /* unknown opcode */
+    }
 }
 
 /* ---- Child Initialization ---- */
@@ -341,13 +359,26 @@ static void checkpoint_child_command_loop(int cmd_fd, int result_fd,
                 g_saved_tstate = saved_tstate;
                 return;  /* return to eval hook */
             }
-        } else if (opcode == 0x03) {  /* RESUME_LIVE */
+        } else if (opcode == 0x03) {  /* RESUME_LIVE(target, run_id) */
+            /* Read the additional 32-byte run_id (sent after the base 9 bytes) */
+            char run_id_buf[33];
+            ssize_t n2 = read_all(cmd_fd, run_id_buf, 32);
+            run_id_buf[32] = '\0';
+            if (n2 <= 0) _exit(0);
+            memcpy(g_resume_live_run_id, run_id_buf, 33);
+
             uint64_t target_seq = payload;
-            if (target_seq <= recorder_get_sequence_counter()) {
-                serialize_error_result(result_fd, "already_past_target",
-                                       recorder_get_sequence_counter());
+            uint64_t cur = recorder_get_sequence_counter();
+            if (target_seq <= cur) {
+                /* Already at or past target — go live immediately.
+                 * This is the normal case after goto_frame advanced the
+                 * child: counter is target+1 due to atomic_fetch_add. */
+                g_cmd_fd = cmd_fd;
+                g_result_fd = result_fd;
+                checkpoint_child_go_live(result_fd, cmd_fd);
+                return;
             } else {
-                iohook_enter_replay_mode(recorder_get_sequence_counter());
+                iohook_enter_replay_mode(cur);
                 recorder_set_fast_forward_live(1, target_seq);
                 g_cmd_fd = cmd_fd;
                 g_result_fd = result_fd;
@@ -475,6 +506,22 @@ int checkpoint_do_fork(uint64_t sequence_no, PyObject *checkpoint_callback) {
     /* Re-acquire GIL before fork — flush thread is paused so no contention.
      * This ensures the child inherits a valid GIL state for PyOS_AfterFork_Child. */
     PyEval_RestoreThread(saved);
+
+    /* B3 fix: If a KeyboardInterrupt (from request_stop) is propagating through
+     * the call stack, abort the checkpoint. Forking with a pending exception
+     * causes Python's logging._prepareFork/_afterFork hooks to produce noisy
+     * tracebacks ("RuntimeError: cannot release un-acquired lock"). The
+     * exception will continue propagating normally after we clean up.
+     * GIL is held here (RestoreThread above), so PyErr_Occurred is safe. */
+    if (PyErr_Occurred()) {
+        pthread_mutex_lock(&g_flush_mutex);
+        atomic_store(&g_pause_requested, 0);
+        pthread_cond_signal(&g_resume_cv);
+        pthread_mutex_unlock(&g_flush_mutex);
+        close(cmd_pipe[0]); close(cmd_pipe[1]);
+        close(result_pipe[0]); close(result_pipe[1]);
+        return -1;
+    }
 
     /* 3. Pre-fork hooks — puts internal CPython mutexes (including PyMutex-based
      * GIL on 3.13+) into a known state so PyOS_AfterFork_Child can reinit them. */

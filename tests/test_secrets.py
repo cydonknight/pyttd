@@ -41,9 +41,12 @@ class TestSecretsFiltering:
         assert locals_data.get('API_TOKEN') == '<redacted>'
         assert locals_data.get('count') != '<redacted>'
 
-    def test_secret_pattern_substring(self, record_func):
+    def test_secret_pattern_word_boundary(self, record_func):
+        """Word-boundary matching: auth_token redacted, authorization not."""
         db_path, run_id, _ = record_func('''
             authorization_header = "Bearer xyz"
+            auth_token = "secret123"
+            my_auth = "key456"
             name = "test"
             _ = name
         ''')
@@ -54,7 +57,12 @@ class TestSecretsFiltering:
             (str(run_id),))
         assert frame is not None
         locals_data = json.loads(frame.locals_snapshot)
-        assert locals_data.get('authorization_header') == '<redacted>'
+        # Word-boundary: "authorization_header" should NOT be redacted
+        # (auth is followed by 'o', not a boundary)
+        assert locals_data.get('authorization_header') != '<redacted>'
+        # "auth_token" and "my_auth" SHOULD be redacted (auth at word boundary)
+        assert locals_data.get('auth_token') == '<redacted>'
+        assert locals_data.get('my_auth') == '<redacted>'
         assert locals_data.get('name') != '<redacted>'
 
     def test_no_redact_mode(self, tmp_path):

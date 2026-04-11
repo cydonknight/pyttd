@@ -487,7 +487,8 @@ class TestSessionEvaluate:
             (str(run_id),))
         if first_line:
             result = session.evaluate_at(first_line.sequence_no, "__import__('os')", "hover")
-            assert result["result"] == "<not available>"
+            assert result["result"] == "<blocked>"
+            assert "not available" in result.get("error", "").lower()
 
 
 class TestInferType:

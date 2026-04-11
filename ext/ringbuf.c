@@ -7,9 +7,17 @@
 #include <pthread.h>
 #endif
 
-/* ---- Global Registry ---- */
+/* ---- Global Registry ----
+ *
+ * `g_thread_rb_head` is a prepend-only linked list of per-thread ring buffers.
+ * Producers (user threads) prepend under `g_registry_mutex`. Consumers (flush
+ * thread) iterate without the mutex — they must use acquire ordering on the
+ * head load so they see the producer's writes to `rb->next` and the buffer
+ * contents. Once in the list, a buffer's `next` pointer is stable for the
+ * lifetime of the process (entries are freed only in ringbuf_system_destroy,
+ * which runs after the flush thread is joined). */
 
-static ThreadRingBuffer *g_thread_rb_head = NULL;
+static _Atomic(ThreadRingBuffer *) g_thread_rb_head = NULL;
 #ifndef _WIN32
 static pthread_mutex_t g_registry_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_key_t g_rb_key;
@@ -152,7 +160,7 @@ int ringbuf_system_init(uint32_t per_thread_capacity) {
     }
 #endif
 
-    g_thread_rb_head = NULL;
+    atomic_store_explicit(&g_thread_rb_head, NULL, memory_order_release);
     g_my_rb = NULL;
     g_system_initialized = 1;
     return PYTTD_RINGBUF_OK;
@@ -164,7 +172,7 @@ void ringbuf_system_destroy(void) {
 #ifndef _WIN32
     pthread_mutex_lock(&g_registry_mutex);
 #endif
-    ThreadRingBuffer *rb = g_thread_rb_head;
+    ThreadRingBuffer *rb = atomic_load_explicit(&g_thread_rb_head, memory_order_acquire);
     while (rb) {
         ThreadRingBuffer *next = rb->next;
         free(rb->events);
@@ -173,7 +181,7 @@ void ringbuf_system_destroy(void) {
         free(rb);
         rb = next;
     }
-    g_thread_rb_head = NULL;
+    atomic_store_explicit(&g_thread_rb_head, NULL, memory_order_release);
 #ifndef _WIN32
     pthread_mutex_unlock(&g_registry_mutex);
 #endif
@@ -195,11 +203,13 @@ ThreadRingBuffer *ringbuf_get_or_create(unsigned long thread_id) {
     ThreadRingBuffer *rb = alloc_thread_rb(thread_id);
     if (!rb) return NULL;
 
-    /* After the first buffer, use smaller pool sizes for new threads */
+    /* After the first buffer, use smaller pool sizes for new threads.
+     * Publish with release ordering so concurrent readers (flush thread)
+     * using acquire ordering see rb->next and the buffer contents. */
 #ifndef _WIN32
     pthread_mutex_lock(&g_registry_mutex);
-    rb->next = g_thread_rb_head;
-    g_thread_rb_head = rb;
+    rb->next = atomic_load_explicit(&g_thread_rb_head, memory_order_relaxed);
+    atomic_store_explicit(&g_thread_rb_head, rb, memory_order_release);
     /* Switch to smaller pools for subsequent threads */
     if (g_per_thread_pool_size == PYTTD_STRING_POOL_SIZE) {
         g_per_thread_pool_size = PYTTD_PER_THREAD_POOL_SIZE;
@@ -207,8 +217,8 @@ ThreadRingBuffer *ringbuf_get_or_create(unsigned long thread_id) {
     pthread_mutex_unlock(&g_registry_mutex);
     pthread_setspecific(g_rb_key, rb);
 #else
-    rb->next = g_thread_rb_head;
-    g_thread_rb_head = rb;
+    rb->next = atomic_load_explicit(&g_thread_rb_head, memory_order_relaxed);
+    atomic_store_explicit(&g_thread_rb_head, rb, memory_order_release);
     if (g_per_thread_pool_size == PYTTD_STRING_POOL_SIZE) {
         g_per_thread_pool_size = PYTTD_PER_THREAD_POOL_SIZE;
     }
@@ -328,12 +338,29 @@ void ringbuf_pool_reset_consumer_for(ThreadRingBuffer *rb) {
 
 /* ---- Registry Queries ---- */
 
+void ringbuf_orphan_thread(unsigned long thread_id) {
+#ifndef _WIN32
+    pthread_mutex_lock(&g_registry_mutex);
+#endif
+    for (ThreadRingBuffer *rb = atomic_load_explicit(&g_thread_rb_head, memory_order_acquire);
+         rb; rb = rb->next) {
+        if (rb->thread_id == thread_id) {
+            rb->orphaned = 1;
+            break;
+        }
+    }
+#ifndef _WIN32
+    pthread_mutex_unlock(&g_registry_mutex);
+#endif
+}
+
 int ringbuf_thread_count(void) {
     int count = 0;
 #ifndef _WIN32
     pthread_mutex_lock(&g_registry_mutex);
 #endif
-    for (ThreadRingBuffer *rb = g_thread_rb_head; rb; rb = rb->next) {
+    for (ThreadRingBuffer *rb = atomic_load_explicit(&g_thread_rb_head, memory_order_acquire);
+         rb; rb = rb->next) {
         if (rb->initialized && !rb->orphaned) count++;
     }
 #ifndef _WIN32
@@ -343,11 +370,15 @@ int ringbuf_thread_count(void) {
 }
 
 ThreadRingBuffer *ringbuf_get_head(void) {
-    return g_thread_rb_head;
+    /* Acquire load pairs with the release store in ringbuf_get_or_create so
+     * the flush thread sees the producer's writes to rb->next and buffer
+     * contents when iterating the list without holding g_registry_mutex. */
+    return atomic_load_explicit(&g_thread_rb_head, memory_order_acquire);
 }
 
 int ringbuf_any_pending(void) {
-    for (ThreadRingBuffer *rb = g_thread_rb_head; rb; rb = rb->next) {
+    for (ThreadRingBuffer *rb = atomic_load_explicit(&g_thread_rb_head, memory_order_acquire);
+         rb; rb = rb->next) {
         if (!rb->initialized) continue;
         uint32_t tail = atomic_load_explicit(&rb->tail, memory_order_relaxed);
         uint32_t head = atomic_load_explicit(&rb->head, memory_order_acquire);
@@ -363,7 +394,8 @@ RingbufStats ringbuf_get_stats(void) {
 #ifndef _WIN32
     pthread_mutex_lock(&g_registry_mutex);
 #endif
-    for (ThreadRingBuffer *rb = g_thread_rb_head; rb; rb = rb->next) {
+    for (ThreadRingBuffer *rb = atomic_load_explicit(&g_thread_rb_head, memory_order_acquire);
+         rb; rb = rb->next) {
         stats.dropped_frames += rb->dropped_frames;
         stats.pool_overflows += rb->pool_overflows;
     }

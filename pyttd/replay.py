@@ -7,7 +7,8 @@ from pyttd.models.db import db
 logger = logging.getLogger(__name__)
 
 _FRAME_BY_SEQ_SQL = """
-    SELECT filename, line_no, function_name, call_depth, locals_snapshot
+    SELECT filename, line_no, function_name, call_depth, locals_snapshot,
+           frame_event, thread_id
     FROM executionframes
     WHERE run_id = ? AND sequence_no = ?
 """
@@ -43,15 +44,47 @@ class ReplayController:
     def warm_goto_frame(self, run_id, target_seq) -> dict:
         """Warm-only navigation: read frame data directly from SQLite
         (repr snapshots only, no live objects)."""
+        if target_seq < 0:
+            return {"error": f"Frame number must be non-negative (got {target_seq})",
+                    "target_seq": target_seq}
         frame = db.fetchone(_FRAME_BY_SEQ_SQL, (run_id, target_seq))
         if frame is None:
-            return {"error": "frame_not_found", "target_seq": target_seq}
+            # Try to give a helpful range by looking up the last sequence
+            last = db.fetchone(
+                "SELECT sequence_no FROM executionframes"
+                " WHERE run_id = ? ORDER BY sequence_no DESC LIMIT 1",
+                (str(run_id),))
+            if last is not None:
+                return {"error": f"Frame {target_seq} not found (valid range: 0-{last.sequence_no})",
+                        "target_seq": target_seq}
+            return {"error": f"Frame {target_seq} not found (no frames in recording)",
+                    "target_seq": target_seq}
         try:
             locals_data = json.loads(frame.locals_snapshot) if frame.locals_snapshot else {}
         except (json.JSONDecodeError, TypeError) as e:
             logger.warning(
                 "Failed to parse locals at seq %d: %s", target_seq, e)
             locals_data = {}
+        # Merge return-only snapshots with nearest full locals
+        if (frame.frame_event == 'return'
+                and set(locals_data.keys()) <= {'__return__'}):
+            fallback = db.fetchone(
+                "SELECT locals_snapshot FROM executionframes"
+                " WHERE run_id = ? AND locals_snapshot IS NOT NULL"
+                " AND locals_snapshot != ''"
+                " AND call_depth = ? AND thread_id = ?"
+                " AND function_name = ? AND filename = ?"
+                " AND sequence_no < ?"
+                " ORDER BY sequence_no DESC LIMIT 1",
+                (run_id, frame.call_depth, frame.thread_id,
+                 frame.function_name, frame.filename, target_seq))
+            if fallback and fallback.locals_snapshot:
+                try:
+                    full_locals = json.loads(fallback.locals_snapshot)
+                    full_locals.update(locals_data)
+                    locals_data = full_locals
+                except (json.JSONDecodeError, TypeError):
+                    pass
         return {
             "seq": target_seq,
             "file": frame.filename,

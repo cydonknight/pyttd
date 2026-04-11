@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 _DEFAULT_SECRET_PATTERNS = [
     'password', 'secret', 'token', 'api_key', 'apikey',
     'auth', 'credential', 'private_key',
+    'connection_string', 'conn_str', 'database_url', 'dsn',
 ]
 
 @dataclass
@@ -17,7 +18,7 @@ class PyttdConfig:
     include_functions: list[str] = field(default_factory=list)
     max_frames: int = 0        # 0 = unlimited
     max_memory_mb: int = 0     # 0 = unlimited
-    max_db_size_mb: int = 0    # 0 = unlimited; warn when DB exceeds this
+    max_db_size_mb: float = 0  # 0 = unlimited; auto-stop when binlog exceeds this
     keep_runs: int = 0         # 0 = keep all; N = keep only last N runs
     include_files: list[str] = field(default_factory=list)
     exclude_functions: list[str] = field(default_factory=list)

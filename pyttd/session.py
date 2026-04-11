@@ -146,14 +146,23 @@ class Session:
         ]
 
     def set_exception_filters(self, filters: list[str]):
-        self.exception_filters = filters
+        # Accept "all" as alias for "raised"
+        self.exception_filters = ["raised" if f == "all" else f for f in filters]
 
     def set_function_breakpoints(self, breakpoints: list[dict]):
         self.function_breakpoints = breakpoints  # [{name, condition?, hitCondition?}]
         self._fn_bp_hit_counts = {}
 
     def set_data_breakpoints(self, breakpoints: list[dict]):
-        self.data_breakpoints = breakpoints  # [{variableName}]
+        # DAP sends {dataId, accessType}; normalize to {variableName} for
+        # internal use. Accept both field names for client compat.
+        normalized = []
+        for bp in breakpoints:
+            nbp = dict(bp)
+            if 'dataId' in nbp and 'variableName' not in nbp:
+                nbp['variableName'] = nbp['dataId']
+            normalized.append(nbp)
+        self.data_breakpoints = normalized
 
     def verify_function_breakpoints(self, breakpoints: list[dict]) -> list[dict]:
         results = []
@@ -304,15 +313,24 @@ class Session:
             condition = bp.get('condition', '')
             hit_condition = bp.get('hitCondition', '')
             log_message = bp.get('logMessage', '')
-            hit = self._find_conditional_hit_forward(bp['file'], bp['line'],
-                                                      condition, self.current_frame_seq,
-                                                      hit_condition=hit_condition,
-                                                      log_message=log_message)
-            if hit is not None:
-                if log_message:
-                    # Log points don't stop; they just emit messages
-                    pass
-                else:
+            if log_message:
+                # Log points: collect ALL messages through end of recording,
+                # don't stop execution. The inner function appends each hit
+                # to self._log_messages and returns the seq so we can continue
+                # searching from there.
+                cursor = self.current_frame_seq
+                for _ in range(10000):  # safety limit
+                    hit = self._find_conditional_hit_forward(
+                        bp['file'], bp['line'], condition, cursor,
+                        hit_condition=hit_condition, log_message=log_message)
+                    if hit is None:
+                        break
+                    cursor = hit  # continue searching after this hit
+            else:
+                hit = self._find_conditional_hit_forward(
+                    bp['file'], bp['line'], condition, self.current_frame_seq,
+                    hit_condition=hit_condition)
+                if hit is not None:
                     candidates.append((hit, "breakpoint"))
 
         # Function breakpoints
@@ -348,6 +366,10 @@ class Session:
                 candidates.append((hit, "exception"))
 
         if not candidates:
+            # U6: If paused, navigate to the pause boundary (not "end")
+            if self._pause_boundary is not None:
+                target = min(self.last_line_seq, self._pause_boundary)
+                return self._navigate_to(target, "pause_boundary")
             return self._navigate_to(self.last_line_seq, "end")
 
         best_seq, reason = min(candidates, key=lambda x: x[0])
@@ -424,10 +446,14 @@ class Session:
 
     def goto_frame(self, target_seq: int) -> dict:
         self._require_replay()
+        requested_seq = target_seq
         # 1. Validate target exists
+        if target_seq < 0:
+            return {"error": f"Frame number must be non-negative (got {target_seq})"}
         frame = self._fetch_frame(target_seq)
         if frame is None:
-            return {"error": "frame_not_found", "target_seq": target_seq}
+            last = self.last_line_seq or 0
+            return {"error": f"Frame {target_seq} not found (valid range: 0-{last})"}
 
         # 2. Snap to nearest line event if not already one
         if frame.frame_event != 'line':
@@ -472,27 +498,47 @@ class Session:
             cache_thread = target_frame.thread_id if target_frame else (self.current_thread_id or 0)
             self._stack_cache[(target_seq, cache_thread)] = [e.copy() for e in self.current_stack]
 
-        # 6. Return result
+        # 6. Return result (ISSUE-1: include snap feedback)
+        snapped = (target_seq != requested_seq)
         if target_frame:
-            return {
+            result = {
                 "seq": target_seq,
                 "file": target_frame.filename,
                 "line": target_frame.line_no,
                 "function_name": target_frame.function_name,
+                "call_depth": target_frame.call_depth,
                 "thread_id": target_frame.thread_id,
                 "reason": "goto",
             }
+            if snapped:
+                result["snapped"] = True
+                result["requestedSeq"] = requested_seq
+            return result
         return {"seq": target_seq, "reason": "goto"}
 
     def goto_targets(self, filename: str, line: int) -> list[dict]:
         self._require_replay()
-        filename = os.path.realpath(filename)
+        real_file = os.path.realpath(filename)
         rows = db.fetchdicts(
             "SELECT sequence_no, function_name FROM executionframes"
             " WHERE run_id = ? AND filename = ? AND line_no = ?"
             " AND frame_event = 'line'"
             " ORDER BY sequence_no LIMIT 1000",
-            (str(self.run_id), filename, line))
+            (str(self.run_id), real_file, line))
+        # UX-1: basename fallback when full path doesn't match
+        if not rows:
+            basename = os.path.basename(filename)
+            match = db.fetchone(
+                "SELECT filename FROM executionframes"
+                " WHERE run_id = ? AND filename LIKE '%/' || ? LIMIT 1",
+                (str(self.run_id), basename))
+            if match:
+                rows = db.fetchdicts(
+                    "SELECT sequence_no, function_name FROM executionframes"
+                    " WHERE run_id = ? AND filename = ? AND line_no = ?"
+                    " AND frame_event = 'line'"
+                    " ORDER BY sequence_no LIMIT 1000",
+                    (str(self.run_id), match.filename, line))
         return [{"seq": r["sequence_no"], "function_name": r["function_name"]} for r in rows]
 
     def restart_frame(self, frame_seq: int) -> dict:
@@ -530,21 +576,61 @@ class Session:
             return self.current_stack
         return self._build_stack_at(seq)
 
+    def _get_merged_locals(self, frame) -> dict | None:
+        """Parse locals_snapshot, merging return-only frames with backward search.
+
+        Return-only frames (from Opt 2) contain just {"__return__": "<repr>"}.
+        This merges them with the nearest full locals snapshot from the same scope.
+        """
+        if not frame.locals_snapshot:
+            # Sampling gap — search backward
+            fallback = db.fetchone(
+                "SELECT * FROM executionframes"
+                " WHERE run_id = ? AND locals_snapshot IS NOT NULL"
+                " AND locals_snapshot != ''"
+                " AND call_depth = ? AND thread_id = ?"
+                " AND function_name = ? AND filename = ?"
+                " AND sequence_no <= ?"
+                " ORDER BY sequence_no DESC LIMIT 1",
+                (str(self.run_id), frame.call_depth, frame.thread_id,
+                 frame.function_name, frame.filename, frame.sequence_no))
+            if fallback is None or not fallback.locals_snapshot:
+                return None
+            frame = fallback
+        try:
+            locals_data = json.loads(frame.locals_snapshot)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        # Detect return-only snapshot: return frame with only __return__
+        if (frame.frame_event == 'return'
+                and set(locals_data.keys()) <= {'__return__'}):
+            fallback = db.fetchone(
+                "SELECT * FROM executionframes"
+                " WHERE run_id = ? AND locals_snapshot IS NOT NULL"
+                " AND locals_snapshot != ''"
+                " AND call_depth = ? AND thread_id = ?"
+                " AND function_name = ? AND filename = ?"
+                " AND sequence_no < ?"
+                " ORDER BY sequence_no DESC LIMIT 1",
+                (str(self.run_id), frame.call_depth, frame.thread_id,
+                 frame.function_name, frame.filename, frame.sequence_no))
+            if fallback and fallback.locals_snapshot:
+                try:
+                    full_locals = json.loads(fallback.locals_snapshot)
+                    full_locals.update(locals_data)  # __return__ wins
+                    locals_data = full_locals
+                except (json.JSONDecodeError, TypeError):
+                    pass
+        return locals_data
+
     def get_variables_at(self, seq: int) -> list[dict]:
         self._require_replay()
         frame = self._fetch_frame(seq)
-        if frame is None or not frame.locals_snapshot:
+        if frame is None:
             return []
-        try:
-            locals_data = json.loads(frame.locals_snapshot)
-        except (json.JSONDecodeError, TypeError) as e:
-            logger.warning("Failed to parse locals at seq %d: %s", seq, e)
-            return [{
-                "name": "<parse error>",
-                "value": f"Locals recorded but could not be deserialized: {e}",
-                "type": "error",
-                "variablesReference": 0,
-            }]
+        locals_data = self._get_merged_locals(frame)
+        if locals_data is None:
+            return []
         variables = []
         for name, value in locals_data.items():
             ref = 0
@@ -582,22 +668,122 @@ class Session:
 
     def _extract_children(self, seq: int, name: str) -> list[dict]:
         frame = self._fetch_frame(seq)
-        if frame is None or not frame.locals_snapshot:
+        if frame is None:
             return []
-        try:
-            locals_data = json.loads(frame.locals_snapshot)
-        except (json.JSONDecodeError, TypeError):
+        locals_data = self._get_merged_locals(frame)
+        if locals_data is None:
             return []
-        value = locals_data.get(name)
+        # Resolve the value at the path (supports dotted paths for nested access)
+        value = self._resolve_var_path(locals_data, name)
+        if value is None:
+            return []
+        return self._children_from_value(value, seq, name)
+
+    def _resolve_var_path(self, locals_data: dict, path: str):
+        """Walk a dotted path through locals/children to reach a nested value.
+
+        For top-level: "config" → locals_data["config"]
+        For nested: "config.'database'" → find child with key 'database' in config's __children__
+        """
+        parts = path.split('.', 1)
+        value = locals_data.get(parts[0])
+        if len(parts) == 1 or value is None:
+            return value
+        return self._descend_children(value, parts[1])
+
+    def _descend_children(self, value, remaining_path: str):
+        """Descend through __children__ arrays following the dotted path."""
+        if not isinstance(value, dict) or '__children__' not in value:
+            return None
+        parts = remaining_path.split('.', 1)
+        target_key = parts[0]
+        for child in value['__children__']:
+            if str(child.get('key', '')) == target_key:
+                child_val = child.get('value', '')
+                if len(parts) == 1:
+                    return child_val
+                # Need to go deeper — child_val might be a repr string
+                parsed = self._parse_child_value(child_val, child.get('type', ''))
+                if parsed is not None:
+                    return self._descend_children(parsed, parts[1])
+                return None
+        return None
+
+    def _parse_child_value(self, value, type_hint: str):
+        """Parse a child value (possibly a repr string) into a structured dict.
+
+        The C serializer only produces __children__ at the top level. Nested
+        containers are stored as repr strings. We parse them here to enable
+        multi-level expansion (U5).
+        """
+        if isinstance(value, dict) and '__children__' in value:
+            return value  # already structured
+        if isinstance(value, str) and type_hint in ('dict', 'list', 'tuple', 'set'):
+            import ast
+            try:
+                parsed = ast.literal_eval(value)
+            except (ValueError, SyntaxError):
+                return None
+            return self._python_to_structured(parsed)
+        return None
+
+    @staticmethod
+    def _python_to_structured(obj) -> dict | None:
+        """Convert a Python object (from ast.literal_eval) into a structured
+        dict with __type__, __repr__, __children__ — the same format the
+        C serializer produces for top-level variables."""
+        if isinstance(obj, dict):
+            children = []
+            for k, v in obj.items():
+                children.append({"key": repr(k), "value": repr(v), "type": type(v).__name__})
+            return {"__type__": "dict", "__len__": len(obj), "__repr__": repr(obj), "__children__": children}
+        if isinstance(obj, (list, tuple)):
+            children = []
+            for i, v in enumerate(obj):
+                children.append({"key": str(i), "value": repr(v), "type": type(v).__name__})
+            tname = "list" if isinstance(obj, list) else "tuple"
+            return {"__type__": tname, "__len__": len(obj), "__repr__": repr(obj), "__children__": children}
+        if isinstance(obj, set):
+            children = []
+            for v in sorted(obj, key=repr):
+                children.append({"key": repr(v), "value": repr(v), "type": type(v).__name__})
+            return {"__type__": "set", "__len__": len(obj), "__repr__": repr(obj), "__children__": children}
+        return None
+
+    def _children_from_value(self, value, seq: int, parent_path: str) -> list[dict]:
+        """Extract children from a value, assigning variablesReference to
+        nested containers so they can be expanded further."""
+        # If value is a repr string that might be a container, try parsing it
+        if isinstance(value, str):
+            # Try to parse as a container type
+            import ast
+            try:
+                parsed = ast.literal_eval(value)
+                structured = self._python_to_structured(parsed)
+                if structured:
+                    value = structured
+            except (ValueError, SyntaxError):
+                pass
         if not isinstance(value, dict) or '__children__' not in value:
             return []
         result = []
         for child in value['__children__']:
+            child_key = str(child.get('key', ''))
+            child_val = child.get('value', '')
+            child_type = child.get('type', 'str')
+            ref = 0
+            # U5: Check if this child can be expanded further
+            if child_type in ('dict', 'list', 'tuple', 'set', 'object'):
+                parsed = self._parse_child_value(child_val, child_type)
+                if parsed and parsed.get('__children__'):
+                    child_path = f"{parent_path}.{child_key}"
+                    ref = self._encode_var_ref(seq, child_path)
+            display_val = str(child_val)
             result.append({
-                "name": str(child.get('key', '')),
-                "value": str(child.get('value', '')),
-                "type": child.get('type', 'str'),
-                "variablesReference": 0,
+                "name": child_key,
+                "value": display_val,
+                "type": child_type,
+                "variablesReference": ref,
             })
         return result
 
@@ -612,14 +798,14 @@ class Session:
     def evaluate_at(self, seq: int, expression: str, context: str) -> dict:
         self._require_replay()
         frame = self._fetch_frame(seq)
-        if frame is None or not frame.locals_snapshot:
+        if frame is None:
             if context == "repl":
                 return {"result": "<no locals at current position>"}
             return {"result": "<not available>"}
-        try:
-            locals_data = json.loads(frame.locals_snapshot)
-        except (json.JSONDecodeError, TypeError) as e:
-            logger.warning("Failed to parse locals at seq %d: %s", seq, e)
+        locals_data = self._get_merged_locals(frame)
+        if locals_data is None:
+            if context == "repl":
+                return {"result": "<no locals at current position>"}
             return {"result": "<not available>"}
 
         # Fast path: simple variable lookup (all contexts including repl)
@@ -633,21 +819,72 @@ class Session:
             eval_locals[name] = _parse_repr_value(value)
 
         # Eval with restricted builtins (hover, watch, and repl)
+        _BLOCKED_NAMES = frozenset({
+            'open', 'exec', 'eval', 'compile', '__import__', 'globals',
+            'breakpoint', 'exit', 'quit', 'input', 'print', 'getattr',
+            'setattr', 'delattr',
+        })
         try:
             result = eval(expression, {"__builtins__": SAFE_BUILTINS}, eval_locals)
             return {"result": str(result), "type": type(result).__name__}
-        except Exception:
+        except SyntaxError:
+            # `import os` is a statement, not an expression — SyntaxError in eval
+            if 'import ' in expression:
+                msg = "Expression blocked: import statements are not allowed in evaluation context"
+            else:
+                msg = "Syntax error in expression"
             if context == "repl":
-                return {"result": f"Error: cannot evaluate '{expression}' against recorded locals"}
+                return {"result": f"Error: {msg}"}
+            return {"result": "<blocked>", "error": msg}
+        except NameError as e:
+            # Check if the missing name is a blocked builtin
+            missing = str(e).split("'")[1] if "'" in str(e) else ""
+            if missing in _BLOCKED_NAMES:
+                if context == "repl":
+                    return {"result": f"Error: '{missing}' is not available in evaluation context (restricted builtins)"}
+                return {"result": "<blocked>",
+                        "error": f"'{missing}' is not available in evaluation context"}
+            if context == "repl":
+                return {"result": f"Error: {e}"}
+            return {"result": "<not available>"}
+        except Exception as e:
+            if context == "repl":
+                return {"result": f"Error: cannot evaluate '{expression}': {type(e).__name__}: {e}"}
             return {"result": "<not available>"}
 
     def set_variable(self, var_name: str, new_value_expr: str) -> dict:
         """Modify a variable in the paused frame.
-        Only works when the recording is paused (live frame accessible)."""
+        Only works when the recording is paused (live frame accessible).
+
+        The mutation always lands on the live paused frame, but the
+        returned ``oldValue`` is read from the currently-navigated historical
+        frame (``current_frame_seq``) so it matches what the user sees in
+        the debugger UI. This keeps set_variable consistent with evaluate()
+        when stepping back through history from the pause point.
+        """
         import pyttd_native
+
+        # Read old value from the currently-navigated historical frame
+        # BEFORE the mutation lands on the live frame. Falls through to
+        # the C-reported live-frame value if no history is available.
+        historical_old = None
+        try:
+            if self.state == "replay" and self.current_frame_seq is not None:
+                frame = self._fetch_frame(self.current_frame_seq)
+                if frame is not None:
+                    locals_data = self._get_merged_locals(frame)
+                    if locals_data and var_name in locals_data:
+                        historical_old = _format_value(locals_data[var_name])
+        except Exception:
+            historical_old = None
+
         try:
             result = pyttd_native.set_variable(var_name, new_value_expr)
-            return result if result else {"error": "set_variable returned None"}
+            if not result:
+                return {"error": "set_variable returned None"}
+            if historical_old is not None:
+                result["oldValue"] = historical_old
+            return result
         except RuntimeError as e:
             return {"error": str(e)}
         except Exception as e:
@@ -898,8 +1135,31 @@ class Session:
                         " WHERE run_id = ? AND filename = ? LIMIT 1",
                         (str(self.run_id), real_file)) is not None
                     if not file_exists:
-                        verified = False
-                        message = f"File not in recording: {os.path.basename(file)}"
+                        # UX-1: Try basename fallback — clients may send
+                        # relative paths that don't match the absolute path
+                        # stored in the recording.
+                        basename = os.path.basename(file)
+                        match = db.fetchone(
+                            "SELECT filename FROM executionframes"
+                            " WHERE run_id = ? AND filename LIKE '%/' || ?"
+                            " LIMIT 1",
+                            (str(self.run_id), basename))
+                        if match:
+                            # Rewrite bp to use the matched full path
+                            real_file = match.filename
+                            bp['file'] = real_file
+                            # Re-check line existence with resolved path
+                            exists = db.fetchone(
+                                "SELECT 1 FROM executionframes"
+                                " WHERE run_id = ? AND filename = ? AND line_no = ?"
+                                " AND frame_event = 'line' LIMIT 1",
+                                (str(self.run_id), real_file, line)) is not None
+                            if not exists:
+                                verified = False
+                                message = f"Line {line} was not executed in the recording"
+                        else:
+                            verified = False
+                            message = f"File not in recording: {basename}"
                     else:
                         verified = False
                         message = f"Line {line} was not executed in the recording"
@@ -1234,9 +1494,11 @@ class Session:
             search_before = hit.sequence_no
 
     def _find_next_call_forward(self, name: str, current_seq: int) -> int | None:
-        """Find the next function call matching name after current_seq, snapped to a line.
+        """Find the next function call matching name after current_seq.
 
-        Handles the snap-to-line aliasing problem for call events.
+        Returns the first line event AFTER the call (inside the function body),
+        not the call site. This ensures function breakpoints land inside the
+        function definition rather than at the calling line.
         """
         search_after = current_seq
         while True:
@@ -1249,9 +1511,15 @@ class Session:
                 (str(self.run_id), name, search_after))
             if not hit:
                 return None
-            snap = self._snap_to_line(hit.sequence_no)
-            if snap > current_seq:
-                return snap
+            # Snap FORWARD to the first line event inside the function body
+            line_after = db.fetchone(
+                "SELECT sequence_no FROM executionframes"
+                " WHERE run_id = ? AND frame_event = 'line'"
+                " AND sequence_no > ?"
+                " ORDER BY sequence_no LIMIT 1",
+                (str(self.run_id), hit.sequence_no))
+            if line_after and line_after.sequence_no > current_seq:
+                return line_after.sequence_no
             search_after = hit.sequence_no
 
     def _find_next_call_reverse(self, name: str, current_seq: int) -> int | None:
@@ -1288,6 +1556,7 @@ class Session:
                     "file": frame.filename,
                     "line": frame.line_no,
                     "function_name": frame.function_name,
+                    "call_depth": frame.call_depth,
                     "thread_id": frame.thread_id,
                 }
         return {"seq": self.current_frame_seq}
@@ -1315,6 +1584,7 @@ class Session:
                 "file": frame.filename,
                 "line": frame.line_no,
                 "function_name": frame.function_name,
+                "call_depth": frame.call_depth,
                 "thread_id": frame.thread_id,
                 "reason": reason,
             }

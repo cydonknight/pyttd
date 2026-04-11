@@ -45,7 +45,8 @@ def test_warm_goto_frame_not_found(record_func):
     controller = ReplayController()
     result = controller.warm_goto_frame(run_id, 999999)
     assert 'error' in result
-    assert result['error'] == 'frame_not_found'
+    assert 'not found' in result['error']
+    assert result['target_seq'] == 999999
 
 
 def test_warm_goto_frame_return_event(record_func):

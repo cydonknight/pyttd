@@ -2,7 +2,7 @@
   "name": "pyttd",
   "displayName": "pyttd - Python Time-Travel Debugger",
   "description": "Time-travel debugger for Python with record, replay, and visual timeline",
-  "version": "0.3.0",
+  "version": "0.8.0",
   "publisher": "pyttd",
   "engines": {
     "vscode": "^1.85.0"

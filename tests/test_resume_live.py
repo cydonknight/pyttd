@@ -57,7 +57,7 @@ print("PASS")
         output = _run_test('''
 import pyttd_native
 try:
-    pyttd_native.resume_live(100)
+    pyttd_native.resume_live(100, "deadbeef" * 4)
     print("FAIL: should have raised")
 except RuntimeError as e:
     assert "No usable checkpoint" in str(e)
@@ -188,12 +188,14 @@ if checkpoint_count == 0:
 
 # Try resume_live at a target within the recording
 target = frame_count // 2
+import uuid as _uuid
+test_run_id = _uuid.uuid4().hex
 try:
-    result = pyttd_native.resume_live(target)
+    result = pyttd_native.resume_live(target, test_run_id)
     print(f"resume_live result: {{result}}")
     # The child should have sent back a live result
     assert result.get("status") == "live", f"Expected live status, got {{result}}"
-    assert "new_run_id" in result
+    assert result.get("new_run_id") == test_run_id, f"Expected run_id {{test_run_id}}, got {{result.get('new_run_id')}}"
     print("PASS")
 except RuntimeError as e:
     # If the child died during fast-forward, that's an expected failure mode
