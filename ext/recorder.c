@@ -72,6 +72,11 @@ static double g_start_time = 0.0;
 static double g_stop_time = 0.0;
 static RingbufStats g_saved_rb_stats = {0, 0};
 PYTTD_THREAD_LOCAL int g_inside_repr = 0;
+/* Most recent raise-site line observed by the trace function on this thread.
+ * Updated in PyTrace_EXCEPTION; consumed by the eval hook when emitting an
+ * exception_unwind event so the recorded line_no is the actual raise site
+ * rather than the frame entry line. -1 means "not set". */
+PYTTD_THREAD_LOCAL int g_last_exception_line = -1;
 
 /* Perf: per-thread code object cache — avoids PyFrame_GetCode + UTF-8 extraction on cache hit */
 PYTTD_THREAD_LOCAL PyFrameObject *g_cached_frame = NULL;
@@ -129,6 +134,25 @@ PyThreadState *g_saved_tstate = NULL;
 
 /* ---- Stats ---- */
 static _Atomic uint64_t g_flush_count = 0;
+/* Issue 5: count of times a checkpoint trigger fired but was skipped because
+ * multiple threads were active at the time (fork is unsafe in that case).
+ * Surfaced via get_recording_stats() so the CLI can warn users that cold
+ * navigation will be limited for this run. */
+static _Atomic uint64_t g_checkpoints_skipped_threads = 0;
+
+/* Issue 6: tracking for attach-mode checkpoints. When attach_mode is set,
+ * synthesize_existing_stack() emits N synthetic call events at depths
+ * matching the existing interpreter stack. A fork() before any "real"
+ * frame has been recorded would have nothing useful to fast-forward into,
+ * so checkpoints are gated until the sequence counter passes
+ * g_attach_real_frames_start (which is the value of g_sequence_counter
+ * just after synthesize_existing_stack() returns). g_attach_mode_active is
+ * set in start_recording() and read by the checkpoint trigger blocks. */
+static int g_attach_mode_active = 0;
+static _Atomic uint64_t g_attach_real_frames_start = 0;
+/* Warmup window after the synthesized prefix before checkpoints are
+ * allowed. Avoids forking immediately on the first real frame. */
+#define PYTTD_ATTACH_CHECKPOINT_WARMUP 10
 
 /* ---- Ignore Filter ---- */
 typedef struct {
@@ -698,13 +722,35 @@ static int serialize_expandable_value(PyObject *value, char *buf, size_t buf_siz
         type_name = "object";
     }
 
+    /* Pre-scan: check if this container has any secret-named keys.
+     * If so, use a scrubbed repr instead of the raw one to prevent
+     * secret values from leaking through the container's repr string. */
+    int has_secret_keys = 0;
+    if (g_secret_filter.count > 0 && PyDict_Check(value)) {
+        PyObject *dk, *dv;
+        Py_ssize_t dpos = 0;
+        while (PyDict_Next(value, &dpos, &dk, &dv)) {
+            const char *dks = PyUnicode_AsUTF8(dk);
+            if (dks && should_redact(dks)) { has_secret_keys = 1; break; }
+        }
+    }
+
     /* Get repr */
-    g_inside_repr = 1;
-    PyObject *repr = PyObject_Repr(value);
-    g_inside_repr = 0;
-    if (!repr) { PyErr_Clear(); return 0; }
-    const char *repr_str = PyUnicode_AsUTF8(repr);
-    if (!repr_str) { Py_DECREF(repr); PyErr_Clear(); return 0; }
+    const char *repr_str;
+    PyObject *repr = NULL;
+    char scrubbed_repr[128];
+    if (has_secret_keys) {
+        snprintf(scrubbed_repr, sizeof(scrubbed_repr),
+                 "{...%zd items, secrets redacted...}", length);
+        repr_str = scrubbed_repr;
+    } else {
+        g_inside_repr = 1;
+        repr = PyObject_Repr(value);
+        g_inside_repr = 0;
+        if (!repr) { PyErr_Clear(); return 0; }
+        repr_str = PyUnicode_AsUTF8(repr);
+        if (!repr_str) { Py_DECREF(repr); PyErr_Clear(); return 0; }
+    }
 
     char repr_truncated[MAX_REPR_LENGTH + 4];
     size_t repr_len = strlen(repr_str);
@@ -716,17 +762,17 @@ static int serialize_expandable_value(PyObject *value, char *buf, size_t buf_siz
 
     /* Write: {"__type__":"<type>","__len__":<N>,"__repr__":"<repr>","__children__":[ */
     size_t needed = 80 + repr_len;
-    if (*pos + needed >= buf_size) { Py_DECREF(repr); return 0; }
+    if (*pos + needed >= buf_size) { Py_XDECREF(repr); return 0; }
 
     int n = snprintf(buf + *pos, buf_size - *pos,
                      "{\"__type__\": \"%s\", \"__len__\": %zd, \"__repr__\": \"",
                      type_name, length);
-    if (n < 0 || (size_t)n >= buf_size - *pos) { Py_DECREF(repr); return 0; }
+    if (n < 0 || (size_t)n >= buf_size - *pos) { Py_XDECREF(repr); return 0; }
     *pos += n;
 
-    if (*pos + 30 >= buf_size) { Py_DECREF(repr); return 0; }
+    if (*pos + 30 >= buf_size) { Py_XDECREF(repr); return 0; }
     int esc_len = json_escape_string(repr_str, buf + *pos, buf_size - *pos - 30);
-    Py_DECREF(repr);
+    Py_XDECREF(repr);
     if (esc_len < 0) return 0;
     *pos += esc_len;
 
@@ -738,6 +784,7 @@ static int serialize_expandable_value(PyObject *value, char *buf, size_t buf_siz
     int child_count = 0;
     int child_first = 1;
 
+    int container_had_redaction = 0;
     if (PyDict_Check(value)) {
         PyObject *key, *val;
         Py_ssize_t dict_pos = 0;
@@ -750,6 +797,13 @@ static int serialize_expandable_value(PyObject *value, char *buf, size_t buf_siz
                 Py_XDECREF(krepr); Py_XDECREF(vrepr);
                 continue;
             }
+            /* Redact dict values whose key matches a secret pattern */
+            int child_redacted = 0;
+            if (g_secret_filter.count > 0 && should_redact(ks)) {
+                vs = "<redacted>";
+                container_had_redaction = 1;
+                child_redacted = 1;
+            }
             if (!child_first) {
                 if (*pos + 2 >= buf_size) { Py_XDECREF(krepr); Py_XDECREF(vrepr); break; }
                 buf[(*pos)++] = ',';
@@ -757,7 +811,7 @@ static int serialize_expandable_value(PyObject *value, char *buf, size_t buf_siz
             }
             child_first = 0;
             /* {"key":"k","value":"v","type":"t"} */
-            const char *vtype = val->ob_type->tp_name;
+            const char *vtype = child_redacted ? "str" : val->ob_type->tp_name;
             if (*pos + 50 >= buf_size) { Py_XDECREF(krepr); Py_XDECREF(vrepr); break; }
             memcpy(buf + *pos, "{\"key\": \"", 9); *pos += 9;
             esc_len = json_escape_string(ks, buf + *pos, buf_size - *pos - 40);
@@ -804,10 +858,18 @@ static int serialize_expandable_value(PyObject *value, char *buf, size_t buf_siz
             }
             child_first = 0;
             const char *itype = item->ob_type->tp_name;
+            /* Redact NamedTuple fields whose name matches a secret pattern */
+            int nt_redacted = 0;
             /* Use field name for NamedTuples, numeric index otherwise */
             if (is_namedtuple && i < PyTuple_GET_SIZE(fields)) {
                 const char *fname = PyUnicode_AsUTF8(PyTuple_GET_ITEM(fields, i));
                 if (fname) {
+                    if (g_secret_filter.count > 0 && should_redact(fname)) {
+                        is = "<redacted>";
+                        itype = "str";
+                        container_had_redaction = 1;
+                        nt_redacted = 1;
+                    }
                     if (*pos + 50 >= buf_size) { Py_XDECREF(irepr); break; }
                     memcpy(buf + *pos, "{\"key\": \"", 9); *pos += 9;
                     esc_len = json_escape_string(fname, buf + *pos, buf_size - *pos - 40);
@@ -1486,11 +1548,19 @@ int pyttd_trace_func(PyObject *obj, PyFrameObject *frame, int what, PyObject *ar
         /* Checkpoint trigger on line events (not just call events in eval hook).
          * With internal frames filtered, call events are too infrequent. */
 #ifdef PYTTD_HAS_FORK
+        /* Issue 6: in attach mode, refuse to fork until the synthesized
+         * stack prefix is past us plus a small warmup, so the child has
+         * a real interpreter state to fast-forward into. */
+        uint64_t attach_floor = g_attach_mode_active
+            ? atomic_load_explicit(&g_attach_real_frames_start, memory_order_relaxed)
+              + PYTTD_ATTACH_CHECKPOINT_WARMUP
+            : 0;
         if (g_checkpoint_interval > 0 &&
             g_checkpoint_callback != NULL &&
             !g_in_checkpoint &&
             !atomic_load_explicit(&g_stop_requested, memory_order_relaxed) &&
             event.sequence_no > 0 &&
+            event.sequence_no >= attach_floor &&
             (event.sequence_no - atomic_load_explicit(&g_last_checkpoint_seq, memory_order_relaxed))
                 >= (uint64_t)g_checkpoint_interval) {
             /* Skip checkpoint if non-main threads have been observed */
@@ -1499,6 +1569,12 @@ int pyttd_trace_func(PyObject *obj, PyFrameObject *frame, int what, PyObject *ar
             g_in_checkpoint = 1;
             checkpoint_do_fork(event.sequence_no, g_checkpoint_callback);
             g_in_checkpoint = 0;
+            } else {
+                /* Issue 5: record that the multi-thread guard prevented a
+                 * checkpoint, and treat the trigger as "fired" so we don't
+                 * spam the counter every line event after the first miss. */
+                atomic_fetch_add_explicit(&g_checkpoints_skipped_threads, 1, memory_order_relaxed);
+                atomic_store_explicit(&g_last_checkpoint_seq, event.sequence_no, memory_order_relaxed);
             }
         }
 #endif
@@ -1611,6 +1687,11 @@ int pyttd_trace_func(PyObject *obj, PyFrameObject *frame, int what, PyObject *ar
             exc_is_coro = (exc_code->co_flags & PYTTD_CORO_FLAGS) ? 1 : 0;
         }
         int line_no = PyFrame_GetLineNumber(frame);
+        /* Issue 3: stash the raise-site line so the eval hook can use it
+         * when emitting exception_unwind. PyTrace_EXCEPTION fires on every
+         * frame the exception passes through, so the most-recent value here
+         * is the right line for the about-to-unwind frame. */
+        g_last_exception_line = line_no;
 
         PyObject *exc_value = NULL;
         if (arg && PyTuple_Check(arg) && PyTuple_GET_SIZE(arg) >= 2) {
@@ -1825,6 +1906,11 @@ static PyObject *pyttd_eval_hook(PyThreadState *tstate,
     g_call_depth++;
     int line_no = PyUnstable_InterpreterFrame_GetLine(iframe);
     int is_coro = (code->co_flags & PYTTD_CORO_FLAGS) ? 1 : 0;
+    /* Issue 3: clear stale raise-site line before entering a new frame.
+     * Defensive — the trace function should always set this fresh before
+     * the eval hook reads it on unwind, but reset just in case a
+     * PyTrace_EXCEPTION dispatch was missed for the previous frame. */
+    g_last_exception_line = -1;
 
     /* Item 5: Always fresh timestamp on CALL (new frame) */
     g_cached_timestamp = get_monotonic_time() - g_start_time;
@@ -1852,11 +1938,18 @@ static PyObject *pyttd_eval_hook(PyThreadState *tstate,
 
     /* Phase 2: Checkpoint trigger (delta-based, guarded against recursion) */
 #ifdef PYTTD_HAS_FORK
+    /* Issue 6: see matching block in pyttd_trace_func — refuse to fork
+     * within the synthesized prefix in attach mode. */
+    uint64_t attach_floor_call = g_attach_mode_active
+        ? atomic_load_explicit(&g_attach_real_frames_start, memory_order_relaxed)
+          + PYTTD_ATTACH_CHECKPOINT_WARMUP
+        : 0;
     if (g_checkpoint_interval > 0 &&
         g_checkpoint_callback != NULL &&
         !g_in_checkpoint &&
         !atomic_load_explicit(&g_stop_requested, memory_order_relaxed) &&
         call_event.sequence_no > 0 &&
+        call_event.sequence_no >= attach_floor_call &&
         (call_event.sequence_no - atomic_load_explicit(&g_last_checkpoint_seq, memory_order_relaxed))
             >= (uint64_t)g_checkpoint_interval) {
         /* Skip checkpoint if non-main threads have been observed */
@@ -1865,6 +1958,12 @@ static PyObject *pyttd_eval_hook(PyThreadState *tstate,
         g_in_checkpoint = 1;
         checkpoint_do_fork(call_event.sequence_no, g_checkpoint_callback);
         g_in_checkpoint = 0;
+        } else {
+            /* Issue 5: see matching block in pyttd_trace_func — record the
+             * skip and bump g_last_checkpoint_seq so we don't burn CPU on
+             * every subsequent line event in the same delta window. */
+            atomic_fetch_add_explicit(&g_checkpoints_skipped_threads, 1, memory_order_relaxed);
+            atomic_store_explicit(&g_last_checkpoint_seq, call_event.sequence_no, memory_order_relaxed);
         }
     }
 #endif
@@ -1886,9 +1985,13 @@ static PyObject *pyttd_eval_hook(PyThreadState *tstate,
 
     /* Check for exception_unwind (eval returned NULL with exception) */
     if (result == NULL && PyErr_Occurred()) {
+        /* Issue 3: prefer the raise-site line stashed by the trace function's
+         * PyTrace_EXCEPTION handler. Falls back to the frame entry line only
+         * if no raise-site line was observed (e.g. trace was suppressed). */
+        int unwind_line = (g_last_exception_line > 0) ? g_last_exception_line : line_no;
         FrameEvent unwind_event;
         unwind_event.sequence_no = atomic_fetch_add_explicit(&g_sequence_counter, 1, memory_order_relaxed);
-        unwind_event.line_no = line_no;
+        unwind_event.line_no = unwind_line;
         unwind_event.call_depth = g_call_depth;
         unwind_event.thread_id = g_my_thread_id;
         unwind_event.timestamp = get_monotonic_time() - g_start_time;  /* always fresh on exception_unwind */
@@ -2169,7 +2272,7 @@ void *flush_thread_func(void *arg) {
 
 #define MAX_SYNTH_DEPTH 256
 
-static void synthesize_existing_stack(void) {
+void synthesize_existing_stack(void) {
     PyFrameObject *current = PyEval_GetFrame();
     if (!current) return;
     /* Hold an extra ref to keep the current frame alive during the stack
@@ -2327,6 +2430,7 @@ PyObject *pyttd_start_recording(PyObject *self, PyObject *args, PyObject *kwargs
     g_stop_time = 0.0;
     g_saved_rb_stats = (RingbufStats){0, 0};
     g_inside_repr = 0;
+    g_last_exception_line = -1;
     g_cached_frame = NULL;
     Py_XDECREF(g_cached_code); g_cached_code = NULL;
     g_cached_filename = NULL;
@@ -2345,6 +2449,9 @@ PyObject *pyttd_start_recording(PyObject *self, PyObject *args, PyObject *kwargs
     g_max_frames = 0;
     g_trace_installed_externally = 0;
     atomic_store_explicit(&g_last_checkpoint_seq, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_checkpoints_skipped_threads, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_attach_real_frames_start, 0, memory_order_relaxed);
+    g_attach_mode_active = 0;
     g_in_checkpoint = 0;
     g_cmd_fd = -1;
     g_result_fd = -1;
@@ -2438,11 +2545,15 @@ PyObject *pyttd_start_recording(PyObject *self, PyObject *args, PyObject *kwargs
         install_io_hooks_internal(io_flush_cb, io_replay_loader);
     }
 
-    /* Attach mode: force-disable checkpoints (unsafe with unknown process state) */
+    /* Issue 6: Attach-mode checkpoint policy is now driven by the caller.
+     * If checkpoint_interval == 0 (the default for arm()), no callback is
+     * registered above and no checkpoints fire. Callers that explicitly
+     * opt in (arm(checkpoints=True)) pass a non-zero interval and accept
+     * the additional risk of forking from a process whose pre-arm state
+     * is unknown to pyttd. The C-side gate g_attach_real_frames_start
+     * still prevents forking until the synthesized prefix is past us. */
     if (attach_mode) {
-        g_checkpoint_interval = 0;
-        Py_XDECREF(g_checkpoint_callback);
-        g_checkpoint_callback = NULL;
+        g_attach_mode_active = 1;
     }
 
     /* Save original eval function and install our hook */
@@ -2454,6 +2565,12 @@ PyObject *pyttd_start_recording(PyObject *self, PyObject *args, PyObject *kwargs
      * BEFORE installing the eval hook */
     if (attach_mode) {
         synthesize_existing_stack();
+        /* Issue 6: stamp the boundary between the synthesized prefix and
+         * the first "real" frame the eval hook will see. Checkpoints
+         * gated below this seq + warmup are skipped. */
+        atomic_store_explicit(&g_attach_real_frames_start,
+                              atomic_load_explicit(&g_sequence_counter, memory_order_relaxed),
+                              memory_order_relaxed);
     }
 
     PYTTD_SET_EVAL_FUNC(interp, pyttd_eval_hook);
@@ -2524,6 +2641,7 @@ PyObject *pyttd_stop_recording(PyObject *self, PyObject *Py_UNUSED(args)) {
     Py_XDECREF(g_cached_code); g_cached_code = NULL;
     g_cached_filename = NULL;
     g_cached_funcname = NULL;
+    g_last_exception_line = -1;
     atomic_store_explicit(&g_stop_requested, 0, memory_order_relaxed);
 
     /* Clear recording environment variable */
@@ -2639,6 +2757,24 @@ PyObject *pyttd_get_recording_stats(PyObject *self, PyObject *Py_UNUSED(args)) {
     }
     Py_XDECREF(cp_count);
     Py_XDECREF(cp_mem);
+
+    /* Issue 5: surface multi-thread checkpoint skip count so the CLI/UI can
+     * warn that cold navigation is limited for this run. */
+    PyObject *cp_skipped = PyLong_FromUnsignedLongLong(
+        atomic_load_explicit(&g_checkpoints_skipped_threads, memory_order_relaxed));
+    if (cp_skipped) {
+        PyDict_SetItemString(dict, "checkpoints_skipped_threads", cp_skipped);
+        Py_DECREF(cp_skipped);
+    }
+
+    /* Issue 6: surface the synthesized-stack boundary so attach-mode runs
+     * can persist it and the replay layer can refuse cold jumps before it. */
+    PyObject *attach_seq = PyLong_FromUnsignedLongLong(
+        atomic_load_explicit(&g_attach_real_frames_start, memory_order_relaxed));
+    if (attach_seq) {
+        PyDict_SetItemString(dict, "attach_safe_seq", attach_seq);
+        Py_DECREF(attach_seq);
+    }
 
     return dict;
 }

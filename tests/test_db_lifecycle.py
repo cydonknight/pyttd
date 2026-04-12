@@ -398,7 +398,8 @@ class TestCLIIntegration:
         from pyttd.cli import _cmd_query
         _cmd_query(args)
         captured = capsys.readouterr()
-        assert str(run_ids[1]) in captured.out
+        # Banner goes to stderr (#9 fix: always on stderr for pipeable stdout)
+        assert str(run_ids[1]) in captured.err
         db.init(None)
 
     def test_clean_keep(self, multi_run_db, capsys):

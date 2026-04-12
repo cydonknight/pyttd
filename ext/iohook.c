@@ -6,6 +6,14 @@
 #include "iohook.h"
 #include "recorder.h"
 
+/* #10: Sentinel returned by io_replay_next() when the replay cursor is
+ * exhausted. Hooked functions check for this and fall through to the
+ * live function so the first overshoot call returns a real value instead
+ * of Py_None. NOT a valid Python object — must never be passed to
+ * Py_DECREF or returned to Python. */
+static PyObject _io_replay_fallthrough_sentinel;
+#define PYTTD_REPLAY_FALLTHROUGH (&_io_replay_fallthrough_sentinel)
+
 /* ---- Globals ---- */
 
 static int g_io_replay_mode = 0;
@@ -408,19 +416,16 @@ static PyObject *io_replay_next(const char *function_name) {
     }
 
     if (g_io_replay_cursor >= PyList_GET_SIZE(g_io_replay_list)) {
-        /* More I/O calls than recorded — auto-exit replay mode so subsequent
-         * hook invocations execute the real function. This normally means
-         * we're running past a RESUME_LIVE target (the replay list only
-         * covers the pre-target window). The current call still returns
-         * None (the caller already committed to a replay path); future
-         * calls are live. Silent — emitting a RuntimeWarning here was
-         * noisy and misleading in the continue_from_past flow. */
+        /* #10: Replay cursor exhausted — exit replay mode and return the
+         * fallthrough sentinel so the hooked function calls the live
+         * original instead of returning Py_None (which crashes callers
+         * that use the result, e.g. uuid.uuid4().hex). */
         g_io_replay_mode = 0;
         Py_XDECREF(g_io_replay_list);
         g_io_replay_list = NULL;
         g_io_replay_cursor = 0;
         (void)function_name;
-        Py_RETURN_NONE;
+        return PYTTD_REPLAY_FALLTHROUGH;
     }
 
     PyObject *entry = PyList_GET_ITEM(g_io_replay_list, g_io_replay_cursor);
@@ -462,7 +467,10 @@ static PyObject *io_replay_next(const char *function_name) {
 
 static PyObject *hooked_time_time(PyObject *self, PyObject *args, PyObject *kwargs) {
     (void)self;
-    if (g_io_replay_mode) return io_replay_next("time.time");
+    if (g_io_replay_mode) {
+        PyObject *r = io_replay_next("time.time");
+        if (r != PYTTD_REPLAY_FALLTHROUGH) return r;
+    }
     PyObject *result = PyObject_Call(g_orig_time_time, args, kwargs);
     if (result == NULL) return NULL;
     io_log_event("time.time", result);
@@ -471,7 +479,10 @@ static PyObject *hooked_time_time(PyObject *self, PyObject *args, PyObject *kwar
 
 static PyObject *hooked_time_monotonic(PyObject *self, PyObject *args, PyObject *kwargs) {
     (void)self;
-    if (g_io_replay_mode) return io_replay_next("time.monotonic");
+    if (g_io_replay_mode) {
+        PyObject *r = io_replay_next("time.monotonic");
+        if (r != PYTTD_REPLAY_FALLTHROUGH) return r;
+    }
     PyObject *result = PyObject_Call(g_orig_time_monotonic, args, kwargs);
     if (result == NULL) return NULL;
     io_log_event("time.monotonic", result);
@@ -480,7 +491,10 @@ static PyObject *hooked_time_monotonic(PyObject *self, PyObject *args, PyObject 
 
 static PyObject *hooked_time_perf_counter(PyObject *self, PyObject *args, PyObject *kwargs) {
     (void)self;
-    if (g_io_replay_mode) return io_replay_next("time.perf_counter");
+    if (g_io_replay_mode) {
+        PyObject *r = io_replay_next("time.perf_counter");
+        if (r != PYTTD_REPLAY_FALLTHROUGH) return r;
+    }
     PyObject *result = PyObject_Call(g_orig_time_perf_counter, args, kwargs);
     if (result == NULL) return NULL;
     io_log_event("time.perf_counter", result);
@@ -489,7 +503,10 @@ static PyObject *hooked_time_perf_counter(PyObject *self, PyObject *args, PyObje
 
 static PyObject *hooked_random_random(PyObject *self, PyObject *args, PyObject *kwargs) {
     (void)self;
-    if (g_io_replay_mode) return io_replay_next("random.random");
+    if (g_io_replay_mode) {
+        PyObject *r = io_replay_next("random.random");
+        if (r != PYTTD_REPLAY_FALLTHROUGH) return r;
+    }
     PyObject *result = PyObject_Call(g_orig_random_random, args, kwargs);
     if (result == NULL) return NULL;
     io_log_event("random.random", result);
@@ -498,7 +515,10 @@ static PyObject *hooked_random_random(PyObject *self, PyObject *args, PyObject *
 
 static PyObject *hooked_random_randint(PyObject *self, PyObject *args, PyObject *kwargs) {
     (void)self;
-    if (g_io_replay_mode) return io_replay_next("random.randint");
+    if (g_io_replay_mode) {
+        PyObject *r = io_replay_next("random.randint");
+        if (r != PYTTD_REPLAY_FALLTHROUGH) return r;
+    }
     PyObject *result = PyObject_Call(g_orig_random_randint, args, kwargs);
     if (result == NULL) return NULL;
     io_log_event("random.randint", result);
@@ -507,7 +527,10 @@ static PyObject *hooked_random_randint(PyObject *self, PyObject *args, PyObject 
 
 static PyObject *hooked_os_urandom(PyObject *self, PyObject *args, PyObject *kwargs) {
     (void)self;
-    if (g_io_replay_mode) return io_replay_next("os.urandom");
+    if (g_io_replay_mode) {
+        PyObject *r = io_replay_next("os.urandom");
+        if (r != PYTTD_REPLAY_FALLTHROUGH) return r;
+    }
     PyObject *result = PyObject_Call(g_orig_os_urandom, args, kwargs);
     if (result == NULL) return NULL;
     io_log_event("os.urandom", result);
@@ -519,10 +542,12 @@ static PyObject *hooked_os_urandom(PyObject *self, PyObject *args, PyObject *kwa
 static PyObject *hooked_time_sleep(PyObject *self, PyObject *args, PyObject *kwargs) {
     (void)self;
     if (g_io_replay_mode) {
-        /* Consume the replay event but skip sleeping */
-        PyObject *dummy = io_replay_next("time.sleep");
-        Py_XDECREF(dummy);
-        Py_RETURN_NONE;
+        PyObject *r = io_replay_next("time.sleep");
+        if (r != PYTTD_REPLAY_FALLTHROUGH) {
+            Py_XDECREF(r);
+            Py_RETURN_NONE;
+        }
+        /* fallthrough: replay exhausted, call real sleep */
     }
     /* Get the duration argument for logging before calling original */
     PyObject *duration = NULL;
@@ -551,7 +576,10 @@ static PyObject *hooked_time_sleep(PyObject *self, PyObject *args, PyObject *kwa
 
 static PyObject *hooked_random_uniform(PyObject *self, PyObject *args, PyObject *kwargs) {
     (void)self;
-    if (g_io_replay_mode) return io_replay_next("random.uniform");
+    if (g_io_replay_mode) {
+        PyObject *r = io_replay_next("random.uniform");
+        if (r != PYTTD_REPLAY_FALLTHROUGH) return r;
+    }
     PyObject *result = PyObject_Call(g_orig_random_uniform, args, kwargs);
     if (result == NULL) return NULL;
     io_log_event("random.uniform", result);
@@ -560,7 +588,10 @@ static PyObject *hooked_random_uniform(PyObject *self, PyObject *args, PyObject 
 
 static PyObject *hooked_random_gauss(PyObject *self, PyObject *args, PyObject *kwargs) {
     (void)self;
-    if (g_io_replay_mode) return io_replay_next("random.gauss");
+    if (g_io_replay_mode) {
+        PyObject *r = io_replay_next("random.gauss");
+        if (r != PYTTD_REPLAY_FALLTHROUGH) return r;
+    }
     PyObject *result = PyObject_Call(g_orig_random_gauss, args, kwargs);
     if (result == NULL) return NULL;
     io_log_event("random.gauss", result);
@@ -571,7 +602,10 @@ static PyObject *hooked_random_gauss(PyObject *self, PyObject *args, PyObject *k
 
 static PyObject *hooked_random_choice(PyObject *self, PyObject *args, PyObject *kwargs) {
     (void)self;
-    if (g_io_replay_mode) return io_replay_next("random.choice");
+    if (g_io_replay_mode) {
+        PyObject *r = io_replay_next("random.choice");
+        if (r != PYTTD_REPLAY_FALLTHROUGH) return r;
+    }
     PyObject *result = PyObject_Call(g_orig_random_choice, args, kwargs);
     if (result == NULL) return NULL;
     PyObject *serialized = serialize_pickle(result);
@@ -586,7 +620,10 @@ static PyObject *hooked_random_choice(PyObject *self, PyObject *args, PyObject *
 
 static PyObject *hooked_random_sample(PyObject *self, PyObject *args, PyObject *kwargs) {
     (void)self;
-    if (g_io_replay_mode) return io_replay_next("random.sample");
+    if (g_io_replay_mode) {
+        PyObject *r = io_replay_next("random.sample");
+        if (r != PYTTD_REPLAY_FALLTHROUGH) return r;
+    }
     PyObject *result = PyObject_Call(g_orig_random_sample, args, kwargs);
     if (result == NULL) return NULL;
     PyObject *serialized = serialize_pickle(result);
@@ -602,25 +639,27 @@ static PyObject *hooked_random_sample(PyObject *self, PyObject *args, PyObject *
 static PyObject *hooked_random_shuffle(PyObject *self, PyObject *args, PyObject *kwargs) {
     (void)self;
     if (g_io_replay_mode) {
-        /* Get the list argument */
-        PyObject *x = NULL;
-        if (PyTuple_GET_SIZE(args) > 0) {
-            x = PyTuple_GET_ITEM(args, 0);
-        }
-        /* Deserialize the recorded shuffled list */
-        PyObject *shuffled = io_replay_next("random.shuffle");
-        if (!shuffled || shuffled == Py_None) {
-            Py_XDECREF(shuffled);
+        PyObject *r = io_replay_next("random.shuffle");
+        if (r != PYTTD_REPLAY_FALLTHROUGH) {
+            /* Get the list argument */
+            PyObject *x = NULL;
+            if (PyTuple_GET_SIZE(args) > 0) {
+                x = PyTuple_GET_ITEM(args, 0);
+            }
+            /* Deserialize the recorded shuffled list */
+            if (!r || r == Py_None) {
+                Py_XDECREF(r);
+                Py_RETURN_NONE;
+            }
+            /* Copy elements into x in-place: x[:] = shuffled */
+            if (x && PyList_Check(x) && PyList_Check(r)) {
+                if (PySequence_SetSlice(x, 0, PyList_GET_SIZE(x), r) < 0) {
+                    PyErr_Clear();
+                }
+            }
+            Py_DECREF(r);
             Py_RETURN_NONE;
         }
-        /* Copy elements into x in-place: x[:] = shuffled */
-        if (x && PyList_Check(x) && PyList_Check(shuffled)) {
-            if (PySequence_SetSlice(x, 0, PyList_GET_SIZE(x), shuffled) < 0) {
-                PyErr_Clear();
-            }
-        }
-        Py_DECREF(shuffled);
-        Py_RETURN_NONE;
     }
     /* Call original shuffle (modifies list in-place, returns None) */
     PyObject *result = PyObject_Call(g_orig_random_shuffle, args, kwargs);
@@ -643,7 +682,10 @@ static PyObject *hooked_random_shuffle(PyObject *self, PyObject *args, PyObject 
 
 static PyObject *hooked_uuid_uuid4(PyObject *self, PyObject *args, PyObject *kwargs) {
     (void)self;
-    if (g_io_replay_mode) return io_replay_next("uuid.uuid4");
+    if (g_io_replay_mode) {
+        PyObject *r = io_replay_next("uuid.uuid4");
+        if (r != PYTTD_REPLAY_FALLTHROUGH) return r;
+    }
     PyObject *result = PyObject_Call(g_orig_uuid_uuid4, args, kwargs);
     if (result == NULL) return NULL;
     /* Serialize UUID.bytes (16 bytes) */
@@ -665,7 +707,10 @@ static PyObject *hooked_uuid_uuid4(PyObject *self, PyObject *args, PyObject *kwa
 
 static PyObject *hooked_uuid_uuid1(PyObject *self, PyObject *args, PyObject *kwargs) {
     (void)self;
-    if (g_io_replay_mode) return io_replay_next("uuid.uuid1");
+    if (g_io_replay_mode) {
+        PyObject *r = io_replay_next("uuid.uuid1");
+        if (r != PYTTD_REPLAY_FALLTHROUGH) return r;
+    }
     PyObject *result = PyObject_Call(g_orig_uuid_uuid1, args, kwargs);
     if (result == NULL) return NULL;
     /* Serialize UUID.bytes (16 bytes) */
@@ -755,7 +800,10 @@ static PyObject *convert_datetime_to_subclass(PyObject *orig_result) {
  *   SubClass.now(utc)    → args=(cls, utc), kwargs=NULL  */
 static PyObject *hooked_datetime_now(PyObject *self, PyObject *args, PyObject *kwargs) {
     (void)self;
-    if (g_io_replay_mode) return io_replay_next("datetime.datetime.now");
+    if (g_io_replay_mode) {
+        PyObject *r = io_replay_next("datetime.datetime.now");
+        if (r != PYTTD_REPLAY_FALLTHROUGH) return r;
+    }
 
     /* Strip cls from args and forward to original now() */
     Py_ssize_t nargs = PyTuple_GET_SIZE(args);
@@ -788,7 +836,10 @@ static PyObject *hooked_datetime_utcnow(PyObject *self, PyObject *args, PyObject
     (void)self;
     (void)args;
     (void)kwargs;
-    if (g_io_replay_mode) return io_replay_next("datetime.datetime.utcnow");
+    if (g_io_replay_mode) {
+        PyObject *r = io_replay_next("datetime.datetime.utcnow");
+        if (r != PYTTD_REPLAY_FALLTHROUGH) return r;
+    }
 
     PyObject *result = PyObject_CallNoArgs(g_orig_datetime_utcnow);
     if (result == NULL) return NULL;

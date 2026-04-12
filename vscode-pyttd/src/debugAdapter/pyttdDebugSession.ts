@@ -251,9 +251,13 @@ export class PyttdDebugSession extends LoggingDebugSession {
             case 'progress': {
                 const cpCount = params.checkpointCount ?? 0;
                 const cpMB = params.checkpointMemoryMB ?? 0;
+                const cpSkipped = params.checkpointsSkippedThreads ?? 0;
                 let msg = `Recording: ${params.frameCount} frames`;
                 if (cpCount > 0) {
                     msg += ` | ${cpCount} checkpoints (${cpMB} MB)`;
+                }
+                if (cpSkipped > 0) {
+                    msg += ` | ${cpSkipped} skipped`;
                 }
                 const warnings: string[] = [];
                 if (params.droppedFrames > 0) warnings.push(`${params.droppedFrames} dropped`);
@@ -261,10 +265,11 @@ export class PyttdDebugSession extends LoggingDebugSession {
                 if (warnings.length > 0) msg += ` (${warnings.join(', ')})`;
                 this.sendEvent(new ProgressUpdateEvent(this.progressId, msg));
                 // Emit checkpoint memory custom event for status bar
-                if (cpCount > 0) {
+                if (cpCount > 0 || cpSkipped > 0) {
                     this.sendEvent(new Event('pyttd/checkpointMemory', {
                         checkpointCount: cpCount,
                         checkpointMemoryMB: cpMB,
+                        checkpointsSkippedThreads: cpSkipped,
                     }));
                 }
                 // Emit custom event so extension.ts can update status bar

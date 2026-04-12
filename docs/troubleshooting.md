@@ -143,9 +143,42 @@ Or let pyttd handle it — `pyttd record` deletes existing DB files (including W
 
 ## Platform-Specific Issues
 
+<a id="checkpoints"></a>
+
+### Checkpoints skipped — "cold navigation is limited"
+
+**Symptom:** After recording, pyttd prints
+
+```
+Note: cold navigation is limited. N checkpoint(s) were skipped because
+multiple threads were active at checkpoint time.
+```
+
+and `goto_frame` jumps in the affected region of the recording feel unusually slow.
+
+**Why this happens.** Cold navigation works by `fork()`-ing the recording process at periodic checkpoints, then fast-forwarding the child to your target. POSIX `fork()` is only async-signal-safe when no other threads are running — duplicating a process whose other threads hold mutexes, file descriptors, or C-extension state can leave the child in an unrecoverable state. pyttd's checkpoint trigger refuses to fork whenever it observes more than one active recording thread (`ringbuf_thread_count() > 1`).
+
+This affects any Python program with a background thread, including:
+
+- Threads spawned by libraries (HTTP clients, log handlers, schedulers, ORMs).
+- `concurrent.futures.ThreadPoolExecutor`.
+- `asyncio` event-loop default executors that run blocking work in a thread.
+- macOS Cocoa runloops in some GUI bindings.
+
+The recording itself is unaffected — every frame is still captured. Only checkpoint creation, and therefore cold `goto_frame`, is degraded.
+
+**What to do.**
+
+- **Scope the recording.** Use `--include`, `--include-file`, `--exclude`, `--exclude-file` so the recording only covers code that runs single-threaded. Threads spawned by ignored modules still exist, but if you can structure your reproducer to use a single thread, do so.
+- **Use warm navigation.** Step back, step forward, reverse continue, and breakpoint navigation are warm — they read from SQLite and are unaffected. Only `goto_frame` to a far-away point relies on checkpoints.
+- **Run on Linux.** The constraint applies on every POSIX platform but in practice Linux's libc/`fork()` is more forgiving with simple C-extension state than macOS. You may see fewer skips on the same workload.
+- **`arm()` a single-threaded region.** If you only need cold navigation in a specific function, call `pyttd.arm()` / `pyttd.disarm()` around code you know runs on the main thread alone.
+
+**Phase 2 (planned).** An opt-in `pyttd.checkpoint_safe_region()` context manager that quiesces recording threads before fork is on the roadmap; it has not landed yet because it interacts with GIL semantics in subtle ways.
+
 ### macOS: checkpoints not created during multi-thread recording
 
-By design. `fork()` is unsafe when multiple threads are active. pyttd skips checkpoint creation when `ringbuf_thread_count() > 1`. Cold navigation falls back to warm-only for those regions.
+See [Checkpoints skipped](#checkpoints) above. macOS is the platform where this guard fires most aggressively.
 
 ### Windows: no cold navigation
 

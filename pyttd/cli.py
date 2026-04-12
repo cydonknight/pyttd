@@ -1,4 +1,5 @@
 import argparse
+import json
 import logging
 import os
 import sys
@@ -28,6 +29,133 @@ def _c(code, text):
     if _use_color():
         return f"{code}{text}{_RESET}"
     return text
+
+
+# ---- Interactive REPL readline support ----
+
+_REPL_COMMANDS = [
+    'goto', 'step', 's', 'step_into', 'next', 'n',
+    'back', 'b', 'step_back', 'out', 'o', 'step_out',
+    'continue', 'c', 'rcontinue', 'rc', 'reverse_continue',
+    'vars', 'v', 'locals', 'info',
+    'eval', 'print', 'p',
+    'where', 'w', 'bt', 'stack', 'backtrace', 'frame',
+    'help', 'quit', 'q', 'exit',
+    'break', 'delete', 'breaks', 'search', 'watch',
+    'logpoint',
+]
+
+_HISTORY_FILE = os.path.expanduser("~/.pyttd_history")
+
+
+class _InteractiveCompleter:
+    """Context-aware tab completer for the pyttd interactive REPL."""
+
+    def __init__(self, session):
+        self.session = session
+        self._matches = []
+        self._cache_function_names = None
+        self._cache_filenames = None
+        self._cache_variable_names = None
+
+    def complete(self, text, state):
+        if state == 0:
+            try:
+                import readline
+                line = readline.get_line_buffer()
+            except (ImportError, AttributeError):
+                line = text
+            self._matches = list(self._candidates(line, text))
+        try:
+            return self._matches[state]
+        except IndexError:
+            return None
+
+    def _candidates(self, line, text):
+        tokens = line.split()
+        # First token: command name
+        if len(tokens) <= 1 and not line.endswith(" "):
+            return (c + " " for c in _REPL_COMMANDS if c.startswith(text))
+        if not tokens:
+            return ()
+        cmd = tokens[0]
+        if cmd in ('goto', 'frame'):
+            return self._special_candidates(text, ['first', 'last'])
+        if cmd == 'search':
+            return self._function_candidates(text)
+        if cmd == 'watch':
+            return self._variable_candidates(text)
+        if cmd == 'break':
+            return self._break_candidates(text)
+        return ()
+
+    def _function_candidates(self, text):
+        if self._cache_function_names is None:
+            try:
+                self._cache_function_names = self.session.list_function_names()
+            except Exception:
+                self._cache_function_names = []
+        return (f for f in self._cache_function_names if f.startswith(text))
+
+    def _variable_candidates(self, text):
+        if self._cache_variable_names is None:
+            try:
+                self._cache_variable_names = self.session.list_variable_names()
+            except Exception:
+                self._cache_variable_names = []
+        return (v for v in self._cache_variable_names if v.startswith(text))
+
+    def _break_candidates(self, text):
+        # If text contains ':', complete line numbers (not feasible to enumerate)
+        # Otherwise, complete filenames (basenames)
+        if ':' in text:
+            return ()
+        if self._cache_filenames is None:
+            try:
+                self._cache_filenames = [
+                    os.path.basename(f) for f in self.session.list_filenames()
+                ]
+            except Exception:
+                self._cache_filenames = []
+        return (f + ":" for f in self._cache_filenames if f.startswith(text))
+
+    def _special_candidates(self, text, extras):
+        return (e for e in extras if e.startswith(text))
+
+
+def _setup_interactive_readline(session):
+    """Set up readline history and tab completion for the REPL."""
+    try:
+        import readline
+    except ImportError:
+        try:
+            import pyreadline3 as readline  # type: ignore[no-redef]
+        except ImportError:
+            return  # no history, no completion — degrade gracefully
+
+    # History persistence
+    try:
+        readline.read_history_file(_HISTORY_FILE)
+    except (FileNotFoundError, OSError):
+        pass
+    readline.set_history_length(1000)
+
+    import atexit
+    atexit.register(_save_readline_history, readline)
+
+    # Context-aware completer
+    completer = _InteractiveCompleter(session)
+    readline.set_completer(completer.complete)
+    readline.parse_and_bind("tab: complete")
+    readline.set_completer_delims(" \t\n")
+
+
+def _save_readline_history(readline_mod):
+    """Save readline history; called at exit."""
+    try:
+        readline_mod.write_history_file(_HISTORY_FILE)
+    except OSError:
+        pass
 
 
 def _format_stats(stats: dict, db_path: str = None, show_guidance: bool = False,
@@ -65,6 +193,15 @@ def _format_stats(stats: dict, db_path: str = None, show_guidance: bool = False,
         cp_mb = cp_mem / (1024 * 1024)
         lines.append(f"{cp_count} checkpoint(s), {cp_mb:.1f} MB total RSS.")
 
+    # Issue 5: warn when the multi-thread skip guard prevented checkpoints.
+    cp_skipped = stats.get('checkpoints_skipped_threads', 0)
+    if cp_skipped > 0:
+        lines.append(
+            f"Note: cold navigation is limited. {cp_skipped} checkpoint(s) "
+            "were skipped because multiple threads were active at "
+            "checkpoint time. See docs/troubleshooting.md#checkpoints"
+        )
+
     # UX-1: Show database path
     if db_path:
         lines.append(f"Database: {db_path}")
@@ -81,43 +218,187 @@ def _format_stats(stats: dict, db_path: str = None, show_guidance: bool = False,
     return "\n".join(lines)
 
 
-def _format_exception_location(db_path: str, run_id: str) -> str | None:
-    """UX-5: Find the last exception_unwind event and format its location."""
+_COROUTINE_MACHINERY_PREFIXES = ("StopIteration(", "StopAsyncIteration(")
+
+
+def _is_coroutine_machinery_row(row) -> bool:
+    """Return True if a recorded exception row is coroutine machinery noise.
+
+    Detects exceptions whose recorded ``__exception__`` repr starts with
+    ``StopIteration(`` or ``StopAsyncIteration(`` — these are emitted by
+    CPython's coroutine plumbing on every ``await`` resumption and are not
+    user-facing errors. Returns False if the row has no locals snapshot or
+    the snapshot is malformed.
+    """
+    locals_json = getattr(row, 'locals_snapshot', None)
+    if not locals_json:
+        return False
+    try:
+        locs = json.loads(locals_json)
+    except (ValueError, TypeError):
+        return False
+    exc = locs.get("__exception__") if isinstance(locs, dict) else None
+    if not isinstance(exc, str):
+        return False
+    return exc.startswith(_COROUTINE_MACHINERY_PREFIXES)
+
+
+def _is_coroutine_exception_noise(row) -> bool:
+    """Return True if a frame row is a coroutine-internal exception event.
+
+    Used by ``--hide-coroutine-internals`` to drop only exception events on
+    coroutine frames whose recorded ``__exception__`` is StopIteration /
+    StopAsyncIteration noise. Non-exception rows, non-coroutine rows, and
+    coroutine rows raising other exceptions all return False so they pass
+    through the filter.
+    """
+    if getattr(row, 'is_coroutine', 0) != 1:
+        return False
+    if getattr(row, 'frame_event', None) not in ('exception', 'exception_unwind'):
+        return False
+    return _is_coroutine_machinery_row(row)
+
+
+def _pick_user_exception(db, run_id, frame_event):
+    """Pick the most user-facing exception row of a given event type.
+
+    Walks the most recent 32 events of the requested type (ordered newest
+    first), drops coroutine machinery noise, then prefers the deepest
+    surviving frame so the result points at the raise site instead of an
+    outer propagation frame. Falls back to the newest row regardless when
+    the filter empties the set, so user code that explicitly raises
+    ``StopIteration`` is still surfaced.
+    """
+    rows = db.fetchall(
+        "SELECT sequence_no, function_name, filename, line_no, locals_snapshot, call_depth"
+        " FROM executionframes"
+        " WHERE run_id = ? AND frame_event = ?"
+        " ORDER BY sequence_no DESC LIMIT 32",
+        (str(run_id), frame_event))
+    if not rows:
+        return None
+    filtered = [r for r in rows if not _is_coroutine_machinery_row(r)]
+    if filtered:
+        return max(filtered, key=lambda r: r.call_depth)
+    return rows[0]
+
+
+def _format_exception_location(db_path: str, run_id: str, verbose: bool = False) -> str | None:
+    """Format the exception propagation chain for the post-record summary.
+
+    Shows a multi-line chain from raise site through propagation frames.
+    Filters coroutine machinery noise, collapses consecutive identical
+    frames, and caps at 5 entries unless *verbose* is True.
+
+    Falls back to a single-frame format when only one useful event exists.
+    """
     try:
         from pyttd.models import storage
         from pyttd.models.db import db
         storage.connect_to_db(db_path)
         storage.initialize_schema()
-        # Prefer 'exception' event (has correct line number) over
-        # 'exception_unwind' (which has the def line, not the raise site).
-        row = db.fetchone(
-            "SELECT sequence_no, function_name, filename, line_no"
-            " FROM executionframes"
-            " WHERE run_id = ? AND frame_event = 'exception'"
-            " ORDER BY sequence_no ASC LIMIT 1",
-            (str(run_id),))
-        if row is None:
-            row = db.fetchone(
-                "SELECT sequence_no, function_name, filename, line_no"
-                " FROM executionframes"
-                " WHERE run_id = ? AND frame_event = 'exception_unwind'"
-                " ORDER BY sequence_no ASC LIMIT 1",
-                (str(run_id),))
+        chain = _build_exception_chain(db, run_id, verbose)
         storage.close_db()
-        if row:
-            basename = os.path.basename(row.filename)
-            return (f"  Exception at frame #{row.sequence_no}"
-                    f" in {row.function_name}() at {basename}:{row.line_no}\n"
-                    f"  Replay:  pyttd replay --last-run --goto-frame {row.sequence_no} --db {db_path}")
+        if chain:
+            return _render_exception_chain(chain, db_path)
     except Exception:
         pass
     return None
+
+
+def _build_exception_chain(db, run_id: str, verbose: bool = False) -> list:
+    """Build a collapsed, filtered exception chain (deepest-first).
+
+    Returns a list where the first element is the raise site (deepest
+    call_depth) and subsequent elements are propagation frames moving
+    outward through the call stack.
+    """
+    # Try exception events first, fall back to exception_unwind
+    events = _fetch_exception_events(db, run_id, 'exception')
+    if not events:
+        events = _fetch_exception_events(db, run_id, 'exception_unwind')
+    if not events:
+        return []
+
+    # Filter coroutine machinery
+    filtered = [e for e in events if not _is_coroutine_machinery_row(e)]
+    if not filtered:
+        # User actually raised StopIteration — keep original events
+        filtered = events
+
+    # Events come DESC (newest/outermost first). Reverse so deepest is first.
+    filtered.reverse()
+
+    # Collapse consecutive identical (filename, function_name) frames
+    collapsed = []
+    for e in filtered:
+        key = (e.filename, e.function_name)
+        if collapsed and (collapsed[-1].filename, collapsed[-1].function_name) == key:
+            continue
+        collapsed.append(e)
+
+    if not verbose:
+        collapsed = collapsed[:5]
+
+    return collapsed
+
+
+def _fetch_exception_events(db, run_id: str, frame_event: str) -> list:
+    """Fetch recent exception events, newest first."""
+    return db.fetchall(
+        "SELECT sequence_no, function_name, filename, line_no,"
+        " locals_snapshot, call_depth"
+        " FROM executionframes"
+        " WHERE run_id = ? AND frame_event = ?"
+        " ORDER BY sequence_no DESC LIMIT 64",
+        (str(run_id), frame_event))
+
+
+def _render_exception_chain(chain: list, db_path: str) -> str:
+    """Render the exception chain as a multi-line string."""
+    if not chain:
+        return None
+
+    # Single event — compact format
+    if len(chain) == 1:
+        e = chain[0]
+        basename = os.path.basename(e.filename)
+        return (f"  Exception at frame #{e.sequence_no}"
+                f" in {e.function_name}() at {basename}:{e.line_no}\n"
+                f"  Replay:  pyttd replay --last-run --goto-frame {e.sequence_no} --db {db_path}")
+
+    # Multi-event chain
+    raise_site = chain[0]  # newest = deepest raise
+
+    lines = ["  Exception chain:"]
+    # Format raise site
+    lines.append(f"     raise -> {_fmt_chain_frame(raise_site)}")
+    # Format propagation frames
+    for prop in chain[1:]:
+        lines.append(f"  propagated <- {_fmt_chain_frame(prop)}")
+    lines.append(
+        f"  Replay:  pyttd replay --last-run --goto-frame {raise_site.sequence_no} --db {db_path}"
+    )
+    return "\n".join(lines)
+
+
+def _fmt_chain_frame(row) -> str:
+    """Format a single frame in the exception chain."""
+    func = row.function_name
+    if len(func) > 48:
+        func = func[:45] + "..."
+    basename = os.path.basename(row.filename)
+    return f"{func:<48} at {basename}:{row.line_no}"
 
 def _format_frame_line(f, source: str) -> str:
     """Format a single frame line for query output (UX-8: with color)."""
     # U11: Display line 0 as line 1 — CPython reports def line as 0 for <module>
     display_line = f.line_no if f.line_no > 0 else 1
-    base = f"  #{f.sequence_no:>6} {f.frame_event:<18} {f.function_name}:{display_line}  {source}"
+    # #12: Disambiguate <module> by showing the source file basename
+    func_label = f.function_name
+    if func_label == '<module>' and hasattr(f, 'filename') and f.filename:
+        func_label = f"<module> [{os.path.basename(f.filename)}]"
+    base = f"  #{f.sequence_no:>6} {f.frame_event:<18} {func_label}:{display_line}  {source}"
     evt = f.frame_event
     if evt in ('exception', 'exception_unwind'):
         return _c(_RED, base)
@@ -128,21 +409,67 @@ def _format_frame_line(f, source: str) -> str:
     return base
 
 
-def _print_locals(frame, changed_only=False, prev_locals=None):
+_DUNDER_GLOBALS = frozenset({
+    "__name__", "__doc__", "__package__", "__file__", "__loader__",
+    "__spec__", "__builtins__", "__cached__", "__annotations__",
+    "__path__", "__all__",
+})
+
+_HIDDEN_VALUE_REPR_PREFIXES = ("<module ", "<function ", "<class ", "<built-in ")
+
+
+def _should_hide_module_local(name: str, value_repr: str, frame_function: str, args) -> bool:
+    """Filter module-scope dunder/import/function noise from --show-locals.
+
+    Render-time filter only — recorded data is unchanged. Active when:
+      - the user has not passed --show-all-globals,
+      - the frame is module scope (function_name == '<module>'),
+      - the variable is either a known dunder global or its repr looks like
+        an imported module / function / class / built-in.
+    """
+    if args is None:
+        return False
+    if getattr(args, 'show_all_globals', False):
+        return False
+    if not getattr(args, 'hide_module_dunders', True):
+        return False
+    if frame_function != '<module>':
+        return False
+    if name in _DUNDER_GLOBALS:
+        return True
+    if value_repr.startswith(_HIDDEN_VALUE_REPR_PREFIXES):
+        return True
+    return False
+
+
+def _print_locals(frame, changed_only=False, prev_locals=None, args=None):
     """Print locals for a frame (shared by --frames, --search, --thread, etc.)."""
     if not frame.locals_snapshot:
         return prev_locals or {}
     try:
         import json as _jl
         ld = _jl.loads(frame.locals_snapshot)
+        frame_function = getattr(frame, 'function_name', '') or ''
+        expand = getattr(args, 'expand', False) if args else False
+        max_depth = getattr(args, 'depth', 2) if args else 2
         for vname, vval in ld.items():
             vstr = _format_local_value(vval)
+            if _should_hide_module_local(vname, vstr, frame_function, args):
+                continue
             if changed_only and prev_locals:
                 if prev_locals.get(vname) == vstr:
                     continue
             print(f"           {_c(_DIM, vname + ' = ' + vstr)}")
+            # #13: When --expand is set, walk __children__ recursively
+            if expand and isinstance(vval, dict) and vval.get('__children__'):
+                _print_expanded_children(vval['__children__'],
+                                         "             ", 1, max_depth)
         if changed_only:
-            return {k: _format_local_value(v) for k, v in ld.items()}
+            return {
+                k: _format_local_value(v) for k, v in ld.items()
+                if not _should_hide_module_local(
+                    k, _format_local_value(v), frame_function, args)
+            }
     except Exception:
         pass
     return prev_locals or {}
@@ -166,6 +493,25 @@ def _format_local_value(value) -> str:
     return str(value)
 
 
+def _print_expanded_children(children, indent, depth, max_depth):
+    """#13: Recursively print __children__ entries as a tree."""
+    if depth >= max_depth or not children:
+        return
+    for child in children:
+        key = child.get('key', '?')
+        val = child.get('value', '?')
+        ctype = child.get('type', '')
+        # Nested containers: value is an envelope with __type__/__children__
+        nested = None
+        if isinstance(val, dict) and '__children__' in val:
+            nested = val['__children__']
+            val = val.get('__repr__', str(val))
+        suffix = f"  {_c(_DIM, '(' + ctype + ')')}" if ctype else ""
+        print(f"{indent}{key} = {val}{suffix}")
+        if nested:
+            _print_expanded_children(nested, indent + "  ", depth + 1, max_depth)
+
+
 def main():
     from pyttd import __version__
     parser = argparse.ArgumentParser(prog='pyttd', description='Python Time-Travel Debugger')
@@ -178,9 +524,10 @@ def main():
     record_parser.add_argument('--module', action='store_true', help='Treat script as module name')
     record_parser.add_argument('--checkpoint-interval', type=int, default=1000)
     record_parser.add_argument('--args', nargs=argparse.REMAINDER, default=[],
-                               help='Arguments to pass to the script. MUST be the last flag — '
-                                    'all tokens after --args are passed to the script, including '
-                                    'any that look like pyttd flags. Place pyttd flags before --args.')
+                               help='Arguments to pass to the script. MUST be the LAST flag on '
+                                    'the command line — everything after --args is consumed as '
+                                    'script arguments, including tokens that look like pyttd flags '
+                                    '(e.g. --env, --include). Place all pyttd flags BEFORE --args.')
     record_parser.add_argument('--no-redact', action='store_true',
                                help='Disable secrets redaction in recorded variables')
     record_parser.add_argument('--secret-patterns', action='append', default=None,
@@ -200,13 +547,14 @@ def main():
     record_parser.add_argument('--db-path', type=str, default=None,
                                help='Custom database path (default: <script>.pyttd.db)')
     record_parser.add_argument('--max-db-size', type=float, default=0,
-                               help='Auto-stop recording when binlog exceeds this size in MB (0 = unlimited)')
+                               help='Auto-stop recording when binlog exceeds this size in MB '
+                                    '(0 = unlimited; approximate — actual size may overshoot)')
     record_parser.add_argument('--keep-runs', type=int, default=0,
                                help='Keep only last N runs, evict older (0 = keep all)')
     record_parser.add_argument('--checkpoint-memory-limit', type=int, default=0,
                                help='Checkpoint memory limit in MB (0 = unlimited)')
-    record_parser.add_argument('--env', nargs='+', default=None,
-                               help='Environment variables (KEY=VALUE format). '
+    record_parser.add_argument('--env', action='append', nargs='+', default=None,
+                               help='Environment variables (KEY=VALUE format, repeatable). '
                                     'Must be placed AFTER the script path since it '
                                     'consumes multiple arguments.')
     record_parser.add_argument('--env-file', type=str, default=None,
@@ -239,6 +587,14 @@ def main():
                               help='Show variable values alongside frame output')
     query_parser.add_argument('--changed-only', action='store_true',
                               help='With --show-locals, only show variables that changed from the previous frame')
+    query_parser.add_argument('--hide-module-dunders', action='store_true', default=True,
+                              help='Hide __name__/__doc__/imports/functions/classes at module scope (default: on)')
+    query_parser.add_argument('--show-all-globals', action='store_true',
+                              help='Include module dunders and imports in --show-locals output')
+    query_parser.add_argument('--expand', action='store_true',
+                              help='With --show-locals, expand containers/objects to show children')
+    query_parser.add_argument('--depth', type=int, default=2,
+                              help='Max expansion depth for --expand (default: 2)')
     query_parser.add_argument('--stats', action='store_true',
                               help='Show per-function call and exception counts')
     query_parser.add_argument('--file', type=str, default=None,
@@ -247,6 +603,8 @@ def main():
                               help='Show exception_unwind events (shortcut for --event-type exception_unwind)')
     query_parser.add_argument('--hide-coroutine-internals', action='store_true',
                               help='Hide coroutine-internal exception events (StopIteration noise from async)')
+    query_parser.add_argument('--unwind-only', action='store_true',
+                              help='With --exceptions, show only exception_unwind events (legacy behavior)')
     query_parser.add_argument('--db', type=str, default=None)
 
     replay_parser = subparsers.add_parser('replay', help='Replay a recorded session')
@@ -281,8 +639,8 @@ def main():
                                    '(* matches any chars including /). Repeatable')
     serve_parser.add_argument('--max-frames', type=int, default=0,
                               help='Approximate max frames to record; may slightly overshoot (0 = unlimited)')
-    serve_parser.add_argument('--env', nargs='+', default=None,
-                              help='Environment variables (KEY=VALUE format)')
+    serve_parser.add_argument('--env', action='append', nargs='+', default=None,
+                              help='Environment variables (KEY=VALUE format, repeatable)')
     serve_parser.add_argument('--env-file', type=str, default=None,
                               help='Path to dotenv file to load environment variables from')
     serve_parser.add_argument('--db-path', type=str, default=None,
@@ -316,6 +674,34 @@ def main():
     clean_parser.add_argument('--dry-run', action='store_true',
                               help='Show what would be deleted without deleting')
 
+    ci_parser = subparsers.add_parser('ci', help='CI wrapper — run command, preserve trace on failure')
+    ci_parser.add_argument('--artifact-dir', default='.pyttd-ci-artifacts',
+                           help='Where to write trace files (default: .pyttd-ci-artifacts/)')
+    ci_parser.add_argument('--keep-on-success', action='store_true',
+                           help='Keep artifacts even on success (default: delete)')
+    ci_parser.add_argument('--compress', action='store_true', default=True,
+                           help='Gzip artifacts for smaller uploads (default: on)')
+    ci_parser.add_argument('--no-compress', action='store_false', dest='compress',
+                           help='Disable gzip compression of artifacts')
+    ci_parser.add_argument('--max-size-mb', type=int, default=500,
+                           help='Max per-recording DB size in MB (default: 500)')
+    ci_parser.add_argument('--no-record', action='store_true',
+                           help='Do not auto-wrap with pyttd record (env-variable mode only)')
+    ci_parser.add_argument('cmd', nargs=argparse.REMAINDER,
+                           help='Command to run (use -- before the command)')
+
+    diff_parser = subparsers.add_parser('diff', help='Diff two recording runs')
+    diff_parser.add_argument('--runs', nargs=2, metavar=('RUN_A', 'RUN_B'), required=True,
+                             help='Run IDs to compare (UUIDs or prefixes)')
+    diff_parser.add_argument('--db', type=str, required=True,
+                             help='Database file containing both runs')
+    diff_parser.add_argument('--context', type=int, default=3,
+                             help='Lines of context around divergence (default: 3)')
+    diff_parser.add_argument('--ignore-vars', action='append', default=[],
+                             help='Variable names to skip when comparing locals (repeatable)')
+    diff_parser.add_argument('--format', choices=['text', 'json'], default='text',
+                             help='Output format (default: text)')
+
     args = parser.parse_args()
 
     # Configure logging
@@ -340,6 +726,14 @@ def main():
         _cmd_export(args)
     elif args.command == 'clean':
         _cmd_clean(args)
+    elif args.command == 'ci':
+        from pyttd.cli_ci import _cmd_ci
+        # Strip leading '--' from the command args if present
+        if args.cmd and args.cmd[0] == '--':
+            args.cmd = args.cmd[1:]
+        _cmd_ci(args)
+    elif args.command == 'diff':
+        _cmd_diff(args)
 
 _PYTTD_FLAGS = frozenset({
     '--db-path', '--max-frames', '--max-db-size', '--keep-runs',
@@ -410,10 +804,11 @@ def _cmd_record(args):
         for key, value in _parse_env_file(args.env_file).items():
             os.environ[key] = value
     if getattr(args, 'env', None):
-        for item in args.env:
-            if '=' in item:
-                key, value = item.split('=', 1)
-                os.environ[key] = value
+        for group in args.env:
+            for item in group:
+                if '=' in item:
+                    key, value = item.split('=', 1)
+                    os.environ[key] = value
 
     try:
         recorder.start(db_path, script_path=script_abs)
@@ -493,18 +888,33 @@ def _cmd_record(args):
             if args.max_frames > 0 and stats.get('frame_count', 0) >= args.max_frames:
                 _safe_print("Recording stopped: frame limit reached")
             else:
-                _safe_print("Recording stopped: database size limit reached")
+                actual_mb = 0
+                if db_path and os.path.isfile(db_path):
+                    actual_mb = os.path.getsize(db_path) / (1024 * 1024)
+                _safe_print(f"Recording stopped: database size limit reached "
+                            f"(limit: {args.max_db_size:.0f} MB, actual: {actual_mb:.1f} MB)")
             _safe_print(_format_stats(stats, db_path=db_path, script_path=script_abs))
+        elif isinstance(script_error, SystemExit) and script_error.code in (None, 0):
+            # sys.exit(0) or sys.exit() is a clean exit, not an error
+            _safe_print(_format_stats(stats, db_path=db_path, show_guidance=True, script_path=script_abs))
         else:
-            _safe_print(f"Script exited with {type(script_error).__name__}: {script_error}")
-            # UX-5: Show exception frame location
-            if run_id:
-                exc_loc = _format_exception_location(db_path, run_id)
+            if isinstance(script_error, SystemExit):
+                _safe_print(f"Script called sys.exit({script_error.code})")
+            else:
+                _safe_print(f"Script exited with {type(script_error).__name__}: {script_error}")
+            # UX-5: Show exception chain
+            if run_id and not isinstance(script_error, SystemExit):
+                exc_loc = _format_exception_location(db_path, run_id,
+                                                      verbose=getattr(args, 'verbose', False))
                 if exc_loc:
                     _safe_print(exc_loc)
             _safe_print(_format_stats(stats, db_path=db_path, script_path=script_abs))
     else:
         _safe_print(_format_stats(stats, db_path=db_path, show_guidance=True, script_path=script_abs))
+
+    # UX-B: Print run id for easy copy-paste into --run-id
+    if run_id and stats.get('frame_count', 0) > 0:
+        _safe_print(f"  Run id: {str(run_id)[:8]} (full: {run_id})")
 
     # UX-12: Recording summary for large recordings
     if stats.get('frame_count', 0) > 0 and run_id:
@@ -525,7 +935,25 @@ def _cmd_record(args):
                 " WHERE run_id = ? AND frame_event = 'exception_unwind'"
                 " AND is_coroutine = 0",
                 (str(run_id),)) or 0
+            # UX-C: Warn when include/exclude globs matched nothing
+            _warn_patterns = []
+            for _pat in (config.include_functions or []):
+                _lk = _pat.replace('*', '%').replace('?', '_')
+                _mc = _d2.fetchval(
+                    "SELECT COUNT(*) FROM executionframes WHERE run_id = ? AND function_name LIKE ?",
+                    (str(run_id), _lk)) or 0
+                if _mc == 0:
+                    _warn_patterns.append(f"--include {_pat}")
+            for _pat in (config.include_files or []):
+                _lk = _pat.replace('*', '%').replace('?', '_')
+                _mc = _d2.fetchval(
+                    "SELECT COUNT(*) FROM executionframes WHERE run_id = ? AND filename LIKE ?",
+                    (str(run_id), _lk)) or 0
+                if _mc == 0:
+                    _warn_patterns.append(f"--include-file {_pat}")
             _s2.close_db()
+            for _wp in _warn_patterns:
+                _safe_print(_c(_YELLOW, f"  WARN: {_wp} matched 0 recorded frames"))
             # Don't count SystemExit (any exit code) as an exception.
             # Python unwinds SystemExit through every frame on the call
             # stack, producing one `exception_unwind` event per frame — so a
@@ -554,11 +982,21 @@ def _cmd_record(args):
             # U13: Active filters and redaction status
             extra = []
             if config.redact_secrets:
-                extra.append("secrets redaction active")
+                msg = "secrets redaction active"
+                user_patterns = getattr(args, 'secret_patterns', None) or []
+                if user_patterns:
+                    msg += f"; custom: {', '.join(user_patterns)}"
+                extra.append(msg)
+            else:
+                extra.append(_c(_RED + _BOLD, "secrets redaction DISABLED"))
             if config.include_functions:
                 extra.append(f"include: {', '.join(config.include_functions)}")
+            if config.include_files:
+                extra.append(f"include-file: {', '.join(config.include_files)}")
             if config.exclude_functions:
                 extra.append(f"exclude: {', '.join(config.exclude_functions)}")
+            if config.exclude_files:
+                extra.append(f"exclude-file: {', '.join(config.exclude_files)}")
             if extra:
                 _safe_print(f"  ({'; '.join(extra)})")
         except Exception:
@@ -605,10 +1043,11 @@ def _cmd_serve(args):
         if args.env_file:
             env_vars.update(_parse_env_file(args.env_file))
         if args.env:
-            for item in args.env:
-                if '=' in item:
-                    key, value = item.split('=', 1)
-                    env_vars[key] = value
+            for group in args.env:
+                for item in group:
+                    if '=' in item:
+                        key, value = item.split('=', 1)
+                        env_vars[key] = value
         server = PyttdServer(
             script=args.script,
             is_module=args.module,
@@ -742,10 +1181,9 @@ def _cmd_query(args):
             except ValueError as e:
                 print(f"Error: {e}", file=sys.stderr)
                 sys.exit(EXIT_USER_ERROR)
-        # Send banner to stderr when JSON format is requested so stdout is pipeable
-        _banner_stream = sys.stderr if getattr(args, 'format', 'text') == 'json' else sys.stdout
+        # #9: Always send banner to stderr so stdout is pipeable for both text and JSON
         print(f"Run: {run.run_id} ({run.script_path or 'unknown'}) — {run.total_frames} frames",
-              file=_banner_stream)
+              file=sys.stderr)
 
         if getattr(args, 'list_threads', False):
             rows = _db.fetchall(
@@ -776,7 +1214,7 @@ def _cmd_query(args):
                     source = get_line_code(f.filename, f.line_no)
                     print(_format_frame_line(f, source))
                     if show_locals:
-                        prev_lc = _print_locals(f, changed_only, prev_lc)
+                        prev_lc = _print_locals(f, changed_only, prev_lc, args)
             return
 
         thread = getattr(args, 'thread', None)
@@ -790,7 +1228,7 @@ def _cmd_query(args):
                     source = get_line_code(f.filename, f.line_no)
                     print(_format_frame_line(f, source))
                     if show_locals:
-                        prev_lc = _print_locals(f, changed_only, prev_lc)
+                        prev_lc = _print_locals(f, changed_only, prev_lc, args)
             return
 
         # UX-9: --var-history
@@ -838,7 +1276,12 @@ def _cmd_query(args):
 
         # Auto-enable --frames when dependent flags are used
         if getattr(args, 'exceptions', False):
-            args.event_type = 'exception_unwind'
+            # #3: --exceptions shows both exception AND exception_unwind events
+            # unless --unwind-only is set (legacy behavior)
+            if getattr(args, 'unwind_only', False):
+                args.event_type = 'exception_unwind'
+            else:
+                args.event_type = '__exceptions__'  # sentinel for both types
             args.frames = True
         if getattr(args, 'event_type', None) and not args.frames:
             args.frames = True
@@ -848,7 +1291,7 @@ def _cmd_query(args):
             args.show_locals = True
         if getattr(args, 'show_locals', False) and not args.frames:
             args.frames = True
-        if getattr(args, 'format', 'text') == 'json' and not args.frames:
+        if getattr(args, 'format', 'text') == 'json' and not args.frames and not getattr(args, 'stats', False):
             args.frames = True
 
         # UX-5: --stats
@@ -921,7 +1364,7 @@ def _cmd_query(args):
                     source = get_line_code(f.filename, f.line_no)
                     print(_format_frame_line(f, source))
                     if show_locals:
-                        prev_lc = _print_locals(f, changed_only, prev_lc)
+                        prev_lc = _print_locals(f, changed_only, prev_lc, args)
             return
 
         if args.frames:
@@ -930,22 +1373,39 @@ def _cmd_query(args):
             offset = getattr(args, 'offset', 0) or 0
             extra_where = ""
             extra_params = []
-            if event_type:
+            if event_type == '__exceptions__':
+                # #3: --exceptions shows both exception AND exception_unwind
+                extra_where += " AND frame_event IN ('exception', 'exception_unwind')"
+            elif event_type:
                 extra_where += " AND frame_event = ?"
                 extra_params.append(event_type)
             file_filter = getattr(args, 'file', None)
             if file_filter:
                 extra_where += " AND filename LIKE ?"
                 extra_params.append(f"%{file_filter}%")
-            # U7: Filter coroutine-internal exception events (StopIteration noise)
-            if getattr(args, 'hide_coroutine_internals', False):
-                extra_where += " AND NOT (is_coroutine = 1 AND frame_event IN ('exception', 'exception_unwind'))"
+            # U7: Filter coroutine-internal exception events (StopIteration noise).
+            # The filter inspects locals_snapshot at render time (only exception
+            # events on coroutine frames whose __exception__ starts with
+            # StopIteration/StopAsyncIteration are dropped — user code that
+            # explicitly raises StopIteration in a non-coroutine frame is
+            # preserved), so we must fetch BEFORE applying LIMIT/OFFSET and
+            # slice afterwards so the user sees N surviving rows.
+            hide_coro = getattr(args, 'hide_coroutine_internals', False)
             from pyttd.models.db import db as _db3
-            rows = _db3.fetchall(
-                "SELECT * FROM executionframes"
-                " WHERE run_id = ?" + extra_where +
-                " ORDER BY sequence_no LIMIT ? OFFSET ?",
-                (str(run.run_id), *extra_params, args.limit, offset))
+            if hide_coro:
+                rows = _db3.fetchall(
+                    "SELECT * FROM executionframes"
+                    " WHERE run_id = ?" + extra_where +
+                    " ORDER BY sequence_no",
+                    (str(run.run_id), *extra_params))
+                rows = [r for r in rows if not _is_coroutine_exception_noise(r)]
+                rows = rows[offset:offset + args.limit]
+            else:
+                rows = _db3.fetchall(
+                    "SELECT * FROM executionframes"
+                    " WHERE run_id = ?" + extra_where +
+                    " ORDER BY sequence_no LIMIT ? OFFSET ?",
+                    (str(run.run_id), *extra_params, args.limit, offset))
             output_format = getattr(args, 'format', 'text')
             if output_format == 'json':
                 import json as _json
@@ -963,7 +1423,13 @@ def _cmd_query(args):
                     # U16: Include locals in JSON when --show-locals
                     if show_locals and f.locals_snapshot:
                         try:
-                            entry["locals"] = _json.loads(f.locals_snapshot)
+                            ld = _json.loads(f.locals_snapshot)
+                            frame_function = f.function_name or ''
+                            entry["locals"] = {
+                                k: v for k, v in ld.items()
+                                if not _should_hide_module_local(
+                                    k, _format_local_value(v), frame_function, args)
+                            }
                         except Exception:
                             pass
                     frames_list.append(entry)
@@ -974,7 +1440,7 @@ def _cmd_query(args):
                     source = get_line_code(f.filename, f.line_no)
                     print(_format_frame_line(f, source))
                     if show_locals:
-                        prev_lc = _print_locals(f, changed_only, prev_lc)
+                        prev_lc = _print_locals(f, changed_only, prev_lc, args)
     finally:
         storage.close_db()
 
@@ -1025,8 +1491,10 @@ def _cmd_replay(args):
             depth = result.get('call_depth', 0)
             seq = result.get('seq', 0)
             line_display = "entry" if line == 0 else str(line)
-            print(f"Frame {seq} — {func} at {fname}:{line_display}")
-            print(f"  call_depth: {depth}")
+            pos_str = f"Frame {seq}"
+            if total_frames:
+                pos_str += f"/{total_frames}"
+            print(f"{pos_str} — {func} at {fname}:{line_display}")
             # Source context: show 2 lines before and after
             if show_context and isinstance(line, int) and os.path.isfile(filepath):
                 try:
@@ -1120,24 +1588,7 @@ def _cmd_replay(args):
             if args.goto_frame > 0:
                 session.goto_frame(args.goto_frame)
 
-            # Tab completion for interactive commands
-            try:
-                import readline
-                _commands = ['goto', 'step', 's', 'step_into', 'next', 'n',
-                             'back', 'b', 'step_back', 'out', 'o', 'step_out',
-                             'continue', 'c', 'vars', 'v', 'locals', 'info',
-                             'eval', 'print', 'p',
-                             'where', 'w', 'bt', 'stack', 'backtrace', 'frame',
-                             'help', 'quit', 'q', 'exit',
-                             'break', 'delete', 'breaks', 'search', 'watch',
-                             'logpoint']
-                def _completer(text, state):
-                    matches = [c for c in _commands if c.startswith(text)]
-                    return matches[state] if state < len(matches) else None
-                readline.set_completer(_completer)
-                readline.parse_and_bind('tab: complete')
-            except ImportError:
-                pass
+            _setup_interactive_readline(session)
 
             # Breakpoint state for interactive session
             _line_bps = []  # [{file, line}]
@@ -1175,12 +1626,25 @@ def _cmd_replay(args):
                     _show_frame(r)
                 elif cmd in ('continue', 'c'):
                     r = session.continue_forward()
+                    # #14: Show logpoint messages, capped to avoid flooding
+                    _log_msgs = getattr(session, '_log_messages', [])
+                    _LOG_CAP = 10
+                    for msg in _log_msgs[:_LOG_CAP]:
+                        print(f"  {_c(_DIM, '[log] ' + msg)}")
+                    if len(_log_msgs) > _LOG_CAP:
+                        print(f"  {_c(_DIM, f'... and {len(_log_msgs) - _LOG_CAP} more log message(s)')}")
                     if r.get('reason') == 'end':
                         print("  End of recording reached (no breakpoint hit).")
+                    elif r.get('reason') == 'breakpoint':
+                        print(f"  Hit breakpoint.")
                     _show_frame(r)
-                    # Show logpoint messages if any
-                    for msg in getattr(session, '_log_messages', []):
-                        print(f"  {_c(_DIM, '[log] ' + msg)}")
+                elif cmd in ('rcontinue', 'rc', 'reverse_continue'):
+                    r = session.reverse_continue()
+                    if r.get('reason') == 'start':
+                        print("  Start of recording reached (no breakpoint hit).")
+                    elif r.get('reason') == 'breakpoint':
+                        print(f"  Hit breakpoint.")
+                    _show_frame(r)
                 elif cmd in ('vars', 'v', 'locals', 'info'):
                     variables = session.get_variables_at(session.current_frame_seq)
                     if not variables:
@@ -1191,12 +1655,19 @@ def _cmd_replay(args):
                         print(f"    {_c(_BOLD, v['name']):<24} = {v['value']}{type_str}")
                 elif cmd.startswith('goto ') or cmd.startswith('frame '):
                     arg = cmd.split(None, 1)[1].strip() if ' ' in cmd else ''
-                    try:
-                        target = int(arg)
-                        r = session.goto_frame(target)
+                    if arg == 'first':
+                        r = session.goto_frame(0)
                         _show_frame(r)
-                    except ValueError:
-                        print("Usage: goto N  (or: frame N)")
+                    elif arg == 'last':
+                        r = session.goto_frame(session.last_line_seq or 0)
+                        _show_frame(r)
+                    else:
+                        try:
+                            target = int(arg)
+                            r = session.goto_frame(target)
+                            _show_frame(r)
+                        except ValueError:
+                            print("Usage: goto N  (or: goto first, goto last, frame N)")
                 elif cmd.startswith('eval ') or cmd.startswith('print ') or cmd.startswith('p '):
                     # Extract expression after the command keyword
                     expr = cmd.split(None, 1)[1].strip() if ' ' in cmd else ''
@@ -1210,8 +1681,8 @@ def _cmd_replay(args):
                         name = _c(_BOLD, frame.get('name', '?')) if i == 0 else frame.get('name', '?')
                         loc = _c(_DIM, f"at {fn}:{frame.get('line', '?')}")
                         print(f"  {marker} #{frame.get('seq', '?')} {name} {loc}")
-                elif cmd.startswith('break '):
-                    arg = cmd[6:].strip()
+                elif cmd == 'break' or cmd.startswith('break '):
+                    arg = cmd[6:].strip() if len(cmd) > 6 else ''
                     if ':' in arg:
                         # break FILE:LINE
                         try:
@@ -1252,7 +1723,15 @@ def _cmd_replay(args):
                         print("  No breakpoints set.")
                     for i, bp in enumerate(_line_bps, 1):
                         fn = os.path.basename(bp.get('file', '?'))
-                        print(f"  [{i}] {fn}:{bp.get('line', '?')}")
+                        label = f"  [{i}] {fn}:{bp.get('line', '?')}"
+                        # #7: Tag log points, conditional, and hit-count bps distinctly
+                        if bp.get('logMessage'):
+                            label += f"  (log: {bp['logMessage']!r})"
+                        elif bp.get('condition'):
+                            label += f"  (if {bp['condition']})"
+                        elif bp.get('hitCondition'):
+                            label += f"  (hit {bp['hitCondition']})"
+                        print(label)
                     for i, fbp in enumerate(_func_bps, len(_line_bps) + 1):
                         print(f"  [{i}] function: {fbp.get('name', '?')}")
                 elif cmd == 'delete':
@@ -1349,6 +1828,7 @@ def _cmd_replay(args):
                     print("  back (b)    — step backward  (aliases: step_back)")
                     print("  out  (o)    — step out  (aliases: step_out)")
                     print("  continue(c) — continue to next breakpoint or end")
+                    print("  rcontinue(rc)— reverse continue to previous breakpoint or start")
                     print()
                     print("  " + _c(_BOLD, "Inspection:"))
                     print("  vars (v)    — show variables  (aliases: locals, info)")
@@ -1369,6 +1849,42 @@ def _cmd_replay(args):
                     print(f"Unknown command: {cmd}. Type 'help' for available commands.")
     finally:
         storage.close_db()
+
+def _cmd_diff(args):
+    from pyttd.query import get_run_by_id
+    from pyttd.models import storage
+    from pyttd.models.db import db
+    from pyttd.diff import align_and_diff, format_diff_text, format_diff_json
+
+    db_path = args.db
+    if not os.path.isfile(db_path):
+        print(f"Database file not found: {db_path}", file=sys.stderr)
+        sys.exit(EXIT_USER_ERROR)
+
+    storage.connect_to_db(db_path)
+    storage.initialize_schema()
+
+    try:
+        run_a = get_run_by_id(db_path, args.runs[0])
+        run_b = get_run_by_id(db_path, args.runs[1])
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(EXIT_USER_ERROR)
+    finally:
+        pass
+
+    ignore_vars = set(args.ignore_vars) if args.ignore_vars else None
+    result = align_and_diff(db, str(run_a.run_id), str(run_b.run_id),
+                            ignore_vars=ignore_vars, context=args.context)
+
+    fmt = getattr(args, 'format', 'text')
+    if fmt == 'json':
+        print(format_diff_json(result))
+    else:
+        print(format_diff_text(result, db_path=db_path))
+
+    storage.close_db()
+
 
 def _cmd_clean(args):
     from pyttd.models.constants import DB_NAME_SUFFIX

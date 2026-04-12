@@ -15,7 +15,8 @@ CREATE TABLE IF NOT EXISTS runs (
     timestamp_end REAL,
     script_path TEXT,
     total_frames INTEGER DEFAULT 0,
-    is_attach INTEGER DEFAULT 0
+    is_attach INTEGER DEFAULT 0,
+    attach_safe_seq INTEGER
 );
 CREATE TABLE IF NOT EXISTS executionframes (
     frame_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -87,6 +88,7 @@ MIGRATION_SQL = [
     'ALTER TABLE runs ADD COLUMN parent_run_id TEXT NULL',
     'ALTER TABLE runs ADD COLUMN branch_seq INTEGER NULL',
     'ALTER TABLE executionframes ADD COLUMN is_coroutine INTEGER DEFAULT 0',
+    'ALTER TABLE runs ADD COLUMN attach_safe_seq INTEGER',
 ]
 
 
@@ -110,7 +112,7 @@ def create_run(script_path=None, is_attach=False, parent_run_id=None, branch_seq
 
 _ALLOWED_RUN_COLUMNS = frozenset({
     'timestamp_end', 'total_frames', 'script_path', 'is_attach',
-    'parent_run_id', 'branch_seq',
+    'parent_run_id', 'branch_seq', 'attach_safe_seq',
 })
 
 def update_run(run_id, **kwargs):

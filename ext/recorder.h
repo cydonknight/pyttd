@@ -87,4 +87,8 @@ const char *recorder_serialize_locals(PyObject *frame_obj, char *buf, size_t buf
                                        PyObject *extra_key, PyObject *extra_val);
 int recorder_json_escape_string(const char *src, char *dst, size_t dst_size);
 
+/* #8: Synthesize call events for existing stack frames — used by
+ * checkpoint_child_go_live() so branched runs capture caller frames. */
+void synthesize_existing_stack(void);
+
 #endif

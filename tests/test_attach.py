@@ -158,6 +158,28 @@ def test_arm_from_module_level(db_path):
         db.init(None)
 
 
+# ---- Finding #6 ----
+
+def test_arm_records_script_path(db_path):
+    """arm() should discover the caller's filename and save it as script_path."""
+    arm(db_path=db_path)
+    x = 1  # noqa: F841
+    disarm()
+
+    storage.connect_to_db(db_path)
+    storage.initialize_schema()
+    try:
+        run = db.fetchone("SELECT script_path FROM runs ORDER BY timestamp_start DESC LIMIT 1")
+        assert run is not None
+        assert run.script_path is not None, "script_path should not be None"
+        assert run.script_path != '', "script_path should not be empty"
+        # Should be an actual file path, not 'unknown'
+        assert 'test_attach' in run.script_path or os.path.isfile(run.script_path)
+    finally:
+        close_db()
+        db.init(None)
+
+
 # ---- Navigation ----
 
 def test_step_back_after_arm(db_path):

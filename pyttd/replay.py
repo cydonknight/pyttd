@@ -19,6 +19,19 @@ class ReplayController:
         """Cold navigation: restore checkpoint, fast-forward, return frame state.
         Falls back to warm-only navigation if no usable checkpoint.
         Cold result merges DB metadata with child's live locals."""
+        # Issue 6: in attach mode the synthesized-stack prefix has no
+        # corresponding interpreter state to fork into. Refuse cold jumps
+        # before the safe boundary and serve them from SQLite directly.
+        try:
+            run_row = db.fetchone(
+                "SELECT attach_safe_seq FROM runs WHERE run_id = ?",
+                (str(run_id),))
+        except Exception:
+            run_row = None
+        attach_safe = getattr(run_row, 'attach_safe_seq', None) if run_row else None
+        if attach_safe and target_seq < attach_safe:
+            return self.warm_goto_frame(run_id, target_seq)
+
         try:
             cold_result = pyttd_native.restore_checkpoint(target_seq)
         except Exception:

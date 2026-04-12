@@ -181,9 +181,17 @@ class Recorder:
 
         stats = pyttd_native.get_recording_stats()
         if self._run_id:
-            schema.update_run(self._run_id,
-                              timestamp_end=datetime.now().timestamp(),
-                              total_frames=stats.get('frame_count', 0))
+            update_kwargs = dict(
+                timestamp_end=datetime.now().timestamp(),
+                total_frames=stats.get('frame_count', 0),
+            )
+            # Issue 6: persist the synthesized-stack boundary so the replay
+            # layer can refuse cold jumps before it. Only meaningful for
+            # attach-mode runs (zero otherwise).
+            attach_safe = stats.get('attach_safe_seq', 0) or 0
+            if attach_safe > 0:
+                update_kwargs['attach_safe_seq'] = attach_safe
+            schema.update_run(self._run_id, **update_kwargs)
         return stats
 
     def kill_checkpoints(self):

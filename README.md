@@ -74,7 +74,34 @@ pyttd export --db hello.pyttd.db -o trace.json
 
 # Clean up database files
 pyttd clean --all --dry-run
+
+# Diff two runs to find divergence
+pyttd diff --runs abc123 def456 --db script.pyttd.db
+
+# CI wrapper — preserve trace on failure
+pyttd ci -- pytest tests/
 ```
+
+### pytest Integration
+
+pyttd ships as a pytest plugin (auto-discovered on install):
+
+```bash
+# Record every test
+pytest --pyttd
+
+# Record all tests; keep only failing traces
+pytest --pyttd-on-fail
+
+# Replay the most recent failure interactively
+pytest --pyttd-replay
+```
+
+Artifacts are written to `.pyttd-artifacts/` with a JSON manifest. Options:
+- `--pyttd-artifact-dir DIR` — custom artifact directory
+- `--pyttd-keep N` — retain last N recordings (default: 10)
+- `--pyttd-max-db-size MB` — per-test size cap (default: 100)
+- `--pyttd-include FUNC` / `--pyttd-exclude FUNC` — scope recording
 
 ### VSCode
 
@@ -159,7 +186,7 @@ install_signal_handler()  # First USR1 arms, second disarms
 - Multi-thread recording with globally ordered sequence numbers
 - Async/await and generator support with coroutine frame tracking
 - I/O hooks for deterministic checkpoint replay — `time.time`, `time.monotonic`, `time.perf_counter`, `time.sleep`, `random.random`, `random.randint`, `random.uniform`, `random.gauss`, `random.choice`, `random.sample`, `random.shuffle`, `os.urandom`, `uuid.uuid4`, `uuid.uuid1`, `datetime.datetime.now`, `datetime.datetime.utcnow`
-- Secrets filtering — sensitive variable names (`password`, `token`, `secret`, `api_key`, `connection_string`, `database_url`, `dsn`, etc.) automatically redacted during recording with word-boundary matching (catches `auth_token` but not `authenticate`); configurable patterns with `--secret-patterns`
+- Secrets filtering — sensitive variable names (`password`, `token`, `secret`, `api_key`, `connection_string`, `database_url`, `dsn`, etc.) automatically redacted during recording with word-boundary matching (catches `auth_token` but not `authenticate`); container-level redaction (dict values and NamedTuple fields with secret-named keys are also scrubbed); configurable patterns with `--secret-patterns`
 - Selective recording — `--include` / `--exclude` filter by function name (matches both qualified and bare names, e.g. `--include failing` matches `main.<locals>.failing`), `--include-file` / `--exclude-file` filter by source file path (glob patterns where `*` matches across `/`)
 - Expandable variable trees — dicts, lists, tuples, sets, objects with `__dict__`, and `__slots__`-based classes (including `@dataclass(slots=True)` and `NamedTuple` with field names) are serialized with structure, not just `repr()`; nested containers are expandable to arbitrary depth via `ast.literal_eval`-based parsing of child repr strings
 - Runtime attach — `arm()` / `disarm()` API to start/stop recording from within a running process, or toggle via Unix signal
@@ -199,6 +226,12 @@ install_signal_handler()  # First USR1 arms, second disarms
 - Variable history queries — track how a variable changes over time, with deduplication
 - Execution stats — per-function call counts, exception counts, and entry points
 - Checkpoint memory profiling — per-checkpoint RSS tracking
+- **Trace diff** — compare two recording runs to find the earliest control-flow or data divergence; best-effort alignment with single-step resync lookahead
+
+### Testing & CI Integration
+- **pytest plugin** — `--pyttd` records every test, `--pyttd-on-fail` keeps only failing traces, `--pyttd-replay` opens interactive replay of the last failure; artifact management with configurable eviction
+- **CI wrapper** — `pyttd ci -- <command>` automatically wraps Python commands with `pyttd record`, preserves `.pyttd.db` artifacts on failure, auto-gzips for upload; exits with the original command's exit code
+- **Exception chain summary** — `pyttd record` now shows the full exception propagation chain (raise site through propagation frames) instead of a single frame; coroutine noise (`StopIteration`/`StopAsyncIteration`) is automatically filtered
 
 ### Database Management
 - Multi-run storage — multiple recording runs in a single database
@@ -278,6 +311,8 @@ Commands:
   serve     Start JSON-RPC debug server (used by VSCode)
   export    Export trace data
   clean     Clean up database files
+  ci        CI wrapper — run command, preserve trace on failure
+  diff      Diff two recording runs to find divergence
 ```
 
 ### record
@@ -337,7 +372,7 @@ pyttd replay [--last-run | --run-id UUID] [--goto-frame N] [--goto-line FILE:LIN
 
 Note: The CLI `replay` command uses warm navigation only (SQLite reads). Cold navigation via checkpoint restore is available through the VSCode extension (JSON-RPC server), which keeps checkpoint children alive during the debug session.
 
-**Interactive replay commands** (`--interactive`):
+**Interactive replay commands** (`--interactive`). The REPL supports **readline history** (persists across sessions at `~/.pyttd_history`), **tab completion** for commands, function names, filenames, and variable names, and **Ctrl+R** reverse search. Degrades gracefully on platforms without readline.
 
 | Command | Aliases | Description |
 |---------|---------|-------------|
@@ -346,7 +381,8 @@ Note: The CLI `replay` command uses warm navigation only (SQLite reads). Cold na
 | `back` | `b`, `step_back` | Step backward |
 | `out` | `o`, `step_out` | Step out of current function |
 | `continue` | `c` | Continue to next breakpoint or end |
-| `goto N` | `frame N` | Jump to frame N |
+| `rcontinue` | `rc`, `reverse_continue` | Reverse continue to previous breakpoint or start |
+| `goto N` | `frame N` | Jump to frame N (also: `goto first`, `goto last`) |
 | `vars` | `v`, `locals`, `info` | Show variables at current frame |
 | `eval EXPR` | `print EXPR`, `p EXPR` | Evaluate expression against locals |
 | `where` | `w`, `bt`, `stack`, `backtrace` | Show call stack |
@@ -388,6 +424,45 @@ Options:
   --keep N       Keep last N runs, evict the rest
   --dry-run      Show what would be deleted without deleting
 ```
+
+### ci
+
+```bash
+pyttd ci [options] -- <command> [args...]
+
+Options:
+  --artifact-dir DIR       Where to write trace files (default: .pyttd-ci-artifacts/)
+  --keep-on-success        Keep artifacts even on success (default: delete)
+  --compress / --no-compress  Gzip artifacts for smaller uploads (default: on)
+  --max-size-mb MB         Max per-recording DB size in MB (default: 500)
+  --no-record              Disable auto-wrapping with pyttd record (env-variable mode only)
+```
+
+Python commands are automatically wrapped with `pyttd record` for seamless trace capture. Non-Python commands use environment variables (`PYTTD_DB_PATH`, `PYTTD_ARM_SIGNAL`) and require the child command to be pyttd-aware (e.g., `pytest --pyttd`). Use `--no-record` to force env-variable mode.
+
+Example GitHub Actions integration:
+
+```yaml
+- run: pyttd ci -- python tests/integration.py
+- if: failure()
+  uses: actions/upload-artifact@v4
+  with:
+    name: pyttd-trace
+    path: .pyttd-ci-artifacts/*.pyttd.db.gz
+```
+
+### diff
+
+```bash
+pyttd diff --runs RUN_A RUN_B --db path.pyttd.db [options]
+
+Options:
+  --context N              Lines of context around divergence (default: 3)
+  --ignore-vars VAR        Variable names to skip when comparing locals (repeatable)
+  --format text|json       Output format (default: text)
+```
+
+Compares two recording runs and finds the earliest point where execution diverges — either a control-flow split (different branches taken) or a data split (same line, different variable values). Best-effort alignment with single-step resync lookahead; memory addresses and ephemeral objects (functions, modules) are normalized automatically.
 
 ### Environment Variables
 
@@ -458,17 +533,18 @@ See [docs/architecture.md](docs/architecture.md) for the full design.
 - Expression evaluation operates on recorded snapshots, not live values
 - C extension internals are opaque (third-party C extension objects may have uninformative `repr()`)
 - Windows: no cold navigation (no `fork()`)
-- `exception_unwind` line number is from function entry, not the exception site
 - Variable repr strings are capped at 256 characters
 - Expandable variable children are capped at 50 entries per level; nested containers use repr-parsing for deeper levels (requires `ast.literal_eval`-safe values)
 - Attach mode (`arm()`) disables checkpoints — cold navigation is unavailable for attached recordings; the initial call stack is synthesized from frame inspection at arm time
 - Tight loops with per-line events have measurable overhead (~3-5x); use `--include` to scope recording for compute-heavy code
 - `--max-frames` is approximate — the actual frame count may slightly exceed the limit because events already in flight complete before the stop signal takes effect
+- `--max-db-size` is approximate — the binary log checks per-record and the DB checks every 5 flush batches, so actual size may overshoot the limit; the overshoot is reported in the CLI output
+- Exit codes: `0` = success (including `sys.exit(0)`), `N` = `sys.exit(N)`, `3` = uncaught exception in script, `130` = SIGINT
 - `start_recording()` / `stop_recording()` only captures function calls — inline code in the calling scope is not recorded; use `arm()` for inline code recording
 
 ## Testing
 
-413 Python tests across 33 test modules + 99 VSCode extension (Mocha) tests:
+545 Python tests across 48 test modules + 99 VSCode extension (Mocha) tests:
 
 ```bash
 # Run all Python tests
@@ -496,6 +572,7 @@ Benchmarks cover recording throughput (6 workload shapes), locals serialization 
 - **[VSCode Guide](docs/vscode-guide.md)** — extension features and configuration
 - **[API Reference](docs/api-reference.md)** — Python programmatic API
 - **[Architecture](docs/architecture.md)** — system design and data flow
+- **[pytest Integration](docs/pytest-integration.md)** — pytest plugin usage and CI setup
 - **[Troubleshooting](docs/troubleshooting.md)** — common issues
 - **[FAQ](docs/faq.md)** — frequently asked questions
 - **[Contributing](CONTRIBUTING.md)** — how to contribute
@@ -506,12 +583,11 @@ Development guides: [Building](docs/development/building.md) | [Testing](docs/de
 ## Roadmap
 
 - **PyCharm plugin** — pyttd's backend is IDE-agnostic (JSON-RPC over TCP with DAP semantics). A PyCharm plugin could integrate time-travel debugging into JetBrains IDEs using the `XDebugProcess` extension point, with custom tool windows for the timeline scrubber and reverse navigation controls. No changes to the Python or C code are needed — only a Kotlin/Java plugin for the PyCharm side.
-- **CI trace capture** — automatically record pyttd traces for failing CI test runs, upload as build artifacts, and replay locally. A `pyttd ci` command would wrap test execution, detect failures, and produce a `.pyttd.db` artifact that developers can download and debug with full time-travel.
-- **pytest integration** — a `pytest-pyttd` plugin that records execution of failing tests and attaches the trace as a test artifact. `pytest --pyttd` would enable recording, and `pytest --pyttd-replay` would launch an interactive replay session for the last failure.
 - **Coverage-aware recording** — integrate with `coverage.py` to selectively record only functions/files that lack test coverage, reducing trace size while targeting the code most likely to contain bugs.
 - **Multi-session / collaborative debugging** — share a pyttd recording session between multiple developers. One developer records and exports the `.pyttd.db`; others connect to a shared replay server to navigate the same trace simultaneously, with synchronized cursors and annotations.
 - **Windows cold navigation** — checkpoint-based navigation currently requires `fork()` (Linux/macOS). A Windows implementation using `CreateProcess` with process snapshots is planned.
 - **Remote debugging** — attach to a pyttd recording session on a remote machine over SSH or TCP.
+- **N-way diff** — compare more than two runs simultaneously; full DTW alignment for complex divergence patterns.
 
 ## Contributing
 

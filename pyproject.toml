@@ -42,6 +42,9 @@ Documentation = "https://github.com/pyttd/pyttd/tree/main/docs"
 [project.scripts]
 pyttd = "pyttd.cli:main"
 
+[project.entry-points.pytest11]
+pyttd = "pyttd.pytest_plugin"
+
 [tool.setuptools.packages.find]
 include = ["pyttd*"]
 

@@ -193,6 +193,11 @@ void checkpoint_child_go_live(int result_fd, int cmd_fd) {
     atomic_store_explicit(&g_recording, 1, memory_order_release);
     atomic_store_explicit(&g_stop_requested, 0, memory_order_relaxed);
 
+    /* 5b. #8: Emit synthetic call events for the existing interpreter stack
+     * so the branched run captures caller frames (main, <module>), not just
+     * the deepest frame the child happened to be in at fork time. */
+    synthesize_existing_stack();
+
     /* 6. Reinstall trace function */
     PyEval_SetTrace((Py_tracefunc)pyttd_trace_func, Py_None);
 

@@ -228,9 +228,9 @@ int sqliteflush_insert_batch(const FrameEvent *events, uint32_t count) {
         return -1;
     }
 
-    /* Throttled size check — every 100 batches */
+    /* Throttled size check — every 5 batches (tightened for #2 overshoot) */
     g_flush_batch_count++;
-    if (g_size_limit > 0 && (g_flush_batch_count % 100) == 0) {
+    if (g_size_limit > 0 && (g_flush_batch_count % 5) == 0) {
         sqliteflush_check_size_limit();
     }
 

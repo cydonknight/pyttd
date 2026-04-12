@@ -283,7 +283,10 @@ class Session:
             (str(self.run_id), current_depth - 1, current_thread,
              exit_event.sequence_no))
 
-        if parent_line is None and exit_event.frame_event == 'exception_unwind':
+        # #4: If exact depth-1 match not found, broaden to any shallower depth.
+        # This handles cases where the recording ends right after the exit event
+        # and no line event at the exact parent depth exists.
+        if parent_line is None:
             parent_line = db.fetchone(
                 "SELECT * FROM executionframes"
                 " WHERE run_id = ? AND frame_event = 'line'"
@@ -898,6 +901,41 @@ class Session:
             "SELECT DISTINCT filename FROM executionframes WHERE run_id = ?",
             (str(self.run_id),))
         return [row.filename for row in rows]
+
+    def list_function_names(self) -> list[str]:
+        """Return sorted distinct function names for this run."""
+        self._require_replay()
+        rows = db.fetchall(
+            "SELECT DISTINCT function_name FROM executionframes WHERE run_id = ?",
+            (str(self.run_id),))
+        return sorted(row.function_name for row in rows)
+
+    def list_filenames(self) -> list[str]:
+        """Return sorted distinct filenames for this run."""
+        self._require_replay()
+        rows = db.fetchall(
+            "SELECT DISTINCT filename FROM executionframes WHERE run_id = ?",
+            (str(self.run_id),))
+        return sorted(row.filename for row in rows)
+
+    def list_variable_names(self, sample_limit: int = 100) -> list[str]:
+        """Return sorted distinct variable names sampled from this run."""
+        self._require_replay()
+        rows = db.fetchall(
+            "SELECT locals_snapshot FROM executionframes"
+            " WHERE run_id = ? AND locals_snapshot IS NOT NULL AND locals_snapshot != ''"
+            " ORDER BY sequence_no DESC LIMIT ?",
+            (str(self.run_id), sample_limit))
+        import json
+        names = set()
+        for row in rows:
+            try:
+                d = json.loads(row.locals_snapshot)
+                if isinstance(d, dict):
+                    names.update(d.keys())
+            except (ValueError, TypeError):
+                pass
+        return sorted(names)
 
     def get_execution_stats(self, filename: str = "") -> list[dict]:
         self._require_replay()

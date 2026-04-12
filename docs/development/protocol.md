@@ -60,6 +60,16 @@ Extension                                Server
     │◄───── response ──────────────────────│
 ```
 
+### Method Naming Convention
+
+All pyttd JSON-RPC method names use **snake_case**, even when the corresponding DAP concept uses camelCase. For example:
+
+- `configurationDone` (DAP) → `configuration_done` (pyttd RPC)
+- `setBreakpoints` (DAP) → `set_breakpoints` (pyttd RPC)
+- `stepBack` (DAP) → `step_back` (pyttd RPC)
+
+Sending a camelCase method name silently returns `{"error": {"code": -32601, "message": "Method not found"}}`. Anyone implementing a custom client (e.g. for a non-VSCode IDE plugin) should convert method names to snake_case before sending.
+
 ## RPC Methods
 
 ### Lifecycle

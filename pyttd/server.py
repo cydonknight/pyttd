@@ -280,6 +280,9 @@ class PyttdServer:
                     progress_data["checkpointCount"] = stats.get('checkpoint_count', 0)
                     progress_data["checkpointMemoryMB"] = round(
                         stats.get('checkpoint_memory_bytes', 0) / (1024 * 1024), 1)
+                    # Issue 5: surface multi-thread checkpoint skip count
+                    progress_data["checkpointsSkippedThreads"] = stats.get(
+                        'checkpoints_skipped_threads', 0)
                 except Exception:
                     pass
                 try:
@@ -519,6 +522,17 @@ class PyttdServer:
             conn.close()
         except Exception:
             logger.debug("Failed to rebuild indexes during pause")
+
+        # 5b. #11: Update runs.total_frames so --list-runs shows correct count
+        try:
+            from pyttd.models.db import db as _db_pause
+            from pyttd.models import schema as _schema_pause
+            actual_count = _db_pause.fetchval(
+                "SELECT COUNT(*) FROM executionframes WHERE run_id = ?",
+                (str(self.recorder.run_id),)) or 0
+            _schema_pause.update_run(self.recorder.run_id, total_frames=actual_count)
+        except Exception:
+            logger.debug("Failed to update total_frames after pause", exc_info=True)
 
         # 6. Read current sequence and enter paused replay
         paused_seq = pyttd_native.get_sequence_counter()
@@ -1236,14 +1250,22 @@ class PyttdServer:
         # even without atexit — total_frames and notification are cosmetic.
         def _child_finalize():
             import pyttd_native as _native
-            stats = {}
             try:
-                stats = _native.stop_recording() or {}
+                _native.stop_recording()
             except Exception:
                 pass
+            # #11: Flush binlog → SQLite so events are queryable, then
+            # count actual rows (not the absolute g_sequence_counter).
             frame_count = 0
             try:
-                frame_count = int(stats.get("frame_count", 0) or 0)
+                _native.binlog_load(db_path)
+            except Exception:
+                pass
+            try:
+                actual = db.fetchval(
+                    "SELECT COUNT(*) FROM executionframes WHERE run_id = ?",
+                    (new_run_id,)) or 0
+                frame_count = actual
             except Exception:
                 pass
             try:

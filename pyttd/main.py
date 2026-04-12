@@ -86,15 +86,23 @@ class ArmContext:
         return False
 
 
-def arm(db_path: str | None = None, **kwargs) -> ArmContext:
+def arm(db_path: str | None = None, *, checkpoints: bool = False, **kwargs) -> ArmContext:
     """Install recording hooks on demand from within a running process.
 
     Synthesizes the existing call stack so navigation works correctly
-    after recording starts mid-execution. Checkpoints are force-disabled.
+    after recording starts mid-execution.
 
     Args:
         db_path: Path to save the .pyttd.db file. Default: <caller_script>.pyttd.db
-        **kwargs: Passed to PyttdConfig (max_frames, etc.)
+        checkpoints: Opt-in for fork-based cold checkpoints during attach
+            mode. **Off by default** because forking from a process whose
+            pre-arm state pyttd does not control (open files, sockets,
+            background threads, locked C-extension state) is risky. When
+            enabled, checkpoints only fire after the synthesized stack
+            prefix is past, and only ever cover the live tail of the
+            recording. The synthesized prefix itself remains warm-only.
+        **kwargs: Passed to PyttdConfig. The relevant knob when
+            ``checkpoints=True`` is ``checkpoint_interval`` (default 1000).
 
     Returns:
         ArmContext that can be used as a context manager.
@@ -103,17 +111,24 @@ def arm(db_path: str | None = None, **kwargs) -> ArmContext:
     if _active_recorder is not None and _active_recorder._recording:
         raise RuntimeError("Recording is already active. Call disarm() first.")
 
+    # #6: Discover the calling script so attach runs show a real script_path
+    # (not "unknown") in --list-runs.
+    import inspect
+    caller_frame = inspect.stack()[1]
+    source_file = os.path.realpath(caller_frame.filename)
     if db_path is None:
-        import inspect
-        caller_frame = inspect.stack()[1]
-        source_file = os.path.realpath(caller_frame.filename)
         db_path = compute_db_path(source_file)
 
-    # Force-disable checkpoints in attach mode
-    kwargs['checkpoint_interval'] = 0
+    if checkpoints:
+        # Caller has opted in: leave checkpoint_interval alone (defaults to
+        # PyttdConfig's default of 1000) so the C trigger fires.
+        kwargs.setdefault('checkpoint_interval', 1000)
+    else:
+        # Default attach behavior — no checkpoints, warm-only navigation.
+        kwargs['checkpoint_interval'] = 0
     config = PyttdConfig(**kwargs)
     _active_recorder = Recorder(config)
-    _active_recorder.start(db_path, attach=True)
+    _active_recorder.start(db_path, script_path=source_file, attach=True)
     # Install trace function on the current thread so line events fire
     # in the caller's already-entered frame (the eval hook only fires on
     # new frame entries, missing the caller's in-progress frame).
