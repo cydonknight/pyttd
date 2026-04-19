@@ -77,7 +77,7 @@ class ReplayController:
         except (json.JSONDecodeError, TypeError) as e:
             logger.warning(
                 "Failed to parse locals at seq %d: %s", target_seq, e)
-            locals_data = {}
+            locals_data = {"__parse_error__": str(e)}
         # Merge return-only snapshots with nearest full locals
         if (frame.frame_event == 'return'
                 and set(locals_data.keys()) <= {'__return__'}):

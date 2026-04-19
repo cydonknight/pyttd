@@ -5,7 +5,8 @@
 - **[Getting Started](getting-started.md)** — install pyttd and make your first recording
 - **[CLI Reference](cli-reference.md)** — all commands, flags, and options
 - **[VSCode Guide](vscode-guide.md)** — visual debugging with the VSCode extension
-- **[API Reference](api-reference.md)** — Python programmatic API (`@ttdbg`, `Recorder`, `Session`, models)
+- **[API Reference](api-reference.md)** — Python programmatic API (`@ttdbg`, `arm()`, `Recorder`, `Session`)
+- **[pytest Integration](pytest-integration.md)** — pytest plugin usage and CI setup
 - **[Troubleshooting](troubleshooting.md)** — solutions to common problems
 - **[FAQ](faq.md)** — frequently asked questions
 
@@ -17,7 +18,7 @@
 
 - **[Contributing Guide](../CONTRIBUTING.md)** — how to contribute to pyttd
 - **[Building](development/building.md)** — prerequisites, compiling, ASAN builds
-- **[Testing](development/testing.md)** — running and writing tests (159 Python + 70 TypeScript)
+- **[Testing](development/testing.md)** — running and writing tests (607 Python + ~95 VSCode/Mocha)
 - **[C Extension Guide](development/c-extension.md)** — PEP 523 hooks, ring buffer, checkpoints, I/O hooks
 - **[Protocol Reference](development/protocol.md)** — JSON-RPC methods, checkpoint pipe protocol, DAP extensions
 - **[Releasing](development/releasing.md)** — version bumps, PyPI, VSIX, tagging

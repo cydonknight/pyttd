@@ -1110,6 +1110,106 @@ class Session:
 
     # --- Phase 10B: Variable History ---
 
+    def find_expression_matches(self, expression: str, start_seq: int = 0,
+                                 end_seq: int | None = None,
+                                 max_results: int = 100,
+                                 mode: str = "truthy") -> list[dict]:
+        """Find frames where a Python expression is truthy or changes.
+
+        Evaluates ``expression`` against recorded locals at each LINE event
+        in the range. Frames where the expression raises (e.g., uses a
+        variable that doesn't exist in that frame) are skipped silently.
+
+        Args:
+            expression: Python expression to evaluate (same sandbox as
+                ``evaluate_at`` — restricted builtins, no imports).
+            start_seq: Start of search range (default: 0).
+            end_seq: End of search range (default: ``self.last_line_seq``).
+            max_results: Stop after this many matches (default: 100).
+            mode: "truthy" = return frames where expr is truthy.
+                  "changes" = return frames where expr result changes.
+
+        Returns:
+            List of {seq, line, filename, functionName, result} dicts.
+        """
+        self._require_replay()
+        if mode not in ("truthy", "changes"):
+            return [{"error": f"Unknown mode: {mode!r} (use 'truthy' or 'changes')"}]
+        if end_seq is None:
+            end_seq = self.last_line_seq or 0
+
+        # Build SQL pre-filter: require at least one referenced name to
+        # appear in the locals snapshot. Dramatically narrows the scan.
+        names = _extract_expression_names(expression)
+        name_clause = ""
+        name_params: list = []
+        if names:
+            like_clauses = []
+            for n in names:
+                like_clauses.append("locals_snapshot LIKE ?")
+                name_params.append(f'%"{n}"%')
+            name_clause = " AND (" + " OR ".join(like_clauses) + ")"
+
+        query = (
+            "SELECT sequence_no, line_no, filename, function_name, locals_snapshot"
+            " FROM executionframes"
+            " WHERE run_id = ? AND frame_event = 'line'"
+            " AND sequence_no >= ? AND sequence_no <= ?"
+            " AND locals_snapshot IS NOT NULL AND locals_snapshot != ''"
+            + name_clause
+            + " ORDER BY sequence_no"
+        )
+        params: tuple = (str(self.run_id), start_seq, end_seq, *name_params)
+
+        # Pre-compile the expression once
+        try:
+            code = compile(expression, '<expr>', 'eval')
+        except SyntaxError as e:
+            return [{"error": f"Syntax error in expression: {e}"}]
+
+        results: list[dict] = []
+        last_value = object()  # sentinel, never equal to any result
+        for frame in db.iterate(query, params):
+            if not frame.locals_snapshot:
+                continue
+            try:
+                locals_data = json.loads(frame.locals_snapshot)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(locals_data, dict):
+                continue
+
+            # Build eval_locals from stored repr strings
+            eval_locals = {
+                name: _parse_repr_value(value)
+                for name, value in locals_data.items()
+            }
+
+            try:
+                value = eval(code, {"__builtins__": SAFE_BUILTINS}, eval_locals)
+            except Exception:
+                # Variable missing in this frame, type mismatch, etc. Skip.
+                continue
+
+            if mode == "truthy":
+                if not value:
+                    continue
+            else:  # mode == "changes"
+                if value == last_value:
+                    continue
+                last_value = value
+
+            results.append({
+                'seq': frame.sequence_no,
+                'line': frame.line_no,
+                'filename': frame.filename,
+                'functionName': frame.function_name,
+                'result': _stringify_result(value),
+            })
+            if len(results) >= max_results:
+                break
+        return results
+
     def get_variable_history(self, variable_name: str, start_seq: int, end_seq: int,
                              max_points: int = 500) -> list[dict]:
         self._require_replay()
@@ -1735,6 +1835,28 @@ def _parse_repr_value(value):
         return ast.literal_eval(s)
     except (ValueError, SyntaxError):
         return s
+
+
+def _extract_expression_names(expression: str) -> list[str]:
+    """Extract referenced variable names from a Python expression.
+
+    Filters out names that are builtins (in SAFE_BUILTINS) since those
+    won't narrow the SQL search. Returns an empty list on syntax errors
+    — the caller should handle compilation separately.
+    """
+    try:
+        code = compile(expression, '<expr>', 'eval')
+    except SyntaxError:
+        return []
+    return [n for n in code.co_names if n not in SAFE_BUILTINS]
+
+
+def _stringify_result(value) -> str:
+    """Short, stable string form of an expression result for display."""
+    s = repr(value)
+    if len(s) > 80:
+        s = s[:77] + "..."
+    return s
 
 
 def _format_value(value) -> str:

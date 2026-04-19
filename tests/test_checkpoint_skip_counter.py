@@ -48,19 +48,32 @@ def test_format_stats_no_warning_when_zero():
 def test_skip_counter_bumps_on_multithread(record_func):
     """A multi-thread workload with a non-zero checkpoint interval should
     record at least one skipped checkpoint and surface it in stats."""
+    # Item #6 moved the checkpoint trigger to a per-thread TLS fast path,
+    # so only the main thread drives the skip-guard check.  Workers must
+    # still be active (i.e., firing events so their ring buffers remain
+    # live and non-orphaned) while the main thread is hitting its
+    # checkpoint deltas — otherwise main races ahead under GIL scheduling,
+    # workers exit first, and main's checks all see thread count == 1.
+    # Hold workers open with a stop event until main has done enough work
+    # to cross multiple checkpoint boundaries.
     db_path, run_id, stats = record_func("""\
         import threading
 
+        ready = threading.Barrier(3)
+        stop = threading.Event()
+
         def worker():
-            for i in range(2000):
-                x = i * 2
-                y = x + 1
+            ready.wait()
+            while not stop.is_set():
+                pass
 
         threads = [threading.Thread(target=worker) for _ in range(2)]
         for t in threads:
             t.start()
-        for i in range(2000):
+        ready.wait()
+        for i in range(5000):
             z = i * 3
+        stop.set()
         for t in threads:
             t.join()
     """, checkpoint_interval=200)

@@ -166,8 +166,11 @@ class TestConditionalBreakpoints:
         assert any('Condition eval error' in r.message for r in caplog.records)
 
     def test_condition_with_comparison(self, record_func):
+        # Keep the loop small so all iterations fall inside the sampling
+        # warmup window — conditional breakpoints require locals to be
+        # captured on the hitting iteration.
         db_path, run_id, _ = record_func('''
-            for i in range(100):
+            for i in range(8):
                 x = i
         ''')
         session = _setup_session(run_id)
@@ -180,7 +183,7 @@ class TestConditionalBreakpoints:
         session.set_breakpoints([{
             'file': frame.filename,
             'line': frame.line_no,
-            'condition': 'i > 50 and i < 55',
+            'condition': 'i > 3 and i < 7',
         }])
         result = session.continue_forward()
         assert result['reason'] == 'breakpoint'

@@ -16,6 +16,10 @@ def export_perfetto(db_path: str, output_path: str, run_id: int | None = None):
     storage.connect_to_db(db_path)
     try:
         storage.initialize_schema()
+        # Export iterates all frames; indexes aren't strictly required for a
+        # sequential scan, but the export also filters by frame_event, so
+        # ensure indexes are present for reasonable performance.
+        storage.ensure_secondary_indexes()
         if run_id is None:
             last_run = db.fetchone(
                 "SELECT * FROM runs ORDER BY timestamp_start DESC LIMIT 1"

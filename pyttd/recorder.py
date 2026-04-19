@@ -1,7 +1,6 @@
 from datetime import datetime
 import logging
 import os
-import sqlite3 as _sqlite3
 import pyttd_native
 from pyttd.config import PyttdConfig
 from pyttd.models import storage
@@ -23,6 +22,12 @@ class Recorder:
         self._size_warned = False
         self._resume_live_callback = None
         self._prev_recording_env = None
+        # Issue 4a: collect user-visible warnings from silent error paths
+        # (binlog_load failure, index rebuild failure, batch_insert failures,
+        # checkpoint callback failures). Surfaced in the stats dict from stop().
+        self._warnings: list[str] = []
+        self._batch_insert_failures = 0
+        self._checkpoint_failures = 0
 
     def start(self, db_path: str, script_path: str | None = None, attach: bool = False):
         """Initialize DB, create Runs record, set ignore patterns, install frame eval hook."""
@@ -91,6 +96,12 @@ class Recorder:
             self.config.exclude_functions,
             _normalize_file_patterns(self.config.exclude_files),
         )
+        # Item #5: locals-only exclusion (events still recorded)
+        exclude_locals = getattr(self.config, 'exclude_locals', None) or []
+        pyttd_native.set_exclude_locals_patterns(
+            _normalize_file_patterns(exclude_locals))
+        pyttd_native.set_locals_max_depth(
+            getattr(self.config, 'locals_max_depth', 20))
         if self.config.include_functions:
             logger.debug("Include functions: %s", self.config.include_functions)
         if self.config.include_files:
@@ -165,19 +176,17 @@ class Recorder:
         if stats.get('frame_count', 0) > 0:
             try:
                 pyttd_native.binlog_load(self._db_path)
-            except Exception:
-                logger.debug("Failed to load binlog into SQLite", exc_info=True)
+            except Exception as e:
+                msg = f"Failed to load binary log into database: {e}"
+                logger.warning(msg)
+                self._warnings.append(msg)
 
-        # Rebuild secondary indexes
-        try:
-            conn = _sqlite3.connect(self._db_path)
-            conn.execute("PRAGMA journal_mode = wal")
-            for sql in schema.SECONDARY_INDEX_CREATE:
-                conn.execute(sql)
-            conn.commit()
-            conn.close()
-        except Exception:
-            logger.debug("Failed to rebuild indexes")
+        # Secondary indexes are NOT rebuilt here — they are built lazily
+        # on first read (see storage.ensure_secondary_indexes). This keeps
+        # `pyttd record` exit fast for users who never query the DB. The
+        # server paths (_on_recording_stopped, _on_request_pause) still
+        # rebuild synchronously because interactive stepping needs them
+        # immediately.
 
         stats = pyttd_native.get_recording_stats()
         if self._run_id:
@@ -192,6 +201,21 @@ class Recorder:
             if attach_safe > 0:
                 update_kwargs['attach_safe_seq'] = attach_safe
             schema.update_run(self._run_id, **update_kwargs)
+
+        # Issue 4a: roll up silent-failure counters into summary warnings,
+        # then attach the warnings list to the stats dict so the CLI can
+        # display them.
+        if self._batch_insert_failures:
+            self._warnings.append(
+                f"{self._batch_insert_failures} flush batch(es) failed — "
+                "some frames may be missing from the database"
+            )
+        if self._checkpoint_failures:
+            self._warnings.append(
+                f"{self._checkpoint_failures} checkpoint callback(s) failed — "
+                "cold navigation to those points may be unavailable"
+            )
+        stats['warnings'] = list(self._warnings)
         return stats
 
     def kill_checkpoints(self):
@@ -233,6 +257,7 @@ class Recorder:
             storage.batch_insert(None, events)
         except Exception:
             logger.exception("batch_insert failed")
+            self._batch_insert_failures += 1
 
     def _on_io_event(self, event: dict):
         """Called synchronously by C I/O hooks (with GIL held) to insert a single IOEvent."""
@@ -262,5 +287,7 @@ class Recorder:
             schema.create_checkpoint(self._run_id, sequence_no, child_pid)
         except KeyboardInterrupt:
             logger.debug("KeyboardInterrupt during checkpoint callback (suppressed)")
+            self._checkpoint_failures += 1
         except Exception:
-            logger.debug("Checkpoint callback failed", exc_info=True)
+            logger.warning("Checkpoint callback failed", exc_info=True)
+            self._checkpoint_failures += 1

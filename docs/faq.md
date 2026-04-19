@@ -12,7 +12,7 @@ pyttd records all frame events including async frames. However, async-specific n
 
 ### Can I use pyttd in production?
 
-pyttd is a **development tool**. It captures `repr()` of all local variables (which may include secrets), adds significant overhead (2-12x slowdown), and creates large trace databases. Do not use in production.
+pyttd is a **development tool**. It captures `repr()` of all local variables (with secrets redaction), adds significant overhead on compute-heavy code (see [Performance](../README.md#performance)), and creates large trace databases. Do not use in production for always-on tracing. For targeted capture — e.g., attaching briefly to reproduce a suspected bug — `arm()` / `disarm()` with `--include`-scoped recording can be acceptable.
 
 ### Does pyttd work with C extensions?
 
@@ -24,19 +24,24 @@ pyttd uses a post-mortem replay model: the script runs to completion before you 
 
 ### How much overhead does recording add?
 
-Measured on Python 3.13 (Apple Silicon):
+Measured on Python 3.13 (Apple Silicon), hot-path-dominated (recorded workload 1-5 seconds so startup amortizes):
 
-- **I/O-bound workloads:** ~2.5x slowdown
-- **Compute-bound workloads:** ~10-12x slowdown
-- **Peak RSS:** ~48 MB for the ring buffer and string pools
+- **I/O-bound:** ~1.4x slowdown
+- **Tight loops with adaptive sampling:** ~4x slowdown
+- **Compute-bound (worst case, every frame is a line event):** ~40-57x slowdown
+- **Peak RSS:** ~45 MB for unscoped recordings, scales with DB size
 
-See [BENCHMARKS.md](../BENCHMARKS.md) for detailed numbers.
+The 57x compute-bound ceiling is the honest cost of recording every line event. **Use `--include` or `--include-file` scoping for compute-heavy code** — realistic scoping drops overhead to 2-5x. See [BENCHMARKS.md](../BENCHMARKS.md) for the full breakdown (in-process vs default subprocess vs scaled subprocess).
 
 ## Recording
 
 ### Can I record only specific functions?
 
-Yes, use the `@ttdbg` decorator:
+Three ways:
+
+1. **CLI scoping** — `pyttd record --include my_func` or `--include-file 'path/*.py'`. Most flexible, works with any script.
+2. **`@ttdbg` decorator** — annotate a function, its execution is recorded.
+3. **`arm()` / `disarm()`** — start/stop recording from anywhere inside a running process; captures inline code via stack synthesis.
 
 ```python
 from pyttd import ttdbg
@@ -46,7 +51,7 @@ def my_function():
     ...
 ```
 
-This records only the decorated function's execution. The CLI (`pyttd record`) records all user code.
+Without any scoping, the CLI records all user code (stdlib and site-packages are filtered by default).
 
 ### Why doesn't pyttd record stdlib/third-party code?
 
@@ -65,12 +70,13 @@ if os.environ.get('PYTTD_RECORDING'):
 
 ### How are variables captured?
 
-pyttd calls `repr()` on every local variable at each `line` event and stores the result as a JSON string. This means:
+pyttd captures locals at `line` events with a mix of fast-path formatting and structured serialization:
 
-- Custom `__repr__` methods are invoked during recording
-- Values are flat strings, not expandable object trees
-- Large objects produce large `repr()` output (truncated at 256 chars per value)
-- Reentrant `__repr__` calls (where `__repr__` itself triggers recording) are guarded against
+- Primitives (int, float, bool, None) use a fast-repr path that bypasses `PyObject_Repr()`
+- Containers (dicts, lists, tuples, sets) and objects with `__dict__` / `__slots__` (including `@dataclass(slots=True)` and `NamedTuple`) are captured as expandable trees — you can drill into them via `--expand` in CLI queries, `expand VARNAME` in the REPL, or the Variables panel in VSCode
+- Custom `__repr__` methods are invoked once; reentrant `__repr__` calls (where `__repr__` itself triggers recording) are guarded against
+- Large values are truncated at 256 characters per field (container children get their own 256-char budgets, so you can still drill in)
+- Adaptive sampling reduces capture frequency in long-running frames. Use `--var-history` for gap-free tracking of specific variables
 
 ## Navigation
 
@@ -102,7 +108,7 @@ However, evaluation operates on recorded `repr()` snapshots — it can look up v
 
 An `exception_unwind` event is recorded when a frame exits via exception propagation (the exception was not caught in that frame). It's distinct from `exception` events, which fire when an exception is first raised.
 
-Known limitation: the `line_no` on `exception_unwind` is from the function entry, not the exception site. Cross-reference with the preceding `exception` event for the correct line.
+`exception_unwind` events now carry the raise-site line number (stashed by the trace function's `PyTrace_EXCEPTION` handler in TLS and read at unwind time), so both event types report correct lines.
 
 ## Platform
 
@@ -112,7 +118,9 @@ Cold navigation uses `fork()` to create process snapshots. Windows doesn't suppo
 
 ### Why are checkpoints skipped during multi-thread recording on macOS?
 
-`fork()` is unsafe when multiple threads are active (the forked child inherits thread state that can't be safely resumed). pyttd detects when multiple threads are recording and skips checkpoint creation. Cold navigation falls back to warm-only for those regions.
+`fork()` is unsafe when multiple threads are active — POSIX rules only preserve async-signal-safe behavior in the child, so any mutex or C-extension lock held by another thread at fork time would be unrecoverable. pyttd's checkpoint trigger guards on `ringbuf_thread_count() <= 1` and skips the fork otherwise. The CLI surfaces a `checkpoints_skipped_threads` count in the recording summary. Cold navigation falls back to warm-only for those regions.
+
+**Mitigations:** scope recording with `--include-file` so that only main-thread user code is instrumented (background-thread events don't count toward the guard), or use `arm(checkpoints=True)` during a known-quiesced region. See [troubleshooting.md#checkpoints](troubleshooting.md#checkpoints) for more.
 
 ## See Also
 

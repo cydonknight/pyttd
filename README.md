@@ -289,7 +289,7 @@ Published benchmark data for Python debuggers is sparse and measured under varyi
 | PyCharm | pydevd + Cython | 2–3x | Same engine as debugpy | [JetBrains blog](https://blog.jetbrains.com/pycharm/2016/02/faster-debugger-in-pycharm-5-1/) |
 | PyCharm | `sys.monitoring` (2026.1+) | ~1x between breakpoints | Near-zero cost between breakpoints; settrace-like during stepping | [JetBrains blog](https://blog.jetbrains.com/pycharm/2024/01/new-low-impact-monitoring-api-in-python-3-12/) |
 | pudb | `sys.settrace` | ~5–6x † | No published benchmarks | — |
-| pyttd | PEP 523 eval hook + C trace | 0.9–2.9 us/event | Recording all frames; subprocess slowdown 1.4–16.5x (see [Performance](#performance)) | This project |
+| pyttd | PEP 523 eval hook + C trace | 4–57x (compute-bound, hot-path dominated) | Recording **every** frame event; `--include` scoping recommended to drop overhead 10-100x (see [Performance](#performance)) | This project |
 
 † Estimated from `sys.settrace` empty-callback overhead ([debugpy #204](https://github.com/microsoft/debugpy/issues/204)). Actual debugger overhead is higher due to breakpoint evaluation and variable inspection.
 
@@ -473,31 +473,90 @@ Compares two recording runs and finds the earliest point where execution diverge
 
 ## Performance
 
-Recording throughput on Apple M-series (Python 3.13), measured in-process (no subprocess startup):
+**Recording every frame event is expensive.** On compute-heavy code, pyttd adds **~40-57x wall-clock slowdown** to the recorded portion. This is the honest cost of capturing every line, call, return, and exception so you can replay and navigate freely afterward.
 
-| Workload | us/event | events/s | bytes/event |
-|----------|----------|----------|-------------|
-| Many short calls (10K) | 0.9 | 1.08M | 798 |
-| Tight loop (50K iterations) | 0.1 | 13.2M | 473 |
-| Deep recursion (200 depth x50) | 0.2 | 4.3M | 647 |
-| Mixed types (7 types) | 0.8 | 1.2M | 801 |
-| Large locals (50 vars) | 2.9 | 349K | 995 |
-| Expandable vars (containers) | 1.1 | 878K | 682 |
+**You almost always want `--include` scoping.** For typical applications, restricting recording to the specific module or function under investigation cuts overhead by 10-100x and keeps DB size manageable. Treat unscoped recording as a diagnostic of last resort, not a default.
 
-End-to-end subprocess slowdown (includes ~200ms startup overhead that inflates ratios for short workloads):
+### Honest subprocess slowdown (hot-path dominated)
 
-| Workload | Slowdown | Peak RSS |
-|----------|----------|----------|
-| I/O-bound | 1.4x | 27 MB |
-| Compute-bound | 16.5x | 58 MB |
-| Tight loop (10K iterations) | 7.9x | 58 MB |
-| Deep recursion (500 depth) | 2.9x | 58 MB |
-| Many locals (20 vars) | 3.2x | 58 MB |
-| Multi-thread (4 threads) | 3.9x | 58 MB |
+These numbers use workloads sized so the recorded portion runs 1-5 seconds. Subprocess startup (~40ms) and binlog finalization amortize to under 5% of total time, so the ratio reflects the actual per-event recording cost.
 
-Recording uses a binary log with buffered writes during execution, then bulk-loads into SQLite at stop time. No Python objects are allocated in the flush path. Zero external runtime dependencies. The hot path uses fast-path formatting for int/float/bool/None (bypassing `PyObject_Repr()`), return-only serialization when the previous line event already captured locals, and adaptive sampling that reduces capture frequency in long-running frames. See [BENCHMARKS.md](BENCHMARKS.md) for the full benchmark suite including locals scaling, type repr throughput, and recorder internals.
+| Workload | Recorded portion | Slowdown |
+|----------|-----------------:|---------:|
+| Tight loop (25M iterations) | 4.6s | 4.0x |
+| Multi-thread (100K per thread) | 0.7s | 28.1x |
+| Many locals (20K iter × 20 vars) | 0.8s | 39.9x |
+| Deep recursion (1500 depth) | 1.8s | 40.1x |
+| Compute-bound (scale 100) | 3.1s | 56.6x |
 
-**Benchmarking methodology:** In-process numbers are measured via a `bench_record` fixture that records a function call within the test process — no subprocess startup. The "us/event" metric is wall-clock time divided by total events (calls + lines + returns). Subprocess slowdown ratios are measured by running the same script with and without pyttd, averaged over multiple iterations. Ratios for short workloads (~20ms baseline) are inflated by ~200ms subprocess startup overhead; see BENCHMARKS.md for longer-baseline scaled benchmarks. All numbers captured on Apple M-series silicon with Python 3.13; results will vary by platform, CPU, and workload shape.
+The compute-bound 57x is the ceiling for a workload that does nothing but function calls and arithmetic — every line is a new event. Real code spends time in I/O, syscalls, and library code (which is filtered out by default), so real-world overhead sits between the tight-loop number (4x, mostly skipped by adaptive sampling) and the compute ceiling.
+
+### When `--include` scoping matters
+
+```bash
+# Bad: 57x slowdown, 14MB DB for a 0.02s workload
+pyttd record heavy_script.py
+
+# Good: records only the function you're investigating
+pyttd record heavy_script.py --include compute_metrics
+
+# Good: scope by file glob
+pyttd record heavy_script.py --include-file '*/billing/*.py'
+
+# Pytest integration: record only the failing test's own code
+pytest --pyttd-on-fail --pyttd-include 'my_module.*'
+```
+
+With realistic scoping, overhead on a typical data-processing pipeline drops to 2-5x — low enough to leave on for development and CI. See [docs/getting-started.md](docs/getting-started.md) for worked examples.
+
+### Short subprocess timing (what `pyttd record small_script.py` takes)
+
+For small scripts, subprocess startup and one-time DB finalization dominate. These are the numbers you see on the command line but they don't reflect per-event cost:
+
+| Workload | Baseline | Recorded | Slowdown | Peak RSS |
+|----------|---------:|---------:|---------:|---------:|
+| I/O-bound | 0.169s | 0.229s | 1.4x | 27 MB |
+| Compute-bound (trivial) | 0.021s | 0.187s | 8.8x | 43 MB |
+| Tight loop (10K iter) | 0.017s | 0.090s | 5.2x | 43 MB |
+| Deep recursion (500 depth) | 0.017s | 0.048s | 2.9x | 43 MB |
+| Many locals (20 vars) | 0.017s | 0.049s | 2.9x | 43 MB |
+| Multi-thread (4 threads) | 0.018s | 0.066s | 3.7x | 46 MB |
+
+For the 0.021s compute-bound baseline above, ~40ms of the "recorded" time is pyttd's own import and C extension load — not recording overhead. The same workload scaled up shows 56.6x (above), which is the honest per-event cost.
+
+### In-process throughput (pure recording cost, no subprocess)
+
+Measured via the `bench_record` fixture — no startup, no DB load. These are the absolute hot-path numbers for per-event optimization work.
+
+| Workload | us/event | events/s |
+|----------|---------:|---------:|
+| Many short calls (10K) | 0.7 | 1.48M |
+| Tight loop (50K iterations) | 0.1 | 17.6M |
+| Deep recursion (200×50) | 0.2 | 4.96M |
+| Mixed types (7 types) | 0.7 | 1.46M |
+| Large locals (50 vars) | 1.8 | 542K |
+| Expandable vars | 1.1 | 913K |
+
+### Memory
+
+Peak RSS stays under 50 MB for all subprocess workloads. Checkpoint memory is configurable via `--checkpoint-memory-limit MB` and enforced by memory-aware eviction. DB size scales linearly with event count: ~200-1000 bytes per event depending on workload shape.
+
+### How recording works (briefly)
+
+pyttd records to a binary log with buffered writes during execution, then bulk-loads into SQLite at stop time. No Python objects are allocated in the flush path. Zero external runtime dependencies. The hot path uses:
+
+- Fast-path formatting for int/float/bool/None (bypassing `PyObject_Repr()`)
+- Return-only serialization when the previous line event already captured locals
+- Adaptive sampling that reduces capture frequency in long-running frames
+- A lazy secondary-index build — `pyttd record` exits as soon as the binlog loads; indexes build on first `pyttd query` / `pyttd replay` / `pyttd diff`
+
+See [BENCHMARKS.md](BENCHMARKS.md) for the full benchmark suite, phase-by-phase breakdown of where subprocess time goes, locals scaling curves, and navigation/query performance.
+
+### Comparison context
+
+Traditional debuggers (pdb, debugpy, PyCharm) add overhead only during active stepping; with `sys.monitoring` on Python 3.12+ they approach zero cost between breakpoints. pyttd records **every** frame event to produce a complete replayable trace. The ratio is higher because you're capturing fundamentally more data — in exchange you get reverse debugging, time-travel navigation, and post-mortem replay that those tools can't offer at all. Use pyttd when you want the trace; use a traditional debugger when you want fast forward-only stepping.
+
+All numbers captured on Apple M-series with Python 3.13.7. Results vary by platform, CPU, and workload shape.
 
 ## Architecture
 
@@ -536,7 +595,7 @@ See [docs/architecture.md](docs/architecture.md) for the full design.
 - Variable repr strings are capped at 256 characters
 - Expandable variable children are capped at 50 entries per level; nested containers use repr-parsing for deeper levels (requires `ast.literal_eval`-safe values)
 - Attach mode (`arm()`) disables checkpoints — cold navigation is unavailable for attached recordings; the initial call stack is synthesized from frame inspection at arm time
-- Tight loops with per-line events have measurable overhead (~3-5x); use `--include` to scope recording for compute-heavy code
+- **Unscoped recording is expensive.** Compute-heavy code without `--include` / `--include-file` scoping incurs 4-57x slowdown (see [Performance](#performance)) and produces large DBs. Scope to the specific function or module under investigation for usable overhead on real workloads
 - `--max-frames` is approximate — the actual frame count may slightly exceed the limit because events already in flight complete before the stop signal takes effect
 - `--max-db-size` is approximate — the binary log checks per-record and the DB checks every 5 flush batches, so actual size may overshoot the limit; the overshoot is reported in the CLI output
 - Exit codes: `0` = success (including `sys.exit(0)`), `N` = `sys.exit(N)`, `3` = uncaught exception in script, `130` = SIGINT

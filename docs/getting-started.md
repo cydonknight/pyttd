@@ -11,13 +11,13 @@ This guide walks you through installing pyttd and making your first time-travel 
 ## Installation
 
 ```bash
-pip install pyttd
+pip install py-tt-debug
 ```
 
 Or install from source:
 
 ```bash
-git clone https://github.com/pyttd/pyttd.git
+git clone https://github.com/cydonknight/pyttd.git
 cd pyttd
 python3 -m venv .venv
 .venv/bin/pip install -e ".[dev]"
@@ -27,7 +27,7 @@ Verify:
 
 ```bash
 pyttd --version
-# pyttd 0.3.0
+# pyttd 0.8.0
 ```
 
 ## Quick Start: CLI
@@ -164,10 +164,11 @@ Step-back is always warm. You don't need to think about this distinction — pyt
 
 ### Variable Snapshots
 
-Variables are captured as `repr()` strings at each `line` event. This means:
-- You see the value of every local variable at every line
-- Values are flat strings (not expandable objects)
-- Custom `__repr__` methods are called during recording
+Variables are captured at line events with a mix of flat repr and structured data:
+- Primitive types (int, float, bool, None, short strings) use a fast-path format
+- Containers (dicts, lists, tuples, sets) and objects with `__dict__` or `__slots__` are captured as expandable trees so you can drill into nested structure in VSCode or the CLI (`--expand` / REPL `expand VARNAME`)
+- Custom `__repr__` methods are called once during recording and the result is cached
+- Adaptive sampling reduces capture frequency in long-running frames; `--var-history` fills gaps for specific variables you care about
 
 ### Multi-Thread Support
 
@@ -192,6 +193,63 @@ def my_function():
 my_function()  # Creates <this_file>.pyttd.db
 ```
 
+### `arm()` / `disarm()` for Mid-Execution Recording
+
+To start recording partway through a running process:
+
+```python
+from pyttd import arm, disarm
+
+arm()
+suspect_function()
+stats = disarm()
+
+# Or as a context manager
+with arm() as ctx:
+    suspect_function()
+print(ctx.stats)
+```
+
+Attach-mode recordings default to warm-only navigation (no checkpoints). Pass `checkpoints=True` to enable fork-based cold navigation for long sessions, provided the process state is fork-safe (no active background threads, no unusual C-extension locks).
+
+## Testing & CI Integration
+
+### pytest plugin
+
+pyttd installs as a pytest plugin — no configuration required:
+
+```bash
+# Record every test
+pytest --pyttd
+
+# Record all tests, keep only failing traces
+pytest --pyttd-on-fail
+
+# Interactively replay the most recent failing test
+pytest --pyttd-replay
+```
+
+Per-test traces land in `.pyttd-artifacts/` with a JSON manifest. See `pytest --help` for the full flag list (`--pyttd-artifact-dir`, `--pyttd-keep`, `--pyttd-include`, etc.).
+
+### CI wrapper
+
+Preserve traces from CI runs on failure:
+
+```bash
+pyttd ci -- pytest tests/
+# On failure, .pyttd-ci-artifacts/run.pyttd.db.gz is kept for upload
+```
+
+### Diffing two runs
+
+Find where two recordings diverge (useful when "it works on my machine"):
+
+```bash
+pyttd diff --runs abc123 def456 --db script.pyttd.db
+```
+
+Best-effort alignment reports the earliest control-flow or data divergence.
+
 ## Next Steps
 
 - [CLI Reference](cli-reference.md) — all commands and flags
@@ -199,3 +257,4 @@ my_function()  # Creates <this_file>.pyttd.db
 - [API Reference](api-reference.md) — Python programmatic API
 - [Architecture](architecture.md) — how pyttd works internally
 - [FAQ](faq.md) — common questions
+- [Troubleshooting](troubleshooting.md) — common issues and fixes

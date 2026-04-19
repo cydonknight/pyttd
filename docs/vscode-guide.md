@@ -148,7 +148,20 @@ Click the annotation to navigate to the first execution of that function.
 
 ### Inline Variable Values
 
-During stepping, variable values appear inline next to the source code, showing the value at the current replay position. This reuses the existing `get_variables` mechanism.
+During stepping, variable values appear inline next to the source code, showing the value at the current replay position.
+
+### Variable History Webview
+
+Right-click a variable in the Variables panel → "Show History" to open the Variable History panel. Numeric values are plotted as a canvas chart; non-numeric values are shown as a table. Click any point to navigate to the frame where that change happened.
+
+### Live Pause
+
+During recording, click the Pause button (or Ctrl+Shift+F6) to suspend execution at the next line boundary. While paused you can:
+- Inspect current variables
+- Step backward through recorded history (without resuming)
+- Set or modify breakpoints
+- Edit variable values in the Variables panel (changes take effect on resume)
+- Resume recording from the live point, OR "Resume from Past" — navigate backward and press Continue to fork execution from a historical checkpoint onto a new timeline branch
 
 ### Call History Tree
 
@@ -183,6 +196,16 @@ Configure via the Breakpoints panel:
 | Uncaught Exceptions | Enabled | Stop on exceptions that propagate out of the recorded code |
 | All Raised Exceptions | Disabled | Stop on every `raise` statement |
 
+### Function, Data, Conditional, Hit-Count, Log Breakpoints
+
+Full DAP breakpoint feature set is supported:
+
+- **Function breakpoints** — break on any call to a named function
+- **Data breakpoints** — break when a named variable's value changes (right-click a variable → Break on Value Change)
+- **Conditional breakpoints** — expressions evaluated against frame locals in a restricted sandbox. Condition evaluation errors appear in the Debug Console
+- **Hit-count breakpoints** — stop after N hits (supports `>=N`, `>N`, `<=N`, `<N`, `==N`, `%N`)
+- **Log points** — emit a log message on hit without stopping (curly-brace interpolation: `{var_name}`)
+
 ### Threads Panel
 
 Shows all Python threads seen during the recording. The active thread is highlighted. Thread-aware navigation (`step_over`, `step_out`) stays on the selected thread.
@@ -208,11 +231,11 @@ When debugging multi-threaded programs:
 
 ## Known Limitations
 
-- Variable values are `repr()` strings — not expandable objects
-- Expression evaluation operates on recorded snapshots, not live values
+- Containers (dict/list/tuple/set, objects with `__dict__` / `__slots__`, NamedTuple, `@dataclass`) are expandable; primitives are flat repr strings
+- Expression evaluation operates on recorded snapshots by default; live evaluation is available only at a pause boundary (live debugging)
 - Cold navigation (goto-frame) is unavailable on Windows (no `fork()`)
-- macOS: checkpoints skip when multiple threads are active (fork limitation)
-- `exception_unwind` events show the function entry line, not the exact exception site
+- macOS: checkpoints skip when multiple threads are active (fork limitation; see troubleshooting)
+- Attach-mode (`arm()`) recordings default to warm-only navigation; pass `arm(checkpoints=True)` for cold nav on the live tail
 
 ## See Also
 

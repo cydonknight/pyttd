@@ -11,7 +11,7 @@ pyttd is a time-travel debugger for Python. It records program execution at the 
 │  Inline values · Call history tree                             │
 ├──────────────────────────────────────────────────────────────┤
 │  Python Backend                                               │
-│  JSON-RPC server · Session navigation · Peewee ORM · CLI      │
+│  JSON-RPC server · Session · Hand-rolled SQL models · CLI     │
 ├──────────────────────────────────────────────────────────────┤
 │  C Extension (pyttd_native)                                   │
 │  PEP 523 eval hook · Trace function · Ring buffer · Fork      │
@@ -34,11 +34,13 @@ Events are pushed into a **lock-free SPSC ring buffer** (one per thread) with do
 
 The Python layer provides:
 
-- **Recorder** — wraps the C extension, manages run lifecycle, Peewee ORM models
-- **Session** — navigation state machine (forward/reverse stepping, breakpoints, stack reconstruction)
+- **Recorder** — wraps the C extension, manages run lifecycle, writes to hand-rolled SQL models
+- **Session** — navigation state machine (forward/reverse stepping, breakpoints, stack reconstruction, expression watchpoints, variable history)
 - **ReplayController** — warm (SQLite read) and cold (checkpoint restore + fast-forward) navigation
 - **JSON-RPC server** — Content-Length framed protocol over TCP, two-thread model (RPC + recording)
-- **CLI** — `record`, `query`, `replay`, `serve` subcommands
+- **Models layer** — lightweight `Database` wrapper over `sqlite3` with thread-local connections, `RowProxy` for attribute access, `SCHEMA_DDL` + `MIGRATION_SQL` as source of truth. Migration versioning via the `pyttd_meta` table
+- **CLI** — `record`, `query`, `replay`, `serve`, `export`, `clean`, `diff`, `ci` subcommands
+- **pytest plugin** — `--pyttd`, `--pyttd-on-fail`, `--pyttd-replay` registered via pyproject entry point
 
 ### Layer 3: VSCode Extension (`vscode-pyttd/`)
 
@@ -67,11 +69,19 @@ PEP 523 eval hook (call events)
 Per-thread SPSC ring buffer + string pool
        │
        ▼  (flush thread, every 10ms)
-Python callback (_on_flush)
+C-level binary log writer (buffered fwrite; no Python objects)
        │
-       ▼
-Peewee batch insert → SQLite (.pyttd.db)
+       ▼  (recorder.stop)
+Bulk-load binlog → SQLite executionframes (.pyttd.db)
 ```
+
+Recording uses a binary log file on disk during execution (`.pyttd.binlog`)
+rather than writing directly into SQLite per flush — the flush path stays
+lock-free and allocation-free, and the SQLite load happens once at stop
+time as a single bulk INSERT inside one transaction with secondary
+indexes absent. Secondary indexes are built lazily on the first read-path
+query (see `storage.ensure_secondary_indexes()`), keeping `pyttd record`'s
+exit time fast.
 
 Each event is a `FrameEvent` struct containing:
 - `sequence_no` — globally unique, monotonically increasing (atomic counter across threads)
@@ -180,14 +190,17 @@ Results: 4-byte big-endian length prefix + JSON string.
 
 ## Database Schema
 
-SQLite with WAL mode, `busy_timeout=5000`.
+SQLite with WAL mode, `busy_timeout=5000`. Tables are lowercase
+per standard SQL convention. See [api-reference.md](api-reference.md#database-schema)
+for full column listings.
 
 | Table | Purpose | Key Columns |
 |-------|---------|-------------|
-| `Runs` | Run metadata | `run_id` (UUID PK), `script_path`, `timestamp_start/end`, `total_frames` |
-| `ExecutionFrames` | Frame events | `sequence_no`, `timestamp`, `filename`, `line_no`, `function_name`, `frame_event`, `call_depth`, `locals_snapshot` (JSON), `thread_id` |
-| `Checkpoint` | Checkpoint metadata | `run_id`, `sequence_no`, `child_pid`, `is_alive` |
-| `IOEvent` | I/O hook recordings | `run_id`, `sequence_no`, `io_sequence`, `function_name`, `return_value` (bytes) |
+| `runs` | Run metadata | `run_id` (TEXT PK), `script_path`, `timestamp_start/end`, `total_frames`, `is_attach`, `attach_safe_seq`, `parent_run_id`, `branch_seq` |
+| `executionframes` | Frame events | `frame_id` (AUTOINCREMENT PK), `sequence_no`, `timestamp`, `filename`, `line_no`, `function_name`, `frame_event`, `call_depth`, `locals_snapshot` (JSON TEXT), `thread_id`, `is_coroutine` |
+| `checkpoint` | Checkpoint metadata | `run_id`, `sequence_no`, `child_pid`, `is_alive` |
+| `ioevent` | I/O hook recordings | `run_id`, `sequence_no`, `io_sequence`, `function_name`, `return_value` (BLOB) |
+| `pyttd_meta` | Migration versioning | `key` (TEXT PK), `value` (TEXT) — tracks `migration_version` for one-shot migration application |
 
 ## Platform Support
 
@@ -203,12 +216,14 @@ SQLite with WAL mode, `busy_timeout=5000`.
 
 - **Python >= 3.12 required** — uses `PyUnstable_InterpreterFrame_*` accessors added in 3.12
 - **C extension only** — no pure-Python recording fallback (performance critical)
-- **Post-mortem model** — script completes before navigation begins
-- **`repr()` snapshots** — variables stored as flat strings, not expandable objects
+- **Post-mortem model with live pause opt-in** — typical use is "record then navigate." Live pause + resume-from-past is available via the pause RPC and `arm()` attach mode
+- **Structured variable snapshots** — containers (dicts, lists, tuples, sets, objects with `__dict__`/`__slots__`) are captured as expandable trees; primitives use a fast-repr path
 - **JSON-RPC over TCP** — avoids user script stdout corrupting the protocol channel
-- **Two timestamp domains** — `Runs.timestamp_*` are wall-clock epoch seconds; `ExecutionFrames.timestamp` is monotonic seconds since recording start
+- **Two timestamp domains** — `runs.timestamp_*` are wall-clock epoch seconds; `executionframes.timestamp` is monotonic seconds since recording start
 - **Step back is always warm** — reads from SQLite, no checkpoint needed
-- **Deferred database** — `SqliteDatabase(None)` with `db.init(path)` at runtime
+- **Deferred database** — `Database()` stub at import time, `db.init(path)` at runtime. Thread-local sqlite3 connections
+- **Binlog + bulk load** — recording writes to a disk binlog; SQLite load runs once at stop time. Secondary indexes are built lazily on first read-path query
+- **Zero runtime Python dependencies** — only stdlib (including `sqlite3`)
 
 ## See Also
 

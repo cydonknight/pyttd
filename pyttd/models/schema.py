@@ -36,16 +36,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS executionframes_run_id_sequence_no
     ON executionframes(run_id, sequence_no);
 CREATE INDEX IF NOT EXISTS executionframes_run_id
     ON executionframes(run_id);
-CREATE INDEX IF NOT EXISTS executionframes_run_id_filename_line_no
-    ON executionframes(run_id, filename, line_no);
-CREATE INDEX IF NOT EXISTS executionframes_run_id_function_name
-    ON executionframes(run_id, function_name);
-CREATE INDEX IF NOT EXISTS executionframes_run_id_frame_event_sequence_no
-    ON executionframes(run_id, frame_event, sequence_no);
-CREATE INDEX IF NOT EXISTS executionframes_run_id_call_depth_sequence_no
-    ON executionframes(run_id, call_depth, sequence_no);
-CREATE INDEX IF NOT EXISTS executionframes_run_id_thread_id_sequence_no
-    ON executionframes(run_id, thread_id, sequence_no);
+-- Note: secondary indexes on executionframes are NOT created here.
+-- They are built lazily via storage.ensure_secondary_indexes() on first
+-- read-path query, or synchronously via SECONDARY_INDEX_CREATE in server
+-- paths that need immediate indexed access for interactive stepping.
 CREATE TABLE IF NOT EXISTS checkpoint (
     checkpoint_id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id TEXT NOT NULL REFERENCES runs(run_id),
@@ -65,6 +59,10 @@ CREATE TABLE IF NOT EXISTS ioevent (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ioevent_run_id_sequence_no_io_sequence
     ON ioevent(run_id, sequence_no, io_sequence);
+CREATE TABLE IF NOT EXISTS pyttd_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
 """
 
 SECONDARY_INDEX_DROP = [

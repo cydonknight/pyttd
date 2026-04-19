@@ -13,23 +13,27 @@ Both are installed by `start_recording()` and removed by `stop_recording()`.
 
 ## Source Files
 
-| File | Purpose | Lines |
-|------|---------|-------|
-| `pyttd_native.c` | Module init, method table | ~50 |
-| `recorder.c` | Eval hook, trace function, flush thread, locals serialization | ~1400 |
-| `recorder.h` | Recorder interface, exposed globals | ~120 |
-| `ringbuf.c` | Lock-free SPSC ring buffer, string pools | ~400 |
-| `ringbuf.h` | Ring buffer interface | ~80 |
-| `checkpoint.c` | Fork-based checkpointing, child init, pipe IPC | ~470 |
-| `checkpoint.h` | Checkpoint interface | ~30 |
-| `checkpoint_store.c` | Checkpoint array, eviction, lifecycle | ~250 |
-| `checkpoint_store.h` | Store interface | ~40 |
-| `replay.c` | Checkpoint restore (RESUME command) | ~150 |
-| `replay.h` | Replay interface | ~10 |
-| `iohook.c` | I/O hooks for deterministic replay | ~400 |
-| `iohook.h` | I/O hook interface | ~20 |
-| `frame_event.h` | FrameEvent struct definition | ~20 |
-| `platform.h` | Platform detection macros | ~60 |
+| File | Purpose |
+|------|---------|
+| `pyttd_native.c` | Module init, `PyttdMethods` table |
+| `recorder.c` | PEP 523 eval hook, C trace function, locals serialization, secrets redaction |
+| `recorder.h` | Recorder interface, exposed globals |
+| `ringbuf.c` | Lock-free SPSC ring buffer, per-thread buffer registry, string pools |
+| `ringbuf.h` | Ring buffer interface |
+| `binlog.c` | Binary log writer (recording) and bulk SQLite loader (stop) |
+| `binlog.h` | Binlog interface |
+| `sqliteflush.c` | Optional per-batch SQLite INSERT path (live mode) |
+| `sqliteflush.h` | Flush interface |
+| `checkpoint.c` | Fork-based checkpointing, child init, pipe IPC |
+| `checkpoint.h` | Checkpoint interface |
+| `checkpoint_store.c` | Checkpoint array, smallest-gap eviction, RSS tracking |
+| `checkpoint_store.h` | Store interface |
+| `replay.c` | Checkpoint restore (RESUME command), resume_live protocol |
+| `replay.h` | Replay interface |
+| `iohook.c` | I/O hooks for deterministic replay |
+| `iohook.h` | I/O hook interface |
+| `frame_event.h` | FrameEvent struct definition |
+| `platform.h` | Platform detection macros (fork support, TLS, atomics) |
 
 ## PEP 523 Eval Hook
 
@@ -154,9 +158,14 @@ Dedicated `pyttd_eval_hook_fast_forward()` and `pyttd_trace_func_fast_forward()`
 
 Module attribute replacement via `PyObject_SetAttrString()`:
 
-**Hooked functions:** `time.time`, `time.monotonic`, `time.perf_counter`, `random.random`, `random.randint`, `os.urandom`
+**Hooked functions:**
+- `time.time`, `time.monotonic`, `time.perf_counter`, `time.sleep`
+- `random.random`, `random.randint`, `random.uniform`, `random.gauss`, `random.choice`, `random.sample`, `random.shuffle`
+- `os.urandom`
+- `uuid.uuid1`, `uuid.uuid4`
+- `datetime.datetime.now`, `datetime.datetime.utcnow`
 
-**Recording mode:** hook calls original, serializes return value (IEEE 754 doubles for floats, length-prefixed for ints/bytes), calls flush callback.
+**Recording mode:** hook calls original, serializes return value (IEEE 754 doubles for floats, length-prefixed for ints/bytes/strings), calls flush callback.
 
 **Replay mode:** `iohook_enter_replay_mode()` pre-loads IOEvents from DB. Hooks return pre-loaded values from a cursor.
 
@@ -173,13 +182,36 @@ Module attribute replacement via `PyObject_SetAttrString()`:
 
 `recorder_serialize_locals()` builds a JSON dict from frame locals:
 
-- Python 3.12: `PyDict_Next()` fast path (frame locals are a real dict)
-- Python 3.13+: `PyMapping_Items()` (works on both dict and `FrameLocalsProxy` from PEP 667)
-- Each value: `repr()` call with `g_inside_repr` reentrancy guard, truncated at 256 chars
-- JSON escaping via `recorder_json_escape_string()` (quotes, backslashes, control characters)
-- Buffer overflow: truncation at `last_complete_pos` ensures valid JSON
+- **Python 3.12 and earlier:** `PyDict_Next()` fast path (frame locals are a real dict)
+- **Python 3.13+:** `PyMapping_Items()` — works on both dict and `FrameLocalsProxy` (PEP 667). Do NOT use `PyDict_Next()` on 3.13+; it crashes on `FrameLocalsProxy`.
+- **Primitives** (int, float, bool, None, short str): fast-path repr via `fast_repr()` — avoids `PyObject_Repr()` entirely.
+- **Containers and objects** (dict, list, tuple, set, `@dataclass`, NamedTuple, anything with `__dict__` / `__slots__`): serialized via `serialize_expandable_value()` as a structured envelope (`__type__`, `__repr__`, `__len__`, `__children__`) so query/replay can present expandable trees.
+- **Custom `__repr__`:** called once; result truncated at 256 chars (`MAX_REPR_LENGTH`). `g_inside_repr` is a TLS reentrancy guard.
+- **Secret redaction:** `should_redact(name)` uses a word-boundary pattern scan; matched locals get `<redacted>`. Dict values and NamedTuple fields with secret-matching keys are also redacted. A sticky per-frame `g_frame_had_redaction` flag conservatively taints `__return__` to prevent container leaks.
+- **JSON escaping** via `recorder_json_escape_string()` (quotes, backslashes, control characters).
+- **Buffer overflow:** truncation at `last_complete_pos` ensures valid JSON.
 
 The global `g_locals_buf` (64 KB) is safe because the GIL guarantees only one thread writes at a time.
+
+### Adaptive sampling
+
+To keep per-event cost bounded in long-running frames, locals capture is throttled after the first 16 LINE events per frame:
+
+```
+g_line_sample_counter <= 16                              → capture every line (warmup)
+g_line_sample_counter <= 256  and interval 8             → every 8th event
+g_line_sample_counter <= 1024 and interval 32            → every 32nd event
+g_line_sample_counter <= 4096 and interval 64            → every 64th event
+otherwise                         interval 128           → every 128th event
+```
+
+Newly-seen source lines always capture (tracked via `g_seen_lines` hash table) so branch coverage is preserved.
+
+### Checkpoint multi-thread safety
+
+`checkpoint_do_fork()` is gated on `ringbuf_thread_count() <= 1`. POSIX fork is unsafe with multiple threads — the child only inherits the calling thread, and any mutex held elsewhere is unrecoverable. Skipped checkpoints increment `g_checkpoints_skipped_threads`, surfaced to the user via the recording summary.
+
+`arm()` attach mode defaults to `checkpoint_interval=0` (no checkpoints). `arm(checkpoints=True)` opts in, with a warmup period after `synthesize_existing_stack()` so the first checkpoint fires only once the interpreter has a real live frame to fork into.
 
 ## Key Globals
 
@@ -189,12 +221,18 @@ The global `g_locals_buf` (64 KB) is safe because the GIL guarantees only one th
 | `g_stop_requested` | `_Atomic int` | All threads | Interrupt flag |
 | `g_sequence_counter` | `_Atomic uint64_t` | All threads | Global event counter |
 | `g_frame_count` | `_Atomic uint64_t` | All threads | Total events recorded |
+| `g_checkpoints_skipped_threads` | `_Atomic uint64_t` | All threads | Count of checkpoints skipped due to multi-thread guard (surfaced in stats) |
 | `g_call_depth` | `PYTTD_THREAD_LOCAL int` | Per-thread | Nesting depth |
 | `g_inside_repr` | `PYTTD_THREAD_LOCAL int` | Per-thread | Repr reentrancy guard |
+| `g_line_sample_counter` | `PYTTD_THREAD_LOCAL int` | Per-thread | Adaptive sampling counter |
+| `g_seen_lines` | `PYTTD_THREAD_LOCAL int[...]` | Per-thread | First-visit tracking for sampling |
+| `g_last_exception_line` | `PYTTD_THREAD_LOCAL int` | Per-thread | Raise-site line for `exception_unwind` |
+| `g_frame_had_redaction` | `PYTTD_THREAD_LOCAL int` | Per-thread | Sticky: any secret-matching local in this frame |
 | `g_main_thread_id` | `unsigned long` | Main thread | For stop-request gating |
 | `g_in_checkpoint` | `int` | Main thread | Checkpoint reentrancy guard |
 | `g_fast_forward` | `int` | Child only | Fast-forward mode flag |
 | `g_fast_forward_target` | `uint64_t` | Child only | Target sequence for FF |
+| `g_attach_real_frames_start` | `_Atomic uint64_t` | All threads | In `arm()` mode, first seq past the synthesized stack (for safe checkpointing) |
 
 ## Debugging
 

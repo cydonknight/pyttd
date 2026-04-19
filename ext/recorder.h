@@ -17,6 +17,8 @@ PyObject *pyttd_set_include_patterns(PyObject *self, PyObject *args);
 PyObject *pyttd_set_max_frames(PyObject *self, PyObject *args);
 PyObject *pyttd_set_file_include_patterns(PyObject *self, PyObject *args);
 PyObject *pyttd_set_exclude_patterns(PyObject *self, PyObject *args);
+PyObject *pyttd_set_exclude_locals_patterns(PyObject *self, PyObject *args);
+PyObject *pyttd_set_locals_max_depth(PyObject *self, PyObject *args);
 PyObject *pyttd_trace_current_frame(PyObject *self, PyObject *Py_UNUSED(args));
 
 /* User pause API (live debugging) */

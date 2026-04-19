@@ -1,8 +1,9 @@
 # CLI Reference
 
-pyttd provides a command-line interface for recording, querying, replaying, and serving debug sessions.
+pyttd provides a command-line interface for recording, querying, replaying,
+exporting, diffing, and serving debug sessions, plus a CI wrapper.
 
-## Global Options
+## Global options
 
 ```
 pyttd [--version] [-v|--verbose] SUBCOMMAND [OPTIONS]
@@ -13,24 +14,54 @@ pyttd [--version] [-v|--verbose] SUBCOMMAND [OPTIONS]
 | `--version` | Print version and exit |
 | `-v`, `--verbose` | Enable debug logging (sets log level to DEBUG) |
 
+## Subcommands
+
+| Command | Purpose |
+|---------|---------|
+| `record` | Record a script's execution to a trace database |
+| `query` | Query a recorded trace (frames, stats, exceptions, variable history, expressions) |
+| `replay` | Warm-navigation replay with optional interactive REPL |
+| `serve` | Start the JSON-RPC debug server (used by the VSCode extension) |
+| `export` | Export a trace to Perfetto / Chrome Trace Event Format |
+| `clean` | Delete old `.pyttd.db` files or evict old runs |
+| `diff` | Compare two recordings to find the first divergence |
+| `ci` | Wrap a command (e.g., `pytest`); preserve the trace on failure |
+
+---
+
 ## `pyttd record`
 
 Record a script's execution to a trace database.
 
 ```
-pyttd record SCRIPT [--module] [--checkpoint-interval N] [--args ...]
+pyttd record SCRIPT [OPTIONS] [--args ARGS...]
 ```
 
-| Argument/Flag | Description | Default |
-|---------------|-------------|---------|
-| `SCRIPT` | Path to Python script, or module name with `--module` | Required |
-| `--module` | Treat SCRIPT as a module name (dotted path) | Off |
-| `--checkpoint-interval N` | Frames between fork-based checkpoints. 0 disables checkpoints | 1000 |
-| `--args ...` | Arguments passed to the recorded script | None |
+**Output:** `<script>.pyttd.db` in the script's directory (or the path set via
+`--db-path`). Environment variable `PYTTD_RECORDING=1` is set during the
+recording and cleared at exit.
 
-The script path is validated before recording starts. The trace database is created at `<script_name>.pyttd.db` in the script's directory.
+### Flags
 
-During recording, the environment variable `PYTTD_RECORDING=1` is set. User scripts can check `os.environ.get('PYTTD_RECORDING')` to detect recording mode.
+| Flag | Description | Default |
+|------|-------------|---------|
+| `SCRIPT` | Path to Python script, or module name if `--module` is set | required |
+| `--module` | Treat `SCRIPT` as a module name (dotted path) | off |
+| `--checkpoint-interval N` | Frames between fork-based checkpoints. `0` disables | `1000` |
+| `--args VALUE...` | Arguments passed to the recorded script. **Must be the last flag** | `[]` |
+| `--no-redact` | Disable secrets redaction | off |
+| `--secret-patterns PAT` | Extra pattern for redaction (repeatable) | built-in list |
+| `--include FUNC` | Record only matching functions (glob; repeatable) | all |
+| `--include-file GLOB` | Record only files matching glob (`*` matches `/`; repeatable) | all |
+| `--exclude FUNC` | Exclude matching functions (repeatable) | none |
+| `--exclude-file GLOB` | Exclude files matching glob (repeatable) | none |
+| `--max-frames N` | Approximate frame cap; `0` unlimited | `0` |
+| `--db-path PATH` | Override default DB path | `<script>.pyttd.db` |
+| `--max-db-size MB` | Auto-stop when DB exceeds this size | unlimited |
+| `--keep-runs N` | Keep last N runs, evict older | keep all |
+| `--checkpoint-memory-limit MB` | Total checkpoint RSS cap | unlimited |
+| `--env KEY=VALUE...` | Env vars for the script (must follow `SCRIPT`) | — |
+| `--env-file PATH` | Load env vars from a dotenv file | — |
 
 ### Examples
 
@@ -38,49 +69,85 @@ During recording, the environment variable `PYTTD_RECORDING=1` is set. User scri
 # Record a script
 pyttd record my_app.py
 
-# Record with verbose logging
-pyttd -v record my_app.py
+# Record with script arguments (--args must be LAST)
+pyttd record my_app.py --include process_data --args --port 8080 --debug
 
 # Record a module
 pyttd record --module mypackage.main
 
-# Record with arguments passed to the script
-pyttd record my_app.py --args --port 8080 --debug
+# Scope to a single function (cuts overhead 10-100x on compute-heavy code)
+pyttd record my_app.py --include compute_metrics
 
-# Record without checkpoints (faster, no cold navigation)
+# Scope by file glob
+pyttd record my_app.py --include-file '*/billing/*.py'
+
+# Custom DB path + aggressive size cap
+pyttd record my_app.py --db-path /tmp/trace.db --max-db-size 50
+
+# Disable checkpoints (warm-only replay, fastest recording)
 pyttd record my_app.py --checkpoint-interval 0
-
-# Record with more frequent checkpoints (more memory, faster jumps)
-pyttd record my_app.py --checkpoint-interval 500
 ```
 
-### Output
+### Include / exclude filter semantics
 
-After recording completes, pyttd prints statistics:
+- Function patterns match the fully-qualified `__qualname__`. Bare names
+  also match (e.g., `--include failing` matches `main.<locals>.failing`).
+- File globs support `*` matching across `/` (e.g., `*/billing/*.py`).
+- Bare filenames without a slash match anywhere in the path suffix.
+- `--exclude` wins over `--include`.
 
-```
-Recording complete: 12,345 frames in 2.1s
-  Dropped frames: 0
-  Checkpoints: 12
-  DB size: 4.2 MB
-```
+---
 
 ## `pyttd query`
 
-Query a recorded trace database.
+Query a recorded trace. Without any mode flag, prints a one-line run summary.
 
 ```
-pyttd query [--last-run] [--frames] [--limit N] [--db PATH]
+pyttd query [RUN-SELECTION] [MODE] [FILTERS] [OUTPUT] [--db PATH]
 ```
 
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--last-run` | Query the most recent recording | Off |
-| `--frames` | Display frame details with source lines | Off |
-| `--limit N` | Maximum number of frames to display | 50 |
-| `--db PATH` | Path to `.pyttd.db` file | Auto-detected |
+### Run selection
 
-If `--db` is not specified, pyttd looks for `.pyttd.db` files in the current directory.
+| Flag | Description |
+|------|-------------|
+| `--last-run` | Most recent recording in the DB |
+| `--run-id UUID` | Specific run (UUID or prefix) |
+| `--list-runs` | List all runs, then exit |
+
+### Modes (what to show)
+
+| Flag | Description |
+|------|-------------|
+| `--frames` | List frame events (call/line/return/exception) with source lines |
+| `--search PATTERN` | Find frames with matching function name or filename |
+| `--stats` | Per-function call and exception counts |
+| `--exceptions` | Exception and exception_unwind events |
+| `--line [FILE:]N` | All executions of a specific line |
+| `--var-history VAR` | All value changes for a named variable |
+| `--where EXPR` | Frames where a Python expression is truthy (e.g., `--where "len(x) > 5"`) |
+| `--list-threads` | List distinct thread IDs |
+| `--thread ID` | Filter frames by thread ID |
+
+`--where` uses a restricted eval sandbox (no imports, no `open`, no side effects) and pre-filters by variable names referenced in the expression for efficiency.
+
+### Output and filtering
+
+| Flag | Description |
+|------|-------------|
+| `--limit N` | Cap the output at N frames (default `50`) |
+| `--offset N` | Skip first N frames (paginate with `--limit`) |
+| `--event-type TYPE` | Filter to a single event type (`call`, `line`, `return`, `exception`, `exception_unwind`) |
+| `--file FILE` | Substring match on filename |
+| `--format text\|json` | Output format (default `text`) |
+| `--show-locals` | Include variable values alongside each frame |
+| `--changed-only` | With `--show-locals`, only show variables that changed from the prior frame |
+| `--expand` | With `--show-locals`, expand containers/objects into child trees |
+| `--depth N` | Max expansion depth for `--expand` (default `2`) |
+| `--hide-module-dunders` | Hide `__name__`/imports/functions at module scope (default ON) |
+| `--show-all-globals` | Override `--hide-module-dunders` and show everything |
+| `--hide-coroutine-internals` | Hide StopIteration noise from async code |
+| `--unwind-only` | With `--exceptions`, show only `exception_unwind` events |
+| `--db PATH` | DB file path (default: newest `.pyttd.db` in CWD) |
 
 ### Examples
 
@@ -88,74 +155,106 @@ If `--db` is not specified, pyttd looks for `.pyttd.db` files in the current dir
 # Show last run summary
 pyttd query --last-run
 
-# Show frames from last run
+# Dump all frames with source lines
 pyttd query --last-run --frames
 
-# Show first 100 frames
-pyttd query --last-run --frames --limit 100
+# Find every frame where a condition was true across the whole trace
+pyttd query --last-run --where "len(users) > 5"
 
-# Query a specific database
-pyttd query --db app.pyttd.db --last-run --frames
+# Track a variable across the recording
+pyttd query --last-run --var-history total
+
+# Exception events, skipping async StopIteration noise
+pyttd query --last-run --exceptions --hide-coroutine-internals
+
+# All runs in a DB, JSON output
+pyttd query --list-runs --db app.pyttd.db --format json
 ```
 
-### Output
-
-```
-Run: abc123-...
-  Script: my_app.py
-  Frames: 12,345
-  Duration: 2.1s
-
-  seq=0    call    my_app.py:1    <module>
-  seq=1    line    my_app.py:3    <module>       x = 42
-  seq=2    call    my_app.py:5    greet
-  seq=3    line    my_app.py:6    greet          name = 'world'
-  ...
-```
+---
 
 ## `pyttd replay`
 
-Replay a recorded session (warm navigation only, no checkpoints).
+Warm-navigation replay. The CLI uses only SQLite reads (no checkpoint children
+kept alive). For cold navigation during interactive debugging, use the VSCode
+extension or `pyttd serve`.
 
 ```
-pyttd replay [--last-run] [--goto-frame N] [--db PATH]
+pyttd replay [RUN-SELECTION] [--goto-frame N | --goto-line FILE:LINE] [--interactive] [--db PATH]
 ```
 
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--last-run` | Use the most recent recording | Off |
-| `--goto-frame N` | Jump to a specific frame by sequence number | 0 |
-| `--db PATH` | Path to `.pyttd.db` file | Auto-detected |
+| Flag | Description |
+|------|-------------|
+| `--last-run` | Most recent recording |
+| `--run-id UUID` | Specific run by UUID or prefix |
+| `--goto-frame N` | Jump to frame N |
+| `--goto-line FILE:LINE` | Jump to first execution of `FILE:LINE` (e.g., `app.py:42`) |
+| `--interactive` | Open the interactive REPL |
+| `--db PATH` | DB path |
 
-### Examples
+### Interactive REPL
 
-```bash
-# Replay last run, jump to frame 750
-pyttd replay --last-run --goto-frame 750
+Readline history persists across sessions at `~/.pyttd_history`. Tab
+completion for commands, function names, filenames, and variable names
+(degrades gracefully if `readline` unavailable).
 
-# Replay from a specific database
-pyttd replay --db app.pyttd.db --last-run --goto-frame 100
-```
+| Command | Aliases | Description |
+|---------|---------|-------------|
+| `step` | `s`, `step_into` | Next line event |
+| `next` | `n` | Step over (same-depth next line) |
+| `back` | `b`, `step_back` | Previous line event |
+| `out` | `o`, `step_out` | Step out of current function |
+| `continue` | `c` | Continue to next breakpoint / end |
+| `rcontinue` | `rc`, `reverse_continue` | Reverse continue to previous breakpoint / start |
+| `goto N` | `frame N` | Jump to frame N (also: `goto first`, `goto last`) |
+| `vars` | `v`, `locals`, `info` | Show variables at current frame |
+| `vars -e` | | Show variables with child trees expanded |
+| `expand VAR` | | Expand a single variable (supports dotted paths: `expand config.database`) |
+| `eval EXPR` | `print EXPR`, `p EXPR` | Evaluate expression against locals |
+| `where` | `w`, `bt`, `stack`, `backtrace` | Show call stack |
+| `watch VAR` | | Show variable change history |
+| `find EXPR` | | Find frames where expression is truthy (e.g., `find len(x) > 5`) |
+| `search PAT` | | Search frames by function/file name |
+| `break F:L` | | Set line breakpoint |
+| `break FUNC` | | Set function breakpoint |
+| `logpoint F:L MSG` | | Emit message when hit, don't stop |
+| `breaks` | | List breakpoints |
+| `delete [N]` | | Delete breakpoint N or all |
+| `quit` | `q`, `exit` | Exit REPL |
+
+---
 
 ## `pyttd serve`
 
-Start a JSON-RPC debug server over TCP. Used by the VSCode extension — typically not invoked directly.
+Start a JSON-RPC debug server over TCP. Used by the VSCode extension.
 
 ```
-pyttd serve (--script SCRIPT | --db PATH) [--module] [--cwd DIR] [--checkpoint-interval N]
+pyttd serve (--script SCRIPT | --db PATH) [OPTIONS]
 ```
 
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--script SCRIPT` | Script to record and debug | Mutually exclusive with `--db` |
-| `--db PATH` | Existing `.pyttd.db` for replay-only mode | Mutually exclusive with `--script` |
-| `--module` | Treat script as module name | Off |
-| `--cwd DIR` | Working directory | `.` |
-| `--checkpoint-interval N` | Frames between checkpoints | 1000 |
+Exactly one of `--script` or `--db` is required:
+- `--script SCRIPT` — record the script, then enter replay mode
+- `--db PATH` — open an existing trace, replay-only (no recording)
 
-Exactly one of `--script` or `--db` is required. With `--script`, the server records the script and enters replay mode after completion. With `--db`, the server opens an existing trace database in replay-only mode (no recording phase).
+### Flags
 
-### Port Handshake
+| Flag | Description |
+|------|-------------|
+| `--script PATH` | Script to record and debug |
+| `--db PATH` | Existing `.pyttd.db` for replay-only mode |
+| `--module` | Treat `--script` as a module name |
+| `--cwd DIR` | Working directory (default `.`) |
+| `--checkpoint-interval N` | Frames between checkpoints (default `1000`) |
+| `--include`, `--include-file`, `--exclude`, `--exclude-file` | Same semantics as `record` |
+| `--max-frames N` | Approximate frame cap |
+| `--env KEY=VALUE...` | Environment variables for the script |
+| `--env-file PATH` | Dotenv file |
+| `--db-path PATH` | Override DB path |
+| `--max-db-size MB` | Auto-stop threshold |
+| `--keep-runs N` | Evict older runs |
+| `--run-id UUID` | Replay a specific run (with `--db`) |
+
+### Port handshake
 
 The server binds to `127.0.0.1:0` (OS-assigned port) and writes to stdout:
 
@@ -163,39 +262,130 @@ The server binds to `127.0.0.1:0` (OS-assigned port) and writes to stdout:
 PYTTD_PORT:<port>
 ```
 
-The VSCode extension reads this line to discover the port, then connects via TCP for JSON-RPC communication.
+The VSCode extension reads this line to connect.
 
-### Examples
+---
 
-```bash
-# Start server for recording + replay
-pyttd serve --script my_app.py
+## `pyttd export`
 
-# Start server in replay-only mode
-pyttd serve --db my_app.pyttd.db
+Export a recording to Perfetto / Chrome Trace Event Format.
 
-# Start server for a module
-pyttd serve --script mypackage.main --module
-
-# Start server with custom working directory
-pyttd serve --script my_app.py --cwd /path/to/project
+```
+pyttd export --format perfetto --db PATH [-o OUTPUT] [--run-id UUID] [--force]
 ```
 
-## Environment Variables
+| Flag | Description |
+|------|-------------|
+| `--format perfetto` | Export format (currently only Perfetto) |
+| `--db PATH` | DB path (required) |
+| `-o OUTPUT`, `--output OUTPUT` | Output file (required) |
+| `--run-id UUID` | Specific run (default: latest) |
+| `--force` | Overwrite existing output file |
+
+The resulting JSON opens at [ui.perfetto.dev](https://ui.perfetto.dev) or
+`chrome://tracing`. Multi-thread structure is preserved.
+
+---
+
+## `pyttd clean`
+
+Delete `.pyttd.db` files or evict old runs.
+
+```
+pyttd clean [--db PATH | --all | --keep N] [--dry-run]
+```
+
+| Flag | Description |
+|------|-------------|
+| `--db PATH` | Delete a specific DB file (and its WAL/SHM/binlog companions) |
+| `--all` | Delete all `.pyttd.db` files in CWD (not recursive) |
+| `--keep N` | Keep last N runs in the DB, evict the rest |
+| `--dry-run` | Preview what would be deleted |
+
+---
+
+## `pyttd diff`
+
+Compare two recordings to find the earliest divergence (control-flow or data).
+
+```
+pyttd diff --runs RUN_A RUN_B --db PATH [OPTIONS]
+```
+
+| Flag | Description |
+|------|-------------|
+| `--runs RUN_A RUN_B` | Run IDs to compare (UUID or prefix, required) |
+| `--db PATH` | Database containing both runs (required) |
+| `--context N` | Lines of matching context around the divergence (default `3`) |
+| `--ignore-vars VAR` | Skip a variable when comparing locals (repeatable) |
+| `--format text\|json` | Output format (default `text`) |
+
+The alignment is best-effort: exact lockstep comparison with single-step
+resync lookahead. It normalizes memory addresses and filters ephemeral
+objects (functions, modules) automatically.
+
+---
+
+## `pyttd ci`
+
+Wrap a command; preserve the trace on failure. Designed for CI pipelines.
+
+```
+pyttd ci [OPTIONS] -- COMMAND...
+```
+
+| Flag | Description |
+|------|-------------|
+| `--artifact-dir DIR` | Output directory (default `.pyttd-ci-artifacts/`) |
+| `--keep-on-success` | Keep artifacts even on success (default: delete on success) |
+| `--compress` / `--no-compress` | Gzip artifacts (default: gzip on) |
+| `--max-size-mb MB` | Per-recording DB size cap (default `500`) |
+| `--no-record` | Disable auto-wrap with `pyttd record`; just set env vars for a pyttd-aware child |
+
+Python commands (`python script.py`, `python -m pkg.mod`, `./script.py`)
+are auto-wrapped with `pyttd record`. For other commands (e.g., `pytest`),
+combine with the pytest plugin (`pytest --pyttd-on-fail`) or pass
+`--no-record` and enable pyttd inside the child process.
+
+### Example: GitHub Actions
+
+```yaml
+- run: pyttd ci -- python tests/integration.py
+- if: failure()
+  uses: actions/upload-artifact@v4
+  with:
+    name: pyttd-trace
+    path: .pyttd-ci-artifacts/*.pyttd.db.gz
+```
+
+---
+
+## Environment variables
 
 | Variable | Description |
 |----------|-------------|
-| `PYTTD_RECORDING` | Set to `"1"` during recording, cleared after stop. User scripts can check this to detect recording mode |
+| `PYTTD_RECORDING` | Set to `"1"` during recording, cleared after stop. User scripts can `os.environ.get('PYTTD_RECORDING')` to detect recording mode |
+| `PYTTD_ARM_SIGNAL` | If set (e.g., `PYTTD_ARM_SIGNAL=USR1`), `import pyttd` installs a signal handler that toggles recording on/off |
+| `PYTTD_DB_PATH` | Set by `pyttd ci` to direct a child process's recording to a specific DB |
 
-## Exit Codes
+---
+
+## Exit codes
 
 | Code | Meaning |
 |------|---------|
-| 0 | Success |
-| 1 | Error (invalid arguments, script not found, recording failure) |
+| `0` | Success (including `sys.exit(0)` from the recorded script) |
+| `1` | User error (invalid arguments, script not found) |
+| `2` | Recording error |
+| `3` | Uncaught exception in the recorded script |
+| `130` | Terminated by SIGINT |
+| `N` | Any other code mirrors the recorded script's `sys.exit(N)` |
+
+---
 
 ## See Also
 
 - [Getting Started](getting-started.md) — first recording walkthrough
 - [API Reference](api-reference.md) — Python programmatic API
 - [VSCode Guide](vscode-guide.md) — using pyttd from VSCode
+- [Troubleshooting](troubleshooting.md) — common issues and fixes

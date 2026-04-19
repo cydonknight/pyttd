@@ -78,7 +78,7 @@ Sending a camelCase method name silently returns `{"error": {"code": -32601, "me
 
 Initialize the backend. No parameters.
 
-**Response:** `{"version": "0.3.0"}`
+**Response:** `{"version": "0.8.0"}` (server reports the current pyttd version)
 
 #### `launch`
 
@@ -175,15 +175,65 @@ Jump to the first line event of the function containing the given frame.
 
 #### `set_breakpoints`
 
-**Parameters:** `{"file": "app.py", "breakpoints": [{"line": 10}, {"line": 20}]}`
+**Parameters:**
 
-**Response:** `{}`
+```json
+{
+    "file": "app.py",
+    "breakpoints": [
+        {"line": 10},
+        {"line": 20, "condition": "x > 5"},
+        {"line": 30, "hitCondition": ">=3"},
+        {"line": 40, "logMessage": "value={x}"}
+    ]
+}
+```
+
+Supports line, conditional, hit-count, and log-point breakpoints. `condition` is evaluated against frame locals in a restricted sandbox; `hitCondition` accepts `>=N`, `>N`, `<=N`, `<N`, `==N`, `%N`; `logMessage` uses `{var_name}` interpolation and emits a message without stopping.
+
+**Response:** `{"breakpoints": [{"verified": true, ...}]}`
+
+#### `set_function_breakpoints`
+
+**Parameters:** `{"breakpoints": [{"name": "target_function"}]}`
+
+**Response:** `{"breakpoints": [{"verified": true, ...}]}`
+
+#### `set_data_breakpoints`
+
+**Parameters:** `{"breakpoints": [{"dataId": "var_name", "accessType": "write"}]}`
+
+**Response:** `{"breakpoints": [{"verified": true, ...}]}`
 
 #### `set_exception_breakpoints`
 
 **Parameters:** `{"filters": ["raised", "uncaught"]}`
 
 **Response:** `{}`
+
+#### `verify_breakpoints`
+
+**Parameters:** `{"breakpoints": [...]}`
+
+**Response:** DAP-style verification results: each breakpoint gets `verified`, `message` (why not verified), and `line` (actual line if snapped).
+
+#### `pause`
+
+Pause live recording at the next line boundary. Used for live debugging — the server snapshots the binlog into SQLite so the frontend can navigate recorded history while execution is paused.
+
+**Response:** Position dict at the pause boundary.
+
+#### `continue_from_past`
+
+**Parameters:** `{"target_seq": <seq>}`
+
+While paused, resume live execution from a historical checkpoint. The nearest checkpoint to `target_seq` is fast-forwarded, then takes over as the live process with a new branched `run_id`. The parent run remains intact; the child's recording goes into a new run linked via `parent_run_id` and `branch_seq`.
+
+**Response:** `{"new_run_id": "...", "seq": ..., "file": "...", ...}`
+
+#### `resume_live`
+
+(Used internally by checkpoint children to signal they've taken over.) Not typically called from the DAP client.
 
 #### `interrupt`
 
@@ -289,6 +339,62 @@ The `variablesReference` encodes the sequence number as `seq + 1` (0 is reserved
 
 **Response:** Array of child calls for building the call history tree.
 
+#### `get_variable_children`
+
+**Parameters:** `{"variablesReference": <ref>}`
+
+Expand a container variable previously returned by `get_variables` (DAP pattern).
+
+**Response:** `[{"name", "value", "type", "variablesReference"}]`
+
+#### `get_variable_children_by_name`
+
+**Parameters:** `{"seq": <sequence_no>, "name": "config.database"}`
+
+Direct expansion by name or dotted path. Used by REPL `expand VARNAME` and programmatic access.
+
+#### `get_variable_history`
+
+**Parameters:** `{"variable_name": "total", "start_seq": 0, "end_seq": 10000, "max_points": 500}`
+
+**Response:** `[{"seq", "line", "filename", "functionName", "value"}]` — frames where the named variable's value changed.
+
+#### `find_expression_matches`
+
+**Parameters:** `{"expression": "len(users) > 5", "start_seq": 0, "end_seq": 10000, "max_results": 100, "mode": "truthy"}`
+
+Find frames where a Python expression is truthy (or its value changes, if `mode="changes"`). Uses the restricted eval sandbox.
+
+**Response:** `[{"seq", "line", "filename", "functionName", "result"}]`
+
+#### `set_variable`
+
+**Parameters:** `{"var_name": "x", "new_value_expr": "42"}`
+
+Mutate a variable at a pause boundary (live debugging only). The new value is evaluated in the restricted sandbox and applied when recording resumes.
+
+**Response:** `{"ok": true, "new_value": "..."}` on success.
+
+#### `evaluate_at`
+
+**Parameters:** `{"seq": <seq>, "expression": "x + 1", "context": "hover"}`
+
+Evaluate an expression against the frame's recorded locals. Context is one of `"hover"`, `"watch"`, `"repl"`.
+
+**Response:** `{"result": "<value repr>", "type": "int"}`
+
+#### `get_timeline_summary`
+
+**Parameters:** `{"start_seq": 0, "end_seq": 10000, "bucket_count": 500, "breakpoints": [...]}`
+
+**Response:** Array of aggregation buckets used by the VSCode timeline scrubber.
+
+#### `get_checkpoint_memory`
+
+**Response:** `{"totalMB": <float>, "limitMB": <float>, "count": <int>}`
+
+Current checkpoint RSS for the status bar / progress UI.
+
 ### Notifications (Server → Extension)
 
 #### `stopped`
@@ -323,9 +429,41 @@ These are emitted as DAP custom events (not JSON-RPC notifications):
 
 Timeline bucket data for the scrubber webview.
 
+```json
+{"buckets": [...], "startSeq": 0, "endSeq": 10000}
+```
+
 #### `pyttd/positionChanged`
 
 Current replay position changed. Used by the timeline scrubber to update the cursor.
+
+```json
+{"seq": 42, "totalFrames": 10000}
+```
+
+#### `pyttd/checkpointMemory`
+
+Emitted during recording with current checkpoint memory usage, for the VSCode status bar.
+
+```json
+{"totalMB": 125.5, "limitMB": 500, "count": 12, "skippedThreads": 0}
+```
+
+#### `pyttd/conditionError`
+
+Emitted when a conditional breakpoint's expression fails to evaluate. Surfaced in the VSCode Debug Console.
+
+```json
+{"file": "app.py", "line": 42, "condition": "x > undefined", "error": "NameError: name 'undefined' is not defined"}
+```
+
+#### `pyttd/pauseState`
+
+Emitted when live recording transitions between running and paused.
+
+```json
+{"paused": true, "seq": 1234, "totalFrames": 5000}
+```
 
 ## Checkpoint Pipe Protocol
 

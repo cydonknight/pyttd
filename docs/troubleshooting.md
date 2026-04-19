@@ -42,14 +42,16 @@ pyttd requires Python 3.12 or later. Check: `python3 --version`.
 
 ### Recording is slow
 
-The C extension adds overhead:
+The C extension adds overhead. Under hot-path-dominated workloads:
 
-- **I/O-bound scripts:** ~2.5x slowdown (typical)
-- **Compute-bound scripts:** ~10-12x slowdown (worst case)
+- **I/O-bound scripts:** ~1.4x slowdown
+- **Tight loops (adaptive sampling kicks in):** ~4x slowdown
+- **Compute-bound, every frame a line event:** 40-57x slowdown (worst case)
 
 To reduce overhead:
-- Disable checkpoints: `--checkpoint-interval 0`
-- Record only the function of interest using `@ttdbg`
+- **Scope with `--include` / `--include-file`** — the single biggest lever. Realistic scoping drops overhead to 2-5x. See [Performance](../README.md#performance) for examples.
+- Disable checkpoints: `--checkpoint-interval 0`.
+- Record only the function of interest using `@ttdbg` or `arm()` / `disarm()`.
 
 ### `KeyboardInterrupt` during recording
 
@@ -78,9 +80,11 @@ Cold navigation requires `fork()`, which is only available on Linux and macOS. O
 
 `step_back` is always warm (SQLite read, sub-ms). `step_over` is also warm but may scan more frames to find the next line at the correct depth.
 
-### Variables show as `repr()` strings
+### Variables show as flat `repr()` strings
 
-This is by design. pyttd captures `repr()` snapshots at each line event. Variables are flat strings, not expandable objects. If you need to see nested structure, add a line that assigns the sub-expression to a local variable.
+Most primitive values (int, float, bool, short string) are captured as flat repr for performance. Containers (dict/list/tuple/set/NamedTuple/dataclass) and objects with `__dict__` are captured as expandable trees — use `--expand` in `pyttd query`, the `expand VARNAME` REPL command, or the VSCode Variables panel to drill into them.
+
+If a specific expression's value is flat-repr'd and you need structure, assign it to a dict or `@dataclass` local.
 
 ### Stack shows unexpected frames
 
@@ -121,8 +125,11 @@ The database stores every frame event with variable snapshots. Typical sizes:
 - Large script (1M frames): ~100 MB
 
 To reduce size:
-- Record only the function of interest with `@ttdbg`
-- Use fewer local variables (each is `repr()`'d and stored)
+- **Scope recording with `--include` / `--include-file`** — same lever as reducing overhead.
+- Use `--max-db-size MB` to cap the binlog (auto-stops when reached).
+- Use `--max-frames N` to cap event count.
+- Use `--keep-runs N` or `pyttd clean --keep N` to evict old runs.
+- Record only the function of interest with `@ttdbg` or `arm()` / `disarm()`.
 
 ### "database is locked" errors
 

@@ -2,67 +2,63 @@
 
 ## Running Tests
 
-### Python Tests (159 tests)
+### Python tests (~607 tests across ~55 modules)
 
 ```bash
 # Run all tests
 .venv/bin/pytest tests/ -v
 
+# Quick (no verbose)
+.venv/bin/pytest tests/ -q
+
 # Run a specific test file
 .venv/bin/pytest tests/test_recorder.py -v
 
 # Run a specific test
-.venv/bin/pytest tests/test_recorder.py::test_basic_recording -v
+.venv/bin/pytest tests/test_recorder.py::TestRecorder::test_basic_recording -v
 
-# Run with benchmark disabled (faster)
-.venv/bin/pytest tests/ -v --benchmark-disable
+# List all collected tests (no execution)
+.venv/bin/pytest tests/ --collect-only -q
 ```
 
-### VSCode Extension Tests (70 tests)
+### VSCode extension tests (~95 Mocha tests)
 
 ```bash
 cd vscode-pyttd
 npm test    # Compiles TypeScript, then runs Mocha
 ```
 
-### Test File Overview
+### Test coverage overview
 
-| File | Tests | What It Covers |
-|------|-------|----------------|
-| `test_models.py` | 7 | Model creation, batch insert, WAL mode |
-| `test_native_stub.py` | 4 | C extension import, method names, checkpoint smoke tests |
-| `test_recorder.py` | 11 | Recording, sequence monotonicity, events, locals, call depth, repr reentrancy, elapsed time |
-| `test_ringbuf.py` | 3 | Flush pipeline, dict keys, recording stats |
-| `test_checkpoint.py` | 7 | Checkpoint creation, sequence numbers, cleanup, stale removal |
-| `test_replay.py` | 6 | Warm goto_frame, return/exception events, locals validation |
-| `test_reverse_nav.py` | 14 | step_back, reverse_continue, goto_frame, goto_targets, restart_frame |
-| `test_iohook.py` | 9 | I/O hook recording, serialization, restoration, exception propagation |
-| `test_session.py` | 22 | Navigation, stack, variables, evaluate, type inference |
-| `test_server.py` | 17 | Server integration, RPC, recording cycle, output capture |
-| `test_timeline.py` | 16 | Timeline summary queries, bucket boundaries, breakpoints, exceptions |
-| `test_phase6.py` | 13 | get_traced_files, get_execution_stats, get_call_children |
-| `test_phase7.py` | 18 | CLI, protocol robustness, env var, serve --db, packaging |
-| `test_multithread.py` | 12 | Multi-thread recording, per-thread stacks, thread-aware navigation |
+The Python test suite covers, broadly:
 
-### VSCode Extension Test Files
+- **Recorder / C extension** — ring buffer flush, sequence monotonicity, call/line/return/exception events, locals capture, call-depth tracking, repr reentrancy guard, adaptive sampling.
+- **Navigation** — step into/over/out/back, continue / reverse continue, goto_frame (warm + cold), goto_targets, restart_frame, stack reconstruction with cache.
+- **Breakpoints** — line, conditional, function, data, hit-count, log points. Condition error surfacing.
+- **Variables** — flat repr, expandable containers (dict/list/tuple/set/NamedTuple/dataclass), variable history, expression watchpoints (`find_expression_matches`).
+- **Checkpoints** — fork-based creation, smallest-gap eviction, RSS tracking, memory-aware eviction, multi-thread skip guard, `arm(checkpoints=True)` opt-in.
+- **I/O hooks** — serialization of `time.*`, `random.*`, `os.urandom`, `datetime.*`, `uuid.*`; replay mode in checkpoint children.
+- **Multi-thread recording** — per-thread ring buffers, global sequence ordering, per-thread stacks, thread-aware navigation.
+- **Live debugging** — pause / resume, `continue_from_past` branching, variable modification at pause boundaries.
+- **CLI** — every subcommand (`record`, `query`, `replay`, `serve`, `export`, `clean`, `diff`, `ci`), interactive REPL commands, exit codes.
+- **pytest plugin** — `--pyttd`, `--pyttd-on-fail`, `--pyttd-replay`, artifact eviction, manifest.
+- **Storage / models** — schema migrations, `pyttd_meta` versioning, lazy secondary index build, run eviction.
+- **Secrets redaction** — word-boundary matching, container-level redaction (dict values, NamedTuple fields), sticky return redaction.
 
-| File | Tests | What It Covers |
-|------|-------|----------------|
-| `backendConnection.test.ts` | 17 | TCP connect, JSON-RPC, notifications, findPythonPath |
-| `pyttdDebugSession.test.ts` | 34 | DAP handlers, navigation, notifications, customRequest |
-| `providers.test.ts` | 19 | CallHistory, CodeLens, InlineValues, TimelineScrubber |
+Get the up-to-date test list with:
 
-## Test Fixtures
+```bash
+.venv/bin/pytest tests/ --collect-only -q | tail -n +1
+```
 
-### `conftest.py`
-
-Key shared fixtures:
+## Test fixtures (`tests/conftest.py`)
 
 | Fixture | Scope | Description |
 |---------|-------|-------------|
 | `db_path` | function | Temporary `.pyttd.db` path via `tmp_path` |
 | `db_setup` | function | Connects to DB, creates schema, yields, closes |
-| `record_func` | function | Helper to record a function and return frames |
+| `record_func` | function | Helper that takes a script string, records it, returns `(db_path, run_id, stats)`. Accepts `checkpoint_interval` kwarg. Auto-cleans checkpoints on teardown |
+| `_reset_trace_state` | function (autouse) | Resets `sys.settrace(None)` and `sys.monitoring.restart_events()` to prevent `PyEval_SetTrace` pollution between tests |
 
 ### DB Isolation
 
@@ -127,17 +123,28 @@ def test_my_feature(db_path, db_setup):
 Performance benchmarks live in `benchmarks/`:
 
 ```bash
+# In-process recording throughput (hot path only, no subprocess)
+.venv/bin/pytest benchmarks/bench_recording_inprocess.py -v -s
+
+# Locals serialization scaling (by count, type, container size)
+.venv/bin/pytest benchmarks/bench_locals_scaling.py -v -s
+
+# Recorder microbenchmarks (per-event cost slope, adaptive sampling, return-only)
+.venv/bin/pytest benchmarks/bench_recorder_micro.py -v -s
+
 # Component benchmarks (warm nav, timeline, DB size, stack, variables, flush)
-.venv/bin/pytest benchmarks/ --benchmark-only -v
+.venv/bin/pytest benchmarks/bench_components.py --benchmark-only -v
 
-# Recording overhead + RSS measurement
-.venv/bin/python3 benchmarks/bench_overhead.py -n 5
+# Subprocess recording overhead + RSS measurement (what users see)
+.venv/bin/python3 benchmarks/bench_overhead.py -n 3
 
-# Update BENCHMARKS.md with fresh results
-.venv/bin/python3 benchmarks/bench_overhead.py -n 5 --output BENCHMARKS.md
+# Scaled subprocess benchmarks (hot-path-dominated ratios, longer workloads)
+.venv/bin/python3 benchmarks/bench_overhead_scaled.py -n 3
 ```
 
-See [BENCHMARKS.md](../../BENCHMARKS.md) for current results and performance targets.
+See [BENCHMARKS.md](../../BENCHMARKS.md) for current results, performance
+targets, and the methodology section distinguishing in-process / default
+subprocess / scaled subprocess measurements.
 
 ## CI
 

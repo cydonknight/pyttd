@@ -93,7 +93,7 @@ Attach the VSIX file to the release.
 
 ### 8. Post-Release
 
-- Bump version to next dev version (e.g., `0.4.0`) in all three locations
+- Bump version to the next dev version (e.g., `0.9.0` after releasing `0.8.0`) in all three locations
 - Add new `[Unreleased]` section to CHANGELOG.md
 
 ## Versioning Policy

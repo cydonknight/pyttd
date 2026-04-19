@@ -23,6 +23,11 @@ class PyttdConfig:
     include_files: list[str] = field(default_factory=list)
     exclude_functions: list[str] = field(default_factory=list)
     exclude_files: list[str] = field(default_factory=list)
+    # Item #5: file globs recorded without locals (events still fire so
+    # navigation/breakpoints keep working; the locals_snapshot column is NULL).
+    exclude_locals: list[str] = field(default_factory=list)
+    # Call depth past which locals are never captured (0 disables).
+    locals_max_depth: int = 20
     checkpoint_memory_limit_mb: int = 0  # 0 = unlimited
 
     def __post_init__(self):

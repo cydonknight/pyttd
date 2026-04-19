@@ -74,13 +74,15 @@ Both `pyproject.toml` and `setup.py` are required:
 - `setup.py` — C extension `ext_modules` definition (setuptools' pyproject.toml-only C extension support is limited)
 
 The C extension compiles these source files:
-- `ext/pyttd_native.c` — module init
-- `ext/recorder.c` — PEP 523 eval hook, trace function, flush thread
-- `ext/ringbuf.c` — lock-free SPSC ring buffer
+- `ext/pyttd_native.c` — module init, `PyttdMethods` table
+- `ext/recorder.c` — PEP 523 eval hook, C-level trace function, flush thread
+- `ext/ringbuf.c` — lock-free SPSC ring buffer, per-thread buffer registry, string pool
+- `ext/binlog.c` — binary log writer (recording) and bulk SQLite loader (stop time)
+- `ext/sqliteflush.c` — optional per-batch SQLite flush path
 - `ext/checkpoint.c` — fork-based checkpointing (Unix only)
-- `ext/checkpoint_store.c` — checkpoint index and eviction
-- `ext/replay.c` — checkpoint restore
-- `ext/iohook.c` — I/O hooks for deterministic replay
+- `ext/checkpoint_store.c` — checkpoint index, eviction, and RSS tracking
+- `ext/replay.c` — checkpoint restore + fast-forward
+- `ext/iohook.c` — I/O hooks for deterministic checkpoint replay
 
 ## VSCode Extension
 

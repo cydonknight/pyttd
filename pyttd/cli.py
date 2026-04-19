@@ -42,7 +42,7 @@ _REPL_COMMANDS = [
     'where', 'w', 'bt', 'stack', 'backtrace', 'frame',
     'help', 'quit', 'q', 'exit',
     'break', 'delete', 'breaks', 'search', 'watch',
-    'logpoint',
+    'logpoint', 'find', 'expand',
 ]
 
 _HISTORY_FILE = os.path.expanduser("~/.pyttd_history")
@@ -84,6 +84,10 @@ class _InteractiveCompleter:
         if cmd == 'search':
             return self._function_candidates(text)
         if cmd == 'watch':
+            return self._variable_candidates(text)
+        if cmd == 'find':
+            return self._variable_candidates(text)
+        if cmd == 'expand':
             return self._variable_candidates(text)
         if cmd == 'break':
             return self._break_candidates(text)
@@ -512,6 +516,28 @@ def _print_expanded_children(children, indent, depth, max_depth):
             _print_expanded_children(nested, indent + "  ", depth + 1, max_depth)
 
 
+def _print_repl_children(children, indent, depth, max_depth):
+    """Render children from session.get_variable_children(_by_name) in the REPL.
+
+    Each child is a {'name', 'value', 'type', 'variablesReference'} dict
+    (the get_variables_at shape), not the raw __children__ shape used by
+    _print_expanded_children. We parse nested container reprs via
+    ast.literal_eval to show one additional level inline when possible.
+    """
+    if depth >= max_depth or not children:
+        return
+    for child in children:
+        key = child.get('name', child.get('key', '?'))
+        val = child.get('value', '?')
+        ctype = child.get('type', '')
+        suffix = _c(_DIM, f"  ({ctype})") if ctype else ""
+        # Truncate very long values at REPL display time
+        val_str = str(val)
+        if len(val_str) > 120:
+            val_str = val_str[:117] + "..."
+        print(f"{indent}{_c(_BOLD, str(key)):<20} = {val_str}{suffix}")
+
+
 def main():
     from pyttd import __version__
     parser = argparse.ArgumentParser(prog='pyttd', description='Python Time-Travel Debugger')
@@ -542,6 +568,12 @@ def main():
     record_parser.add_argument('--exclude-file', action='append', default=None,
                                help='Exclude files whose full path matches this glob from recording '
                                     '(* matches any chars including /). Repeatable')
+    record_parser.add_argument('--exclude-locals', action='append', default=None,
+                               help='File glob for which events are still recorded but locals are '
+                                    'not captured (handy for noisy libraries). Repeatable.')
+    record_parser.add_argument('--locals-max-depth', type=int, default=None,
+                               help='Skip locals capture beyond this call depth (default 20, '
+                                    '0 disables the depth-based skip).')
     record_parser.add_argument('--max-frames', type=int, default=0,
                                help='Approximate max frames to record; may slightly overshoot (0 = unlimited)')
     record_parser.add_argument('--db-path', type=str, default=None,
@@ -605,6 +637,9 @@ def main():
                               help='Hide coroutine-internal exception events (StopIteration noise from async)')
     query_parser.add_argument('--unwind-only', action='store_true',
                               help='With --exceptions, show only exception_unwind events (legacy behavior)')
+    query_parser.add_argument('--where', type=str, default=None,
+                              help='Show frames where a Python expression is truthy '
+                                   '(e.g., --where "len(users) > 5"); restricted eval sandbox')
     query_parser.add_argument('--db', type=str, default=None)
 
     replay_parser = subparsers.add_parser('replay', help='Replay a recorded session')
@@ -787,6 +822,10 @@ def _cmd_record(args):
         config_kwargs['exclude_functions'] = args.exclude
     if args.exclude_file is not None:
         config_kwargs['exclude_files'] = args.exclude_file
+    if getattr(args, 'exclude_locals', None) is not None:
+        config_kwargs['exclude_locals'] = args.exclude_locals
+    if getattr(args, 'locals_max_depth', None) is not None:
+        config_kwargs['locals_max_depth'] = args.locals_max_depth
     if args.max_frames > 0:
         config_kwargs['max_frames'] = args.max_frames
     if args.max_db_size > 0:
@@ -911,6 +950,10 @@ def _cmd_record(args):
             _safe_print(_format_stats(stats, db_path=db_path, script_path=script_abs))
     else:
         _safe_print(_format_stats(stats, db_path=db_path, show_guidance=True, script_path=script_abs))
+
+    # Issue 4a: surface silent-failure warnings collected during recording
+    for warning in stats.get('warnings', []):
+        _safe_print(_c(_YELLOW, f"  Warning: {warning}"))
 
     # UX-B: Print run id for easy copy-paste into --run-id
     if run_id and stats.get('frame_count', 0) > 0:
@@ -1184,6 +1227,43 @@ def _cmd_query(args):
         # #9: Always send banner to stderr so stdout is pipeable for both text and JSON
         print(f"Run: {run.run_id} ({run.script_path or 'unknown'}) — {run.total_frames} frames",
               file=sys.stderr)
+
+        # Lazy index build: executionframes queries below require secondary
+        # indexes. Recorder.stop() no longer builds them eagerly, so the
+        # first query on a fresh DB builds them on demand.
+        storage.ensure_secondary_indexes()
+
+        # Expression watchpoint: find frames where an expression is truthy
+        if getattr(args, 'where', None):
+            from pyttd.session import Session
+            session = Session()
+            first_line = _db.fetchone(
+                "SELECT sequence_no FROM executionframes"
+                " WHERE run_id = ? AND frame_event = 'line'"
+                " ORDER BY sequence_no LIMIT 1",
+                (str(run.run_id),))
+            first_seq = first_line.sequence_no if first_line else 0
+            session.enter_replay(run.run_id, first_seq)
+            results = session.find_expression_matches(
+                args.where, 0, session.last_line_seq or 0,
+                max_results=max(args.limit, 1) if args.limit else 100)
+            if results and 'error' in results[0]:
+                print(f"Error: {results[0]['error']}", file=sys.stderr)
+                sys.exit(EXIT_USER_ERROR)
+            if getattr(args, 'format', 'text') == 'json':
+                print(json.dumps(results, indent=2))
+            else:
+                if not results:
+                    print(f"No frames where `{args.where}` is truthy.")
+                else:
+                    print(f"{len(results)} match(es):")
+                    for r in results:
+                        fn = os.path.basename(r.get('filename', '?'))
+                        func = r.get('functionName', '?')
+                        line = r.get('line', '?')
+                        print(f"  #{r['seq']:>6}  {func}:{line}  "
+                              f"at {fn}  →  {r['result']}")
+            return
 
         if getattr(args, 'list_threads', False):
             rows = _db.fetchall(
@@ -1479,10 +1559,24 @@ def _cmd_replay(args):
                 sys.exit(EXIT_USER_ERROR)
         controller = ReplayController()
 
+        # Lazy index build: replay reads executionframes heavily (stack
+        # reconstruction, step navigation, goto). Ensure secondary indexes
+        # exist before the first query.
+        storage.ensure_secondary_indexes()
+
+        # Hoisted from the interactive block so _show_frame can reference it
+        # on every call (ISSUES-PLAN.md Issue 1 — NameError fix).
+        total_frames = run.total_frames or 0
+
         def _show_frame(result, show_context=True):
             """UX-3: Format frame output like a debugger."""
             if "error" in result:
-                print(f"Error: {result['error']}")
+                err = result['error']
+                if isinstance(err, dict):
+                    msg = err.get('message') or err.get('error') or str(err)
+                else:
+                    msg = str(err)
+                print(f"Error: {msg}")
                 return
             filepath = result.get('file', '?')
             fname = os.path.basename(filepath)
@@ -1509,9 +1603,17 @@ def _cmd_replay(args):
                     pass
             locals_data = result.get('locals')
             if locals_data and isinstance(locals_data, dict):
+                parse_err = locals_data.get('__parse_error__')
+                if parse_err:
+                    print()
+                    print(f"  (variable data unavailable: {parse_err})")
+                    locals_data = None
+            if locals_data and isinstance(locals_data, dict):
                 print()
                 print("  Locals:")
                 for name, value in locals_data.items():
+                    if name == '__parse_error__':
+                        continue
                     formatted = _format_local_value(value)
                     print(f"    {name:<16} = {formatted}")
 
@@ -1594,8 +1696,7 @@ def _cmd_replay(args):
             _line_bps = []  # [{file, line}]
             _func_bps = []  # [{name}]
 
-            # U12: Show summary on REPL startup
-            total_frames = run.total_frames or 0
+            # U12: Show summary on REPL startup (total_frames set earlier)
             func_count = _dbr.fetchval(
                 "SELECT COUNT(DISTINCT function_name) FROM executionframes"
                 " WHERE run_id = ? AND frame_event = 'call'",
@@ -1645,7 +1746,13 @@ def _cmd_replay(args):
                     elif r.get('reason') == 'breakpoint':
                         print(f"  Hit breakpoint.")
                     _show_frame(r)
-                elif cmd in ('vars', 'v', 'locals', 'info'):
+                elif cmd in ('vars', 'v', 'locals', 'info') or \
+                        cmd.startswith('vars ') or cmd.startswith('v '):
+                    # `vars -e` or `vars --expand` shows children recursively
+                    expand = False
+                    if cmd.startswith('vars ') or cmd.startswith('v '):
+                        rest = cmd.split(None, 1)[1]
+                        expand = rest in ('-e', '--expand', 'e', 'expand')
                     variables = session.get_variables_at(session.current_frame_seq)
                     if not variables:
                         print("  (no variables)")
@@ -1653,6 +1760,23 @@ def _cmd_replay(args):
                         vtype = v.get('type', '')
                         type_str = _c(_DIM, f"  ({vtype})") if vtype else ""
                         print(f"    {_c(_BOLD, v['name']):<24} = {v['value']}{type_str}")
+                        if expand and v.get('variablesReference', 0) != 0:
+                            children = session.get_variable_children(
+                                v['variablesReference'])
+                            _print_repl_children(children, "      ", 1, 3)
+                elif cmd == 'expand' or cmd.startswith('expand '):
+                    varname = cmd[7:].strip() if len(cmd) > 7 else ''
+                    if not varname:
+                        print("Usage: expand VARNAME  "
+                              "(e.g., expand config, expand response.headers)")
+                    else:
+                        children = session.get_variable_children_by_name(
+                            session.current_frame_seq, varname)
+                        if not children:
+                            print(f"  '{varname}' is not expandable or not found.")
+                        else:
+                            print(f"  {_c(_BOLD, varname)}:")
+                            _print_repl_children(children, "    ", 0, 4)
                 elif cmd.startswith('goto ') or cmd.startswith('frame '):
                     arg = cmd.split(None, 1)[1].strip() if ' ' in cmd else ''
                     if arg == 'first':
@@ -1820,6 +1944,29 @@ def _cmd_replay(args):
                                 if isinstance(val, dict):
                                     val = val.get('__repr__', str(val))
                                 print(f"    #{h['seq']:>6}  {h.get('functionName', '?')}:{h.get('line', '?')}  {varname} = {val}")
+                elif cmd == 'find' or cmd.startswith('find '):
+                    expr = cmd[5:].strip() if len(cmd) > 5 else ''
+                    if not expr:
+                        print("Usage: find EXPRESSION  (e.g., find len(x) > 5)")
+                    else:
+                        results = session.find_expression_matches(
+                            expr, 0, session.last_line_seq or 0)
+                        if results and 'error' in results[0]:
+                            print(f"  {results[0]['error']}")
+                        elif not results:
+                            print(f"  No frames where `{expr}` is truthy.")
+                        else:
+                            shown = results[:20]
+                            print(f"  {len(results)} match(es):")
+                            for r in shown:
+                                fn = os.path.basename(r.get('filename', '?'))
+                                func = r.get('functionName', '?')
+                                line = r.get('line', '?')
+                                print(f"    #{r['seq']:>6}  {func}:{line}  "
+                                      f"→ {r['result']}")
+                            if len(results) > 20:
+                                print(f"    ... and {len(results) - 20} more. "
+                                      f"Use 'goto N' to navigate.")
                 elif cmd == 'help':
                     print("  " + _c(_BOLD, "Navigation:"))
                     print("  goto N      — jump to frame N  (aliases: frame N)")
@@ -1832,9 +1979,12 @@ def _cmd_replay(args):
                     print()
                     print("  " + _c(_BOLD, "Inspection:"))
                     print("  vars (v)    — show variables  (aliases: locals, info)")
+                    print("  vars -e     — show variables expanded with children")
+                    print("  expand VAR  — expand a single variable (supports dotted paths)")
                     print("  eval EXPR   — evaluate expression  (aliases: print, p)")
                     print("  where (w)   — show call stack  (aliases: bt, stack, backtrace)")
                     print("  watch VAR   — show variable history across recording")
+                    print("  find EXPR   — find frames where EXPR is truthy (e.g., len(x) > 5)")
                     print("  search PAT  — find frames matching function/file name")
                     print()
                     print("  " + _c(_BOLD, "Breakpoints:"))
@@ -1863,6 +2013,8 @@ def _cmd_diff(args):
 
     storage.connect_to_db(db_path)
     storage.initialize_schema()
+    # Diff iterates line events across two runs — build indexes on demand.
+    storage.ensure_secondary_indexes()
 
     try:
         run_a = get_run_by_id(db_path, args.runs[0])
