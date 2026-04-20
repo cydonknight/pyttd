@@ -153,15 +153,30 @@ def ensure_secondary_indexes(quiet: bool = False) -> bool:
         # Fall through — we'll attempt the creates anyway; CREATE INDEX IF
         # NOT EXISTS is safe.
 
+    # Estimate DB size so we can choose between a one-liner and a progress notice.
+    db_size_mb = 0
+    if not quiet:
+        try:
+            path = getattr(db, '_path', None)
+            if path:
+                import os as _os
+                db_size_mb = _os.path.getsize(path) / (1024 * 1024)
+        except Exception:
+            pass
+
     # Print a one-time notice per DB path so users understand the pause.
-    # Use the db path as the key. _notified_lazy_build is session-scoped.
     if not quiet:
         import sys
         try:
             path = getattr(db, '_path', None) or '<unknown>'
             if path not in _notified_lazy_build:
-                print("Building query indexes (one-time, ~100-200ms)...",
-                      file=sys.stderr)
+                if db_size_mb > 5:
+                    print(f"Building query indexes for {db_size_mb:.0f} MB database "
+                          f"(one-time)...",
+                          file=sys.stderr, end='', flush=True)
+                else:
+                    print("Building query indexes (one-time)...",
+                          file=sys.stderr, end='', flush=True)
                 _notified_lazy_build.add(path)
         except Exception:
             pass
@@ -171,12 +186,25 @@ def ensure_secondary_indexes(quiet: bool = False) -> bool:
     except Exception:
         pass
 
+    import time as _time
+    t0 = _time.monotonic()
     try:
         for sql in schema.SECONDARY_INDEX_CREATE:
             db.execute(sql)
         db.commit()
+        elapsed_ms = (_time.monotonic() - t0) * 1000
+        if not quiet:
+            try:
+                print(f" done ({elapsed_ms:.0f}ms)", file=sys.stderr)
+            except Exception:
+                pass
         return True
     except Exception as e:
+        if not quiet:
+            try:
+                print(" failed", file=sys.stderr)
+            except Exception:
+                pass
         logger.warning(
             "Could not build secondary indexes (queries may be slow): %s", e)
         return False

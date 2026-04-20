@@ -30,8 +30,11 @@ pyttd supports both **post-mortem replay** (script runs to completion, then you 
 > **Requires Python 3.12+** — uses CPython C API features introduced in 3.12.
 
 ```bash
-pip install py-tt-debug
+pip install py-tt-debug    # PyPI package name
+import pyttd               # Python import name
 ```
+
+The PyPI package is `py-tt-debug`; the importable module is `pyttd`. The CLI command is `pyttd`.
 
 Or from source:
 

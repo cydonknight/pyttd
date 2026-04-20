@@ -11,7 +11,7 @@ This guide walks you through installing pyttd and making your first time-travel 
 ## Installation
 
 ```bash
-pip install py-tt-debug
+pip install py-tt-debug    # PyPI package name; import as "pyttd", CLI command is "pyttd"
 ```
 
 Or install from source:

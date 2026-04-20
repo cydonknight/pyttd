@@ -545,7 +545,13 @@ def main():
     parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose logging')
     subparsers = parser.add_subparsers(dest='command')
 
-    record_parser = subparsers.add_parser('record', help='Record script execution')
+    record_parser = subparsers.add_parser(
+        'record',
+        help='Record script execution',
+        epilog='Typical unscoped recording produces 200-1000 bytes/frame. '
+               'Use --include/--include-file to scope recording for compute-heavy '
+               'code — unscoped recording of tight loops can produce large DBs quickly.',
+    )
     record_parser.add_argument('script', help='Script path or module name (with --module)')
     record_parser.add_argument('--module', action='store_true', help='Treat script as module name')
     record_parser.add_argument('--checkpoint-interval', type=int, default=1000)
